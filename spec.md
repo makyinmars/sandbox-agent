@@ -9,6 +9,13 @@ i need to build a library that is a universal api to work with agents
 
 ## concepts
 
+### architecture
+
+this is intended to build 2 components:
+
+- daemon that runs inside a sandbox that can run agents inside the sandbox
+- sdk that talks the http api to the daemon to communicate with it
+
 ### universal api types
 
 we need to define a universal base type for input & output from agents that is a common denominator for all agent schemas
@@ -45,6 +52,7 @@ it's ran with a token like this using clap:
 sandbox-daemon --token <token> --host xxxx --port xxxx
 
 (you can specify --no-token too)
+(also add cors flags to the cli to configure cors, default to no cors)
 
 also expose a CLI endpoint for every http endpoint we have (specify this in claude.md to keep this to date) so we can do:
 
@@ -95,6 +103,8 @@ POST /sessions/{}/questions/{questionId}/reject
 
 POST /sessions/{}/permissions/{permissionId}/reply
 { reply: "once" | "always" | "reject" }
+
+note: Claude's plan approval (ExitPlanMode) is converted to a question event with approve/reject options. No separate endpoint needed.
 
 types:
 
@@ -342,26 +352,74 @@ curl -fsSL "https://storage.googleapis.com/amp-public-assets-prod-0/cli/${VERSIO
 
 When spawning subprocesses, pass the API key via environment variable. For OpenCode server mode, the server reads credentials from its config on startup.
 
+### extract credentials
+
+write a rust module for extracting credentials from the host machine. see bootstrap in ~/agent-jj. this will be used for tests
+
 ### testing
 
-TODO
+every agent needs to be tested for every possible feature of the universal api
+
+that means we need to build a test suite that can be ran on any agent
+
+then run them on every agent
+
+this machine is already authenticated with codex & claude & opencode (for codex). not amp yet. use the extract credentials module to get the credentials for this test. in order to test things like quetions, etc, the test should prompt the agent with a very specific prompt that should give a very specific response. do not mock anything.
+
+## testing frontend
+
+in frontend/packages/web/ build a vite server that:
+
+- connect screen: prompts the user to provide an endpoint & optional token
+    - shows instructions on how to run the sandbox-daemon (including cors)
+- agent screen: provides a full agent ui
 
 ## component: sdks
 
 we need to auto-generate types from our json schema for these languages
 
 - typescript sdk
-	- also need to support standard schema
-	- can run in inline mode that doesn't require this
-- python sdk
+    - expose our http api as a typescript sdk
+    - update claude.md to specify that when changing api, we need to update the typescript sdk + the cli to interact with it
+
+## examples
+
+build typescript examples of how to deploy this to the given providres:
+
+- docker
+- e2b
+- daytona
+- vercel sandboxes
+- cloudflare sandboxes
+
+these should each have a vitest unit test to test. cloudflaer is trickier since it requires a more complex setup.
+
+## readme docs
+
+write a readme that doubles as docs for:
+
+- architecture
+- agent compatibility
+- deployemnt guide (these should be links to working examples)
+    - docker (for dev)
+    - e2b
+    - daytona
+    - vercel sandboxes
+    - cloudflare sandboxes
+- universal agent api feature checklist
+    - quesitons
+    - approve plan
+    - etc (ie you need to infer what features are required to imeplment and what is optional)
+- cli
+- http api
+- running the example frontend
+- typescript sdk
+
+use the collapsible github sections for things like each api endpoint or each typescript sdk endpoint to collapse more info. this keeps the page readable.
 
 ## spec todo
 
 - generate common denominator with conversion functions
-- what else do we need, like todo, etc?
-- how can we dump the spec for all of the agents somehow
-- generate an example ui for this
-- architecture document
 - how should we handle the tokens for auth?
 
 ## future problems to visit
@@ -376,22 +434,24 @@ we need to auto-generate types from our json schema for these languages
 - otel
 - better authentication systems
 - s3-based file system
-- ai sdk compatability for their ecosystem (useChat, etc)
+- ai sdk compatibility for their ecosystem (useChat, etc)
 - resumable messages
 - todo lists
 - all other features
 - misc
     - bootstrap tool that extracts tokens from the current system
-- management ui
 - skill
 - pre-package these as bun binaries instead of npm installations
 - build & release pipeline with musl
 - agent feature matrix for api features
+- tunnels
 
 ## future work
 
+- mcp integration (can connect to given endpoints)
 - provide a pty to access the agent data
 - other agent features like file system
+- python sdk
 
 ## misc
 
