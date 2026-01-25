@@ -63,15 +63,19 @@ sandbox-daemon sessions get-messages --endpoint xxxx --token xxxx
 POST /agents/{}/install (this will install the agent)
 {}
 
+GET /agents/{}/modes
+< { modes: [{ id: "build", name: "Build", description: "..." }, ...] }
+
 POST /sessions/{} (will install agent if not already installed)
 >
 {
-	agent:"claud"|"codex"|"opencode",
-	model?:string,
-	variant?:string,
+    agent: "claude" | "codex" | "opencode",
+    agentMode?: string,        // Which agent/behavior: "build", "plan", or custom
+    permissionMode?: "default" | "plan" | "bypass",  // Permission restrictions
+    model?: string,
+    variant?: string,
     token?: string,
     validateToken?: boolean,
-    dangerouslySkipPermissions?: boolean,
     agentVersion?: string
 }
 <
@@ -79,6 +83,18 @@ POST /sessions/{} (will install agent if not already installed)
     healthy: boolean,
     error?: AgentError
 }
+
+// agentMode vs permissionMode:
+// - agentMode = what the agent DOES (behavior, system prompt)
+// - permissionMode = what the agent CAN DO (capability restrictions)
+// These are separate concepts. OpenCode has custom agents. Claude has subagent types.
+//
+// Assertions:
+// - agentMode defaults to "build" if not specified
+// - permissionMode defaults to "default" if not specified
+// - permissionMode "plan" = read-only (no writes), agent must use ExitPlanMode to execute
+// - permissionMode "bypass" = skip all permission checks (dangerous)
+// - agentMode "plan" != permissionMode "plan" (one is behavior, one is restriction)
 
 POST /sessions/{}/messages
 {
