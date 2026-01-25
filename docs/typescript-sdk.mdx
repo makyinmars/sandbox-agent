@@ -1,0 +1,100 @@
+---
+title: "TypeScript SDK"
+description: "Generated types and a thin fetch-based client."
+---
+
+The TypeScript SDK is generated from the OpenAPI spec produced by the Rust server.
+
+## Generate types
+
+```bash
+pnpm --filter @sandbox-agent/typescript-sdk generate
+```
+
+This runs:
+
+- `cargo run -p sandbox-agent-openapi-gen` to emit OpenAPI JSON
+- `openapi-typescript` to generate types
+
+## Usage
+
+```ts
+import { SandboxDaemonClient } from "@sandbox-agent/typescript-sdk";
+
+const client = new SandboxDaemonClient({
+  baseUrl: "http://127.0.0.1:8787",
+  token: process.env.SANDBOX_TOKEN,
+});
+
+await client.createSession("my-session", { agent: "claude" });
+await client.postMessage("my-session", { message: "Hello" });
+const events = await client.getEvents("my-session", { offset: 0, limit: 50 });
+```
+
+## Endpoint mapping
+
+<details>
+<summary><strong>client.listAgents()</strong></summary>
+
+Maps to `GET /v1/agents`.
+</details>
+
+<details>
+<summary><strong>client.installAgent(agentId, body)</strong></summary>
+
+Maps to `POST /v1/agents/{agentId}/install`.
+</details>
+
+<details>
+<summary><strong>client.getAgentModes(agentId)</strong></summary>
+
+Maps to `GET /v1/agents/{agentId}/modes`.
+</details>
+
+<details>
+<summary><strong>client.createSession(sessionId, body)</strong></summary>
+
+Maps to `POST /v1/sessions/{sessionId}`.
+</details>
+
+<details>
+<summary><strong>client.postMessage(sessionId, body)</strong></summary>
+
+Maps to `POST /v1/sessions/{sessionId}/messages`.
+</details>
+
+<details>
+<summary><strong>client.getEvents(sessionId, params)</strong></summary>
+
+Maps to `GET /v1/sessions/{sessionId}/events`.
+</details>
+
+<details>
+<summary><strong>client.getEventsSse(sessionId, params)</strong></summary>
+
+Maps to `GET /v1/sessions/{sessionId}/events/sse` (raw SSE response).
+</details>
+
+<details>
+<summary><strong>client.streamEvents(sessionId, params)</strong></summary>
+
+Helper that parses SSE into `UniversalEvent` objects.
+</details>
+
+<details>
+<summary><strong>client.replyQuestion(sessionId, questionId, body)</strong></summary>
+
+Maps to `POST /v1/sessions/{sessionId}/questions/{questionId}/reply`.
+</details>
+
+<details>
+<summary><strong>client.rejectQuestion(sessionId, questionId)</strong></summary>
+
+Maps to `POST /v1/sessions/{sessionId}/questions/{questionId}/reject`.
+</details>
+
+<details>
+<summary><strong>client.replyPermission(sessionId, permissionId, body)</strong></summary>
+
+Maps to `POST /v1/sessions/{sessionId}/permissions/{permissionId}/reply`.
+</details>

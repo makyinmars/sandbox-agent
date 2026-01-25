@@ -24,7 +24,7 @@ const TARGET_TYPES = [
 ];
 
 function findTypesPath(): string | null {
-  const baseDir = join(import.meta.dirname, "..");
+  const baseDir = join(import.meta.dirname, "..", "..", "resources", "agent-schemas");
 
   for (const relativePath of POSSIBLE_PATHS) {
     const fullPath = join(baseDir, relativePath);
@@ -50,7 +50,7 @@ export async function extractCodexSchema(): Promise<NormalizedSchema> {
 
   const config: Config = {
     path: typesPath,
-    tsconfig: join(import.meta.dirname, "..", "tsconfig.json"),
+    tsconfig: join(import.meta.dirname, "..", "..", "resources", "agent-schemas", "tsconfig.json"),
     type: "*",
     skipTypeCheck: true,
     topRef: false,

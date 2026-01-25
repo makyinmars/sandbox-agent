@@ -1,0 +1,27 @@
+---
+title: "Docker (dev)"
+description: "Build and run the daemon in a Docker container."
+---
+
+## Build the binary
+
+Use the release Dockerfile to build a static binary:
+
+```bash
+docker build -f docker/release/linux-x86_64.Dockerfile -t sandbox-agent-build .
+
+docker run --rm -v "$PWD/artifacts:/artifacts" sandbox-agent-build
+```
+
+The binary will be written to `./artifacts/sandbox-agent-x86_64-unknown-linux-musl`.
+
+## Run the daemon
+
+```bash
+docker run --rm -p 8787:8787 \
+  -v "$PWD/artifacts:/artifacts" \
+  debian:bookworm-slim \
+  /artifacts/sandbox-agent-x86_64-unknown-linux-musl --token "$SANDBOX_TOKEN" --host 0.0.0.0 --port 8787
+```
+
+You can now access the API at `http://localhost:8787`.

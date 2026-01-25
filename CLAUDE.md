@@ -18,6 +18,34 @@ Universal schema guidance:
 - When changing the HTTP API, update the TypeScript SDK and CLI together.
 - Do not make breaking changes to API endpoints.
 
+### CLI ⇄ HTTP endpoint map (keep in sync)
+
+- `sandbox-agent agents list` ↔ `GET /v1/agents`
+- `sandbox-agent agents install` ↔ `POST /v1/agents/{agent}/install`
+- `sandbox-agent agents modes` ↔ `GET /v1/agents/{agent}/modes`
+- `sandbox-agent sessions create` ↔ `POST /v1/sessions/{sessionId}`
+- `sandbox-agent sessions send-message` ↔ `POST /v1/sessions/{sessionId}/messages`
+- `sandbox-agent sessions events` / `get-messages` ↔ `GET /v1/sessions/{sessionId}/events`
+- `sandbox-agent sessions events-sse` ↔ `GET /v1/sessions/{sessionId}/events/sse`
+- `sandbox-agent sessions reply-question` ↔ `POST /v1/sessions/{sessionId}/questions/{questionId}/reply`
+- `sandbox-agent sessions reject-question` ↔ `POST /v1/sessions/{sessionId}/questions/{questionId}/reject`
+- `sandbox-agent sessions reply-permission` ↔ `POST /v1/sessions/{sessionId}/permissions/{permissionId}/reply`
+
+### Default port references (update when CLI default changes)
+
+- `frontend/packages/web/src/App.tsx`
+- `README.md`
+- `docs/cli.mdx`
+- `docs/frontend.mdx`
+- `docs/index.mdx`
+- `docs/quickstart.mdx`
+- `docs/typescript-sdk.mdx`
+- `docs/deployments/cloudflare-sandboxes.mdx`
+- `docs/deployments/daytona.mdx`
+- `docs/deployments/docker.mdx`
+- `docs/deployments/e2b.mdx`
+- `docs/deployments/vercel-sandboxes.mdx`
+
 ## Git Commits
 
 - Do not include any co-authors in commit messages (no `Co-Authored-By` lines)

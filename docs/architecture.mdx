@@ -1,0 +1,45 @@
+---
+title: "Architecture"
+description: "How the daemon, schemas, and agents fit together."
+---
+
+Sandbox Agent SDK is built around a single daemon that runs inside the sandbox and exposes a universal HTTP API. Clients use the API (or the TypeScript SDK / CLI) to create sessions, send messages, and stream events.
+
+## Components
+
+- **Daemon**: Rust HTTP server that manages agent processes and streaming.
+- **Universal schema**: Shared input/output types for messages and events.
+- **SDKs & CLI**: Convenience wrappers around the HTTP API.
+
+## Session model
+
+- **Session ID**: Client-provided primary session identifier.
+- **Agent session ID**: Underlying ID from the agent (thread/session). This is surfaced in events but is not the primary key.
+
+## Event streaming
+
+- Events are stored in memory per session and assigned a monotonically increasing `id`.
+- `/events` returns a slice of events by offset/limit.
+- `/events/sse` streams new events from the same offset semantics.
+
+## Agent integration strategies
+
+### Subprocess per session
+
+Claude Code, Codex, and Amp run as subprocesses. The daemon reads JSONL output from stdout and converts each event into a UniversalEvent.
+
+### Shared server (OpenCode)
+
+OpenCode runs as a shared server. The daemon connects via HTTP and SSE, then converts OpenCode events to UniversalEvents.
+
+## Human-in-the-loop
+
+Questions and permission prompts are normalized into the universal schema:
+
+- Question events surface as `questionAsked` with selectable options.
+- Permission events surface as `permissionAsked` with `reply: once | always | reject`.
+- Claude plan approval is normalized into a question event (approve/reject).
+
+## Authentication
+
+The daemon uses a **global token** configured at startup. All HTTP and CLI operations reuse the same token and are validated against the `Authorization` header (`Bearer` or `Token`) or `x-sandbox-token`.

@@ -1,0 +1,20 @@
+---
+title: "Frontend Demo"
+description: "Run the Vite + React UI for testing the daemon."
+---
+
+The demo frontend lives at `frontend/packages/web`.
+
+## Run locally
+
+```bash
+pnpm install
+pnpm --filter @sandbox-agent/web dev
+```
+
+The UI expects:
+
+- Endpoint (e.g. `http://127.0.0.1:8787`)
+- Optional token
+
+If you see CORS errors, enable CORS on the daemon with `--cors-allow-origin` and related flags.

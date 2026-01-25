@@ -2,7 +2,14 @@ import { createHash } from "crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync } from "fs";
 import { join } from "path";
 
-const CACHE_DIR = join(import.meta.dirname, "..", ".cache");
+const CACHE_DIR = join(
+  import.meta.dirname,
+  "..",
+  "..",
+  "resources",
+  "agent-schemas",
+  ".cache"
+);
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 interface CacheEntry<T> {

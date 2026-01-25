@@ -4,11 +4,11 @@
   "type": "module",
   "license": "Apache-2.0",
   "scripts": {
-    "extract": "tsx src/index.ts",
-    "extract:opencode": "tsx src/index.ts --agent=opencode",
-    "extract:claude": "tsx src/index.ts --agent=claude",
-    "extract:codex": "tsx src/index.ts --agent=codex",
-    "extract:amp": "tsx src/index.ts --agent=amp"
+    "extract": "tsx ../../src/agents/index.ts",
+    "extract:opencode": "tsx ../../src/agents/index.ts --agent=opencode",
+    "extract:claude": "tsx ../../src/agents/index.ts --agent=claude",
+    "extract:codex": "tsx ../../src/agents/index.ts --agent=codex",
+    "extract:amp": "tsx ../../src/agents/index.ts --agent=amp"
   },
   "dependencies": {
     "ts-json-schema-generator": "^2.4.0",

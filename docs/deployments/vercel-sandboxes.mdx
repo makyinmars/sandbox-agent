@@ -1,0 +1,21 @@
+---
+title: "Vercel Sandboxes"
+description: "Run the daemon inside Vercel Sandboxes." 
+---
+
+## Steps
+
+1. Provision a Vercel Sandbox with network access and storage.
+2. Install the agent binaries you need.
+3. Run the daemon and expose the port.
+
+```bash
+export SANDBOX_TOKEN="..."
+
+cargo run -p sandbox-agent -- \
+  --token "$SANDBOX_TOKEN" \
+  --host 0.0.0.0 \
+  --port 8787
+```
+
+4. Configure your client to use the sandbox URL.

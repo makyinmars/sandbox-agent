@@ -22,8 +22,9 @@
 ## CLI
 - [x] Implement clap CLI flags: `--token`, `--no-token`, `--host`, `--port`, CORS flags
 - [x] Implement a CLI endpoint for every HTTP endpoint
-- [ ] Update `CLAUDE.md` to keep CLI endpoints in sync with HTTP API changes
+- [x] Update `CLAUDE.md` to keep CLI endpoints in sync with HTTP API changes
 - [x] Prefix CLI API requests with `/v1`
+- [x] Add CLI credentials extractor subcommand
 
 ## HTTP API Endpoints
 - [x] POST `/agents/{}/install` with `reinstall` handling
@@ -96,3 +97,4 @@
 - [x] implement release pipeline
 - implement e2b example
 - implement typescript "start locally" by pulling form server using version
+- [x] Move agent schema sources to src/agents

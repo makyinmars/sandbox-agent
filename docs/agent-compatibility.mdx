@@ -1,0 +1,26 @@
+---
+title: "Agent Compatibility"
+description: "Supported agents, install methods, and streaming formats."
+---
+
+## Compatibility matrix
+
+| Agent | Provider | Binary | Install method | Session ID | Streaming format |
+|-------|----------|--------|----------------|------------|------------------|
+| Claude Code | Anthropic | `claude` | curl raw binary from GCS | `session_id` | JSONL via stdout |
+| Codex | OpenAI | `codex` | curl tarball from GitHub releases | `thread_id` | JSONL via stdout |
+| OpenCode | Multi-provider | `opencode` | curl tarball from GitHub releases | `session_id` | SSE or JSONL |
+| Amp | Sourcegraph | `amp` | curl raw binary from GCS | `session_id` | JSONL via stdout |
+
+## Agent modes
+
+- **OpenCode**: discovered via the server API.
+- **Claude Code / Codex / Amp**: hardcoded modes (typically `build`, `plan`, or `custom`).
+
+## Capability notes
+
+- **Questions / permissions**: OpenCode natively supports these workflows. Claude plan approval is normalized into a question event.
+- **Streaming**: all agents stream events; OpenCode uses SSE while others use JSONL.
+- **Files and images**: normalized via `UniversalMessagePart` with `File` and `Image` parts.
+
+See [Universal API](/universal-api) for feature coverage details.

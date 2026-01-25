@@ -184,6 +184,9 @@ struct SessionState {
     model: Option<String>,
     variant: Option<String>,
     agent_session_id: Option<String>,
+    ended: bool,
+    ended_exit_code: Option<i32>,
+    ended_message: Option<String>,
     next_event_id: u64,
     events: Vec<UniversalEvent>,
     pending_questions: HashSet<String>,
@@ -213,6 +216,9 @@ impl SessionState {
             model: request.model.clone(),
             variant: request.variant.clone(),
             agent_session_id: None,
+            ended: false,
+            ended_exit_code: None,
+            ended_message: None,
             next_event_id: 0,
             events: Vec::new(),
             pending_questions: HashSet::new(),
@@ -289,6 +295,23 @@ impl SessionState {
 
     fn take_permission(&mut self, permission_id: &str) -> bool {
         self.pending_permissions.remove(permission_id)
+    }
+
+    fn mark_ended(&mut self, exit_code: Option<i32>, message: String) {
+        self.ended = true;
+        self.ended_exit_code = exit_code;
+        self.ended_message = Some(message);
+    }
+
+    fn ended_error(&self) -> Option<SandboxError> {
+        if !self.ended {
+            return None;
+        }
+        Some(SandboxError::AgentProcessExited {
+            agent: self.agent.as_str().to_string(),
+            exit_code: self.ended_exit_code,
+            stderr: self.ended_message.clone(),
+        })
     }
 }
 
@@ -408,7 +431,7 @@ impl SessionManager {
         session_id: String,
         message: String,
     ) -> Result<(), SandboxError> {
-        let session_snapshot = self.session_snapshot(&session_id).await?;
+        let session_snapshot = self.session_snapshot(&session_id, false).await?;
         if session_snapshot.agent == AgentId::Opencode {
             self.ensure_opencode_stream(session_id.clone()).await?;
             self.send_opencode_prompt(&session_snapshot, &message).await?;
@@ -511,6 +534,9 @@ impl SessionManager {
             let session = sessions.get_mut(session_id).ok_or_else(|| SandboxError::SessionNotFound {
                 session_id: session_id.to_string(),
             })?;
+            if let Some(err) = session.ended_error() {
+                return Err(err);
+            }
             if !session.take_question(question_id) {
                 return Err(SandboxError::InvalidRequest {
                     message: format!("unknown question id: {question_id}"),
@@ -542,6 +568,9 @@ impl SessionManager {
             let session = sessions.get_mut(session_id).ok_or_else(|| SandboxError::SessionNotFound {
                 session_id: session_id.to_string(),
             })?;
+            if let Some(err) = session.ended_error() {
+                return Err(err);
+            }
             if !session.take_question(question_id) {
                 return Err(SandboxError::InvalidRequest {
                     message: format!("unknown question id: {question_id}"),
@@ -574,6 +603,9 @@ impl SessionManager {
             let session = sessions.get_mut(session_id).ok_or_else(|| SandboxError::SessionNotFound {
                 session_id: session_id.to_string(),
             })?;
+            if let Some(err) = session.ended_error() {
+                return Err(err);
+            }
             if !session.take_permission(permission_id) {
                 return Err(SandboxError::InvalidRequest {
                     message: format!("unknown permission id: {permission_id}"),
@@ -595,11 +627,20 @@ impl SessionManager {
         Ok(())
     }
 
-    async fn session_snapshot(&self, session_id: &str) -> Result<SessionSnapshot, SandboxError> {
+    async fn session_snapshot(
+        &self,
+        session_id: &str,
+        allow_ended: bool,
+    ) -> Result<SessionSnapshot, SandboxError> {
         let sessions = self.sessions.lock().await;
         let session = sessions.get(session_id).ok_or_else(|| SandboxError::SessionNotFound {
             session_id: session_id.to_string(),
         })?;
+        if !allow_ended {
+            if let Some(err) = session.ended_error() {
+                return Err(err);
+            }
+        }
         Ok(SessionSnapshot::from(session))
     }
 
@@ -641,24 +682,45 @@ impl SessionManager {
             Ok(Ok(status)) if status.success() => {}
             Ok(Ok(status)) => {
                 let message = format!("agent exited with status {:?}", status);
-                self.record_error(&session_id, message, Some("process_exit".to_string()), None)
+                self.record_error(
+                    &session_id,
+                    message.clone(),
+                    Some("process_exit".to_string()),
+                    None,
+                )
+                    .await;
+                self.mark_session_ended(&session_id, status.code(), &message)
                     .await;
             }
             Ok(Err(err)) => {
+                let message = format!("failed to wait for agent: {err}");
                 self.record_error(
                     &session_id,
-                    format!("failed to wait for agent: {err}"),
+                    message.clone(),
                     Some("process_wait_failed".to_string()),
                     None,
                 )
                 .await;
+                self.mark_session_ended(
+                    &session_id,
+                    None,
+                    &message,
+                )
+                .await;
             }
             Err(err) => {
+                let message = format!("failed to join agent task: {err}");
                 self.record_error(
                     &session_id,
-                    format!("failed to join agent task: {err}"),
+                    message.clone(),
                     Some("process_wait_failed".to_string()),
                     None,
+                )
+                .await;
+                self.mark_session_ended(
+                    &session_id,
+                    None,
+                    &message,
                 )
                 .await;
             }
@@ -707,6 +769,16 @@ impl SessionManager {
             .await;
     }
 
+    async fn mark_session_ended(&self, session_id: &str, exit_code: Option<i32>, message: &str) {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(session_id) {
+            if session.ended {
+                return;
+            }
+            session.mark_ended(exit_code, message.to_string());
+        }
+    }
+
     async fn ensure_opencode_stream(self: &Arc<Self>, session_id: String) -> Result<(), SandboxError> {
         let agent_session_id = {
             let mut sessions = self.sessions.lock().await;
@@ -744,6 +816,12 @@ impl SessionManager {
                     None,
                 )
                 .await;
+                self.mark_session_ended(
+                    &session_id,
+                    None,
+                    "opencode server unavailable",
+                )
+                .await;
                 return;
             }
         };
@@ -757,6 +835,12 @@ impl SessionManager {
                     format!("OpenCode SSE connection failed: {err}"),
                     Some("opencode_stream".to_string()),
                     None,
+                )
+                .await;
+                self.mark_session_ended(
+                    &session_id,
+                    None,
+                    "opencode sse connection failed",
                 )
                 .await;
                 return;
@@ -773,6 +857,12 @@ impl SessionManager {
                 None,
             )
             .await;
+            self.mark_session_ended(
+                &session_id,
+                None,
+                "opencode sse error",
+            )
+            .await;
             return;
         }
 
@@ -787,6 +877,12 @@ impl SessionManager {
                         format!("OpenCode SSE stream error: {err}"),
                         Some("opencode_stream".to_string()),
                         None,
+                    )
+                    .await;
+                    self.mark_session_ended(
+                        &session_id,
+                        None,
+                        "opencode sse stream error",
                     )
                     .await;
                     return;

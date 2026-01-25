@@ -468,25 +468,27 @@ build typescript examples of how to deploy this to the given providres:
 
 these should each have a vitest unit test to test. cloudflaer is trickier since it requires a more complex setup.
 
-## readme docs
+## docs
 
-write a readme that doubles as docs for:
+Docs live in the `docs/` folder (Mintlify). The root `README.md` should stay brief and link to the docs site or local docs.
+
+Write docs that cover:
 
 - architecture
 - agent compatibility
-- deployemnt guide (these should be links to working examples)
+- deployment guide (link to working examples)
     - docker (for dev)
     - e2b
     - daytona
     - vercel sandboxes
     - cloudflare sandboxes
 - universal agent api feature checklist
-    - quesitons
+    - questions
     - approve plan
-    - etc (ie you need to infer what features are required to imeplment and what is optional)
+    - etc (infer what features are required vs optional)
 - cli
 - http api
 - running the example frontend
 - typescript sdk
 
-use the collapsible github sections for things like each api endpoint or each typescript sdk endpoint to collapse more info. this keeps the page readable.
+Use collapsible sections for each API endpoint or TypeScript SDK endpoint to keep the page readable.

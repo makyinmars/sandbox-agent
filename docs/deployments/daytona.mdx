@@ -1,0 +1,21 @@
+---
+title: "Daytona"
+description: "Run the daemon in a Daytona workspace." 
+---
+
+## Steps
+
+1. Create a Daytona workspace with Rust and curl available.
+2. Install or build the sandbox-agent binary.
+3. Start the daemon and expose port `8787` (or your preferred port).
+
+```bash
+export SANDBOX_TOKEN="..."
+
+cargo run -p sandbox-agent -- \
+  --token "$SANDBOX_TOKEN" \
+  --host 0.0.0.0 \
+  --port 8787
+```
+
+4. Use your Daytona port forwarding to reach the daemon from your client.

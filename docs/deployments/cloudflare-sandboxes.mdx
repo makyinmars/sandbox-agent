@@ -1,0 +1,21 @@
+---
+title: "Cloudflare Sandboxes"
+description: "Deploy the daemon in Cloudflare Sandboxes." 
+---
+
+## Steps
+
+1. Create a Cloudflare Sandbox with a Linux runtime.
+2. Install the agent binaries and the sandbox-agent daemon.
+3. Start the daemon and expose the HTTP port.
+
+```bash
+export SANDBOX_TOKEN="..."
+
+cargo run -p sandbox-agent -- \
+  --token "$SANDBOX_TOKEN" \
+  --host 0.0.0.0 \
+  --port 8787
+```
+
+4. Connect your client to the sandbox endpoint.

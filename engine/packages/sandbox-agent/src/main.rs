@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -5,6 +6,10 @@ use clap::{Args, Parser, Subcommand};
 use reqwest::blocking::Client as HttpClient;
 use reqwest::Method;
 use sandbox_agent_agent_management::agents::AgentManager;
+use sandbox_agent_agent_management::credentials::{
+    extract_all_credentials, AuthType, CredentialExtractionOptions, ExtractedCredentials,
+    ProviderCredentials,
+};
 use sandbox_agent_core::router::{
     AgentInstallRequest, AppState, AuthConfig, CreateSessionRequest, MessageRequest,
     PermissionReply, PermissionReplyRequest, QuestionReplyRequest,
@@ -26,35 +31,39 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, short = 'H', default_value = "127.0.0.1")]
     host: String,
 
-    #[arg(long, default_value_t = 8787)]
+    #[arg(long, short = 'p', default_value_t = 2468)]
     port: u16,
 
-    #[arg(long)]
+    #[arg(long, short = 't')]
     token: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, short = 'n')]
     no_token: bool,
 
-    #[arg(long = "cors-allow-origin")]
+    #[arg(long = "cors-allow-origin", short = 'O')]
     cors_allow_origin: Vec<String>,
 
-    #[arg(long = "cors-allow-method")]
+    #[arg(long = "cors-allow-method", short = 'M')]
     cors_allow_method: Vec<String>,
 
-    #[arg(long = "cors-allow-header")]
+    #[arg(long = "cors-allow-header", short = 'A')]
     cors_allow_header: Vec<String>,
 
-    #[arg(long = "cors-allow-credentials")]
+    #[arg(long = "cors-allow-credentials", short = 'C')]
     cors_allow_credentials: bool,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Manage installed agents and their modes.
     Agents(AgentsArgs),
+    /// Create sessions and interact with session events.
     Sessions(SessionsArgs),
+    /// Inspect locally discovered credentials.
+    Credentials(CredentialsArgs),
 }
 
 #[derive(Args, Debug)]
@@ -69,42 +78,65 @@ struct SessionsArgs {
     command: SessionsCommand,
 }
 
+#[derive(Args, Debug)]
+struct CredentialsArgs {
+    #[command(subcommand)]
+    command: CredentialsCommand,
+}
+
 #[derive(Subcommand, Debug)]
 enum AgentsCommand {
+    /// List all agents and install status.
     List(ClientArgs),
+    /// Install or reinstall an agent.
     Install(InstallAgentArgs),
+    /// Show available modes for an agent.
     Modes(AgentModesArgs),
 }
 
 #[derive(Subcommand, Debug)]
+enum CredentialsCommand {
+    /// Extract credentials using local discovery rules.
+    Extract(CredentialsExtractArgs),
+}
+
+#[derive(Subcommand, Debug)]
 enum SessionsCommand {
+    /// Create a new session for an agent.
     Create(CreateSessionArgs),
     #[command(name = "send-message")]
+    /// Send a message to an existing session.
     SendMessage(SessionMessageArgs),
     #[command(name = "get-messages")]
+    /// Alias for events; returns session events.
     GetMessages(SessionEventsArgs),
     #[command(name = "events")]
+    /// Fetch session events with offset/limit.
     Events(SessionEventsArgs),
     #[command(name = "events-sse")]
+    /// Stream session events over SSE.
     EventsSse(SessionEventsSseArgs),
     #[command(name = "reply-question")]
+    /// Reply to a question event.
     ReplyQuestion(QuestionReplyArgs),
     #[command(name = "reject-question")]
+    /// Reject a question event.
     RejectQuestion(QuestionRejectArgs),
     #[command(name = "reply-permission")]
+    /// Reply to a permission request.
     ReplyPermission(PermissionReplyArgs),
 }
 
 #[derive(Args, Debug, Clone)]
 struct ClientArgs {
-    #[arg(long)]
+    #[arg(long, short = 'e')]
     endpoint: Option<String>,
 }
 
 #[derive(Args, Debug)]
 struct InstallAgentArgs {
     agent: String,
-    #[arg(long)]
+    #[arg(long, short = 'r')]
     reinstall: bool,
     #[command(flatten)]
     client: ClientArgs,
@@ -120,17 +152,17 @@ struct AgentModesArgs {
 #[derive(Args, Debug)]
 struct CreateSessionArgs {
     session_id: String,
-    #[arg(long)]
+    #[arg(long, short = 'a')]
     agent: String,
-    #[arg(long)]
+    #[arg(long, short = 'g')]
     agent_mode: Option<String>,
-    #[arg(long)]
+    #[arg(long, short = 'p')]
     permission_mode: Option<String>,
-    #[arg(long)]
+    #[arg(long, short = 'm')]
     model: Option<String>,
-    #[arg(long)]
+    #[arg(long, short = 'v')]
     variant: Option<String>,
-    #[arg(long)]
+    #[arg(long, short = 'A')]
     agent_version: Option<String>,
     #[command(flatten)]
     client: ClientArgs,
@@ -139,7 +171,7 @@ struct CreateSessionArgs {
 #[derive(Args, Debug)]
 struct SessionMessageArgs {
     session_id: String,
-    #[arg(long)]
+    #[arg(long, short = 'm')]
     message: String,
     #[command(flatten)]
     client: ClientArgs,
@@ -148,9 +180,9 @@ struct SessionMessageArgs {
 #[derive(Args, Debug)]
 struct SessionEventsArgs {
     session_id: String,
-    #[arg(long)]
+    #[arg(long, short = 'o')]
     offset: Option<u64>,
-    #[arg(long)]
+    #[arg(long, short = 'l')]
     limit: Option<u64>,
     #[command(flatten)]
     client: ClientArgs,
@@ -159,7 +191,7 @@ struct SessionEventsArgs {
 #[derive(Args, Debug)]
 struct SessionEventsSseArgs {
     session_id: String,
-    #[arg(long)]
+    #[arg(long, short = 'o')]
     offset: Option<u64>,
     #[command(flatten)]
     client: ClientArgs,
@@ -169,7 +201,7 @@ struct SessionEventsSseArgs {
 struct QuestionReplyArgs {
     session_id: String,
     question_id: String,
-    #[arg(long)]
+    #[arg(long, short = 'a')]
     answers: String,
     #[command(flatten)]
     client: ClientArgs,
@@ -187,10 +219,24 @@ struct QuestionRejectArgs {
 struct PermissionReplyArgs {
     session_id: String,
     permission_id: String,
-    #[arg(long)]
+    #[arg(long, short = 'r')]
     reply: PermissionReply,
     #[command(flatten)]
     client: ClientArgs,
+}
+
+#[derive(Args, Debug)]
+struct CredentialsExtractArgs {
+    #[arg(long, short = 'a', value_enum)]
+    agent: Option<CredentialAgent>,
+    #[arg(long, short = 'p')]
+    provider: Option<String>,
+    #[arg(long, short = 'd')]
+    home_dir: Option<PathBuf>,
+    #[arg(long, short = 'n')]
+    no_oauth: bool,
+    #[arg(long, short = 'r')]
+    reveal: bool,
 }
 
 #[derive(Debug, Error)]
@@ -280,6 +326,7 @@ fn run_client(command: &Command, cli: &Cli) -> Result<(), CliError> {
     match command {
         Command::Agents(subcommand) => run_agents(&subcommand.command, cli),
         Command::Sessions(subcommand) => run_sessions(&subcommand.command, cli),
+        Command::Credentials(subcommand) => run_credentials(&subcommand.command),
     }
 }
 
@@ -378,6 +425,200 @@ fn run_sessions(command: &SessionsCommand, cli: &Cli) -> Result<(), CliError> {
             print_empty_response(response)
         }
     }
+}
+
+fn run_credentials(command: &CredentialsCommand) -> Result<(), CliError> {
+    match command {
+        CredentialsCommand::Extract(args) => {
+            let mut options = CredentialExtractionOptions::new();
+            if let Some(home_dir) = args.home_dir.clone() {
+                options.home_dir = Some(home_dir);
+            }
+            if args.no_oauth {
+                options.include_oauth = false;
+            }
+
+            let credentials = extract_all_credentials(&options);
+            if let Some(agent) = args.agent.clone() {
+                let token = select_token_for_agent(&credentials, agent, args.provider.as_deref())?;
+                write_stdout_line(&token)?;
+                return Ok(());
+            }
+            if let Some(provider) = args.provider.as_deref() {
+                let token = select_token_for_provider(&credentials, provider)?;
+                write_stdout_line(&token)?;
+                return Ok(());
+            }
+
+            let output = credentials_to_output(credentials, args.reveal);
+            let pretty = serde_json::to_string_pretty(&output)?;
+            write_stdout_line(&pretty)?;
+            Ok(())
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CredentialsOutput {
+    anthropic: Option<CredentialSummary>,
+    openai: Option<CredentialSummary>,
+    other: HashMap<String, CredentialSummary>,
+}
+
+#[derive(Serialize)]
+struct CredentialSummary {
+    provider: String,
+    source: String,
+    auth_type: String,
+    api_key: String,
+    redacted: bool,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum CredentialAgent {
+    Claude,
+    Codex,
+    Opencode,
+    Amp,
+}
+
+fn credentials_to_output(credentials: ExtractedCredentials, reveal: bool) -> CredentialsOutput {
+    CredentialsOutput {
+        anthropic: credentials.anthropic.map(|cred| summarize_credential(&cred, reveal)),
+        openai: credentials.openai.map(|cred| summarize_credential(&cred, reveal)),
+        other: credentials
+            .other
+            .into_iter()
+            .map(|(key, cred)| (key, summarize_credential(&cred, reveal)))
+            .collect(),
+    }
+}
+
+fn summarize_credential(credential: &ProviderCredentials, reveal: bool) -> CredentialSummary {
+    let api_key = if reveal {
+        credential.api_key.clone()
+    } else {
+        redact_key(&credential.api_key)
+    };
+    CredentialSummary {
+        provider: credential.provider.clone(),
+        source: credential.source.clone(),
+        auth_type: match credential.auth_type {
+            AuthType::ApiKey => "api_key".to_string(),
+            AuthType::Oauth => "oauth".to_string(),
+        },
+        api_key,
+        redacted: !reveal,
+    }
+}
+
+fn redact_key(key: &str) -> String {
+    let trimmed = key.trim();
+    let len = trimmed.len();
+    if len <= 8 {
+        return "****".to_string();
+    }
+    let prefix = &trimmed[..4];
+    let suffix = &trimmed[len - 4..];
+    format!("{prefix}...{suffix}")
+}
+
+fn select_token_for_agent(
+    credentials: &ExtractedCredentials,
+    agent: CredentialAgent,
+    provider: Option<&str>,
+) -> Result<String, CliError> {
+    match agent {
+        CredentialAgent::Claude | CredentialAgent::Amp => {
+            if let Some(provider) = provider {
+                if provider != "anthropic" {
+                    return Err(CliError::Server(format!(
+                        "agent {:?} only supports provider anthropic",
+                        agent
+                    )));
+                }
+            }
+            select_token_for_provider(credentials, "anthropic")
+        }
+        CredentialAgent::Codex => {
+            if let Some(provider) = provider {
+                if provider != "openai" {
+                    return Err(CliError::Server(format!(
+                        "agent {:?} only supports provider openai",
+                        agent
+                    )));
+                }
+            }
+            select_token_for_provider(credentials, "openai")
+        }
+        CredentialAgent::Opencode => {
+            if let Some(provider) = provider {
+                return select_token_for_provider(credentials, provider);
+            }
+            if let Some(openai) = credentials.openai.as_ref() {
+                return Ok(openai.api_key.clone());
+            }
+            if let Some(anthropic) = credentials.anthropic.as_ref() {
+                return Ok(anthropic.api_key.clone());
+            }
+            if credentials.other.len() == 1 {
+                if let Some((_, cred)) = credentials.other.iter().next() {
+                    return Ok(cred.api_key.clone());
+                }
+            }
+            let available = available_providers(credentials);
+            if available.is_empty() {
+                Err(CliError::Server(
+                    "no credentials found for opencode".to_string(),
+                ))
+            } else {
+                Err(CliError::Server(format!(
+                    "multiple providers available for opencode: {} (use --provider)",
+                    available.join(", ")
+                )))
+            }
+        }
+    }
+}
+
+fn select_token_for_provider(
+    credentials: &ExtractedCredentials,
+    provider: &str,
+) -> Result<String, CliError> {
+    if let Some(cred) = provider_credential(credentials, provider) {
+        Ok(cred.api_key.clone())
+    } else {
+        Err(CliError::Server(format!(
+            "no credentials found for provider {provider}"
+        )))
+    }
+}
+
+fn provider_credential<'a>(
+    credentials: &'a ExtractedCredentials,
+    provider: &str,
+) -> Option<&'a ProviderCredentials> {
+    match provider {
+        "openai" => credentials.openai.as_ref(),
+        "anthropic" => credentials.anthropic.as_ref(),
+        _ => credentials.other.get(provider),
+    }
+}
+
+fn available_providers(credentials: &ExtractedCredentials) -> Vec<String> {
+    let mut providers = Vec::new();
+    if credentials.openai.is_some() {
+        providers.push("openai".to_string());
+    }
+    if credentials.anthropic.is_some() {
+        providers.push("anthropic".to_string());
+    }
+    for key in credentials.other.keys() {
+        providers.push(key.clone());
+    }
+    providers.sort();
+    providers.dedup();
+    providers
 }
 
 fn build_cors_layer(cli: &Cli) -> Result<Option<CorsLayer>, CliError> {

@@ -1,0 +1,111 @@
+---
+title: "CLI"
+description: "CLI reference and server flags."
+---
+
+The `sandbox-agent` CLI mirrors the HTTP API so you can script everything without writing client code.
+
+## Server flags
+
+```bash
+sandbox-agent --token "$SANDBOX_TOKEN" --host 127.0.0.1 --port 8787
+```
+
+- `--token`: global token for all requests.
+- `--no-token`: disable auth (local dev only).
+- `--host`, `--port`: bind address.
+- `--cors-allow-origin`, `--cors-allow-method`, `--cors-allow-header`, `--cors-allow-credentials`: configure CORS.
+
+## Agent commands
+
+<details>
+<summary><strong>agents list</strong></summary>
+
+```bash
+sandbox-agent agents list --endpoint http://127.0.0.1:8787
+```
+</details>
+
+<details>
+<summary><strong>agents install</strong></summary>
+
+```bash
+sandbox-agent agents install claude --reinstall --endpoint http://127.0.0.1:8787
+```
+</details>
+
+<details>
+<summary><strong>agents modes</strong></summary>
+
+```bash
+sandbox-agent agents modes claude --endpoint http://127.0.0.1:8787
+```
+</details>
+
+## Session commands
+
+<details>
+<summary><strong>sessions create</strong></summary>
+
+```bash
+sandbox-agent sessions create my-session \
+  --agent claude \
+  --agent-mode build \
+  --permission-mode default \
+  --endpoint http://127.0.0.1:8787
+```
+</details>
+
+<details>
+<summary><strong>sessions send-message</strong></summary>
+
+```bash
+sandbox-agent sessions send-message my-session \
+  --message "Summarize the repository" \
+  --endpoint http://127.0.0.1:8787
+```
+</details>
+
+<details>
+<summary><strong>sessions events</strong></summary>
+
+```bash
+sandbox-agent sessions events my-session --offset 0 --limit 50 --endpoint http://127.0.0.1:8787
+```
+</details>
+
+<details>
+<summary><strong>sessions events-sse</strong></summary>
+
+```bash
+sandbox-agent sessions events-sse my-session --offset 0 --endpoint http://127.0.0.1:8787
+```
+</details>
+
+<details>
+<summary><strong>sessions reply-question</strong></summary>
+
+```bash
+sandbox-agent sessions reply-question my-session QUESTION_ID \
+  --answers "yes" \
+  --endpoint http://127.0.0.1:8787
+```
+</details>
+
+<details>
+<summary><strong>sessions reject-question</strong></summary>
+
+```bash
+sandbox-agent sessions reject-question my-session QUESTION_ID --endpoint http://127.0.0.1:8787
+```
+</details>
+
+<details>
+<summary><strong>sessions reply-permission</strong></summary>
+
+```bash
+sandbox-agent sessions reply-permission my-session PERMISSION_ID \
+  --reply once \
+  --endpoint http://127.0.0.1:8787
+```
+</details>

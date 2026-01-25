@@ -1,0 +1,25 @@
+---
+title: "E2B"
+description: "Deploy the daemon inside an E2B sandbox."
+---
+
+## Steps
+
+1. Start an E2B sandbox with network access.
+2. Install the agent binaries you need (Claude, Codex, OpenCode, Amp).
+3. Run the daemon and expose its port.
+
+Example startup script:
+
+```bash
+export SANDBOX_TOKEN="..."
+
+# Install sandbox-agent binary (or build from source)
+# TODO: replace with release download once published
+cargo run -p sandbox-agent -- \
+  --token "$SANDBOX_TOKEN" \
+  --host 0.0.0.0 \
+  --port 8787
+```
+
+4. Configure your client to connect to the sandbox endpoint.
