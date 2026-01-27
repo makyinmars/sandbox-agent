@@ -1,6 +1,5 @@
 ---
 source: server/packages/sandbox-agent/tests/http_sse_snapshots.rs
-assertion_line: 1232
 expression: snapshot
 ---
 session_a:
@@ -10,8 +9,10 @@ session_a:
     started:
       message: session.created
   - agent: claude
-    kind: unknown
+    kind: started
     seq: 2
+    started:
+      message: system.init
   - agent: claude
     kind: message
     message:
@@ -27,8 +28,10 @@ session_b:
     started:
       message: session.created
   - agent: claude
-    kind: unknown
+    kind: started
     seq: 2
+    started:
+      message: system.init
   - agent: claude
     kind: message
     message:

@@ -112,11 +112,13 @@ impl AgentManager {
 
     pub fn install(&self, agent: AgentId, options: InstallOptions) -> Result<InstallResult, AgentError> {
         let install_path = self.binary_path(agent);
-        if install_path.exists() && !options.reinstall {
-            return Ok(InstallResult {
-                path: install_path,
-                version: self.version(agent).unwrap_or(None),
-            });
+        if !options.reinstall {
+            if let Ok(existing_path) = self.resolve_binary(agent) {
+                return Ok(InstallResult {
+                    path: existing_path,
+                    version: self.version(agent).unwrap_or(None),
+                });
+            }
         }
 
         fs::create_dir_all(&self.install_dir)?;
@@ -135,7 +137,9 @@ impl AgentManager {
     }
 
     pub fn is_installed(&self, agent: AgentId) -> bool {
-        self.binary_path(agent).exists() || find_in_path(agent.binary_name()).is_some()
+        self.binary_path(agent).exists()
+            || find_in_path(agent.binary_name()).is_some()
+            || default_install_dir().join(agent.binary_name()).exists()
     }
 
     pub fn binary_path(&self, agent: AgentId) -> PathBuf {
@@ -367,6 +371,10 @@ impl AgentManager {
         }
         if let Some(path) = find_in_path(agent.binary_name()) {
             return Ok(path);
+        }
+        let fallback = default_install_dir().join(agent.binary_name());
+        if fallback.exists() {
+            return Ok(fallback);
         }
         Err(AgentError::BinaryNotFound { agent })
     }
@@ -778,6 +786,12 @@ fn find_in_path(binary_name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn default_install_dir() -> PathBuf {
+    dirs::data_dir()
+        .map(|dir| dir.join("sandbox-agent").join("bin"))
+        .unwrap_or_else(|| PathBuf::from(".").join(".sandbox-agent").join("bin"))
 }
 
 fn download_bytes(url: &Url) -> Result<Vec<u8>, AgentError> {

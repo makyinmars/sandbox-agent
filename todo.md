@@ -8,6 +8,8 @@
 - [x] Implement 2-way converters:
   - [x] Universal input message <-> agent-specific input
   - [x] Universal event <-> agent-specific event
+- [x] Normalize Claude system/init events into universal started events
+- [x] Support Codex CLI type-based event format in universal converter
 - [x] Enforce agentMode vs permissionMode semantics + defaults at the API boundary
 - [x] Ensure session id vs agentSessionId semantics are respected and surfaced consistently
 

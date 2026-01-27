@@ -1,5 +1,7 @@
 ## soon
 
+- implement stdin/stdout
+- switch sdk to use sdtin/stdout for embedded mdoe
 - discuss actor arch in readme + give example
 - skillfile
     - specifically include the release checklist

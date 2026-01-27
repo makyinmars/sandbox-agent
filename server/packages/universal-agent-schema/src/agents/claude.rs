@@ -7,6 +7,7 @@ use crate::{
     QuestionInfo,
     QuestionOption,
     QuestionRequest,
+    Started,
     UniversalEventData,
     UniversalMessage,
     UniversalMessageParsed,
@@ -20,6 +21,7 @@ pub fn event_to_universal_with_session(
 ) -> EventConversion {
     let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
     match event_type {
+        "system" => system_event_to_universal(event),
         "assistant" => assistant_event_to_universal(event),
         "tool_use" => tool_use_event_to_universal(event, session_id),
         "tool_result" => tool_result_event_to_universal(event),
@@ -112,6 +114,18 @@ fn assistant_event_to_universal(event: &Value) -> EventConversion {
         parts,
     });
     EventConversion::new(UniversalEventData::Message { message })
+}
+
+fn system_event_to_universal(event: &Value) -> EventConversion {
+    let subtype = event
+        .get("subtype")
+        .and_then(Value::as_str)
+        .unwrap_or("system");
+    let started = Started {
+        message: Some(format!("system.{subtype}")),
+        details: Some(event.clone()),
+    };
+    EventConversion::new(UniversalEventData::Started { started })
 }
 
 fn tool_use_event_to_universal(event: &Value, session_id: String) -> EventConversion {

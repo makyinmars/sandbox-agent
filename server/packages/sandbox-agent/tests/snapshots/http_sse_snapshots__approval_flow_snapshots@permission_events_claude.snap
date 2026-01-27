@@ -1,6 +1,5 @@
 ---
 source: server/packages/sandbox-agent/tests/http_sse_snapshots.rs
-assertion_line: 978
 expression: normalize_events(&permission_events)
 ---
 - agent: claude
@@ -9,8 +8,10 @@ expression: normalize_events(&permission_events)
   started:
     message: session.created
 - agent: claude
-  kind: unknown
+  kind: started
   seq: 2
+  started:
+    message: system.init
 - agent: claude
   kind: message
   message:

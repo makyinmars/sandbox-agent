@@ -8,8 +8,10 @@ expression: normalize_events(&question_events)
   started:
     message: session.created
 - agent: claude
-  kind: unknown
+  kind: started
   seq: 2
+  started:
+    message: system.init
 - agent: claude
   kind: message
   message:

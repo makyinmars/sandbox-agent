@@ -19,7 +19,7 @@ use tower_http::cors::CorsLayer;
 const PROMPT: &str = "Reply with exactly the single word OK.";
 const PERMISSION_PROMPT: &str = "List files in the current directory using available tools.";
 const QUESTION_PROMPT: &str =
-    "Ask the user a multiple-choice question with options yes/no using any built-in AskUserQuestion tool, then wait.";
+    "Use the AskUserQuestion tool to ask exactly one yes/no question, then wait for a reply. Do not answer yourself.";
 
 struct TestApp {
     app: Router,
@@ -1022,7 +1022,7 @@ async fn approval_flow_snapshots() {
         }
 
         let question_reply_session = format!("question-reply-{}", config.agent.as_str());
-        create_session(&app.app, config.agent, &question_reply_session, test_permission_mode(config.agent)).await;
+        create_session(&app.app, config.agent, &question_reply_session, "plan").await;
         let status = send_status(
             &app.app,
             Method::POST,
@@ -1083,7 +1083,7 @@ async fn approval_flow_snapshots() {
         }
 
         let question_reject_session = format!("question-reject-{}", config.agent.as_str());
-        create_session(&app.app, config.agent, &question_reject_session, test_permission_mode(config.agent)).await;
+        create_session(&app.app, config.agent, &question_reject_session, "plan").await;
         let status = send_status(
             &app.app,
             Method::POST,

@@ -3,11 +3,17 @@
 Universal API for running Claude Code, Codex, OpenCode, and Amp inside sandboxes.
 
 - **Any coding agent**: Universal API to interact with all agents with full feature coverage
-- **Server Mode**: Run as HTTP server from any sandbox provider or as TypeScript & Python SDK
+- **Server, stdin/stdout, or SDK mode**: Run as an HTTP server, CLI using stdin/stdout, or with the SDK
 - **Universal session schema**: Universal schema to store agent transcripts
 - **Supports your sandbox provider**: Daytona, E2B, Vercel Sandboxes, and more
 - **Lightweight, portable Rust binary**: Install anywhere with 1 curl command
 - **OpenAPI spec**: Versioned API schema tracked in `sdks/openapi/openapi.json`
+
+Coming soon:
+
+- **Vercel AI SDK Compatibility**: Works with existing AI SDK tooling, like `useChat`
+- **Auto-configure MCP & Skills**: Auto-load MCP servers & skills for your agents
+- **Process & logs manager**: Manage processes, logs, and ports for your agents to run background processes
 
 ## Agent Support
 
@@ -62,13 +68,22 @@ Features out of scope:
 ## FAQ
 
 **Why not use PTY?**
-PTY-based approaches require parsing terminal escape sequences and dealing with interactive prompts. The agents we support all have machine-readable output modes (JSONL, HTTP APIs) that provide structured events, making integration more reliable.
+
+PTY-based approaches require parsing terminal escape sequences and dealing with interactive prompts.
+
+The agents we support all have machine-readable output modes (JSONL, HTTP APIs) that provide structured events, making integration more reliable.
 
 **Why not use features that already exist on sandbox provider APIs?**
-Sandbox providers focus on infrastructure (containers, VMs, networking). This project focuses specifically on coding agent orchestration—session management, HITL (human-in-the-loop) flows, and universal event schemas. These concerns are complementary.
+
+Sandbox providers focus on infrastructure (containers, VMs, networking).
+
+This project focuses specifically on coding agent orchestration: session management, HITL (human-in-the-loop) flows, and universal event schemas. These concerns are complementary.
 
 **Does it support [platform]?**
 The server is a single Rust binary that runs anywhere with a curl install. If your platform can run Linux binaries (Docker, VMs, etc.), it works. See the deployment guides for E2B, Daytona, Vercel Sandboxes, and Docker.
 
 **Can I use this with my personal API keys?**
 Yes. Use `sandbox-agent credentials extract-env` to extract API keys from your local agent configs (Claude Code, Codex, OpenCode, Amp) and pass them to the sandbox environment.
+
+**Why rust?**
+TODO
