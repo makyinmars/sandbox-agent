@@ -600,9 +600,38 @@
           "planMode",
           "permissions",
           "questions",
-          "toolCalls"
+          "toolCalls",
+          "toolResults",
+          "textMessages",
+          "images",
+          "fileAttachments",
+          "sessionLifecycle",
+          "errorEvents",
+          "reasoning",
+          "commandExecution",
+          "fileChanges",
+          "mcpTools",
+          "streamingDeltas"
         ],
         "properties": {
+          "commandExecution": {
+            "type": "boolean"
+          },
+          "errorEvents": {
+            "type": "boolean"
+          },
+          "fileAttachments": {
+            "type": "boolean"
+          },
+          "fileChanges": {
+            "type": "boolean"
+          },
+          "images": {
+            "type": "boolean"
+          },
+          "mcpTools": {
+            "type": "boolean"
+          },
           "permissions": {
             "type": "boolean"
           },
@@ -612,7 +641,22 @@
           "questions": {
             "type": "boolean"
           },
+          "reasoning": {
+            "type": "boolean"
+          },
+          "sessionLifecycle": {
+            "type": "boolean"
+          },
+          "streamingDeltas": {
+            "type": "boolean"
+          },
+          "textMessages": {
+            "type": "boolean"
+          },
           "toolCalls": {
+            "type": "boolean"
+          },
+          "toolResults": {
             "type": "boolean"
           }
         }

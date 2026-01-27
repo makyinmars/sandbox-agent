@@ -1,46 +1,24 @@
-import {
-  Clipboard,
-  Cloud,
-  Download,
-  GitBranch,
-  HelpCircle,
-  MessageSquare,
-  PauseCircle,
-  PlayCircle,
-  Plus,
-  RefreshCw,
-  Send,
-  Shield,
-  Terminal,
-  Wrench,
-  Zap
-} from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  SandboxDaemonError,
-  createSandboxDaemonClient,
-  type SandboxDaemonClient,
+  SandboxAgentError,
+  SandboxAgent,
   type AgentInfo,
-  type AgentCapabilities,
   type AgentModeInfo,
   type PermissionEventData,
   type QuestionEventData,
   type SessionInfo,
   type UniversalEvent,
-  type UniversalItem,
-  type ContentPart
+  type UniversalItem
 } from "sandbox-agent";
+import ChatPanel from "./components/chat/ChatPanel";
+import type { TimelineEntry } from "./components/chat/types";
+import ConnectScreen from "./components/ConnectScreen";
+import DebugPanel, { type DebugTab } from "./components/debug/DebugPanel";
+import SessionSidebar from "./components/SessionSidebar";
+import type { RequestLog } from "./types/requestLog";
+import { buildCurl } from "./utils/http";
 
-type RequestLog = {
-  id: number;
-  method: string;
-  url: string;
-  body?: string;
-  status?: number;
-  time: string;
-  curl: string;
-  error?: string;
-};
+const defaultAgents = ["claude", "codex", "opencode", "amp", "mock"];
 
 type ItemEventData = {
   item: UniversalItem;
@@ -51,88 +29,6 @@ type ItemDeltaEventData = {
   native_item_id?: string | null;
   delta: string;
 };
-
-type TimelineEntry = {
-  id: string;
-  kind: "item" | "meta";
-  time: string;
-  item?: UniversalItem;
-  deltaText?: string;
-  meta?: {
-    title: string;
-    detail?: string;
-    severity?: "info" | "error";
-  };
-};
-
-type DebugTab = "log" | "events" | "approvals" | "agents";
-
-const defaultAgents = ["claude", "codex", "opencode", "amp"];
-const emptyCapabilities: AgentCapabilities = {
-  planMode: false,
-  permissions: false,
-  questions: false,
-  toolCalls: false
-};
-
-const formatJson = (value: unknown) => {
-  if (value === null || value === undefined) return "";
-  if (typeof value === "string") return value;
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
-};
-
-const escapeSingleQuotes = (value: string) => value.replace(/'/g, `'\\''`);
-
-const CapabilityBadges = ({ capabilities }: { capabilities: AgentCapabilities }) => {
-  const items = [
-    { key: "planMode", label: "Plan", icon: GitBranch, enabled: capabilities.planMode },
-    { key: "permissions", label: "Perms", icon: Shield, enabled: capabilities.permissions },
-    { key: "questions", label: "Q&A", icon: HelpCircle, enabled: capabilities.questions },
-    { key: "toolCalls", label: "Tools", icon: Wrench, enabled: capabilities.toolCalls }
-  ];
-
-  return (
-    <div className="capability-badges">
-      {items.map(({ key, label, icon: Icon, enabled }) => (
-        <span key={key} className={`capability-badge ${enabled ? "enabled" : "disabled"}`}>
-          <Icon size={12} />
-          <span>{label}</span>
-        </span>
-      ))}
-    </div>
-  );
-};
-
-const buildCurl = (method: string, url: string, body?: string, token?: string) => {
-  const headers: string[] = [];
-  if (token) {
-    headers.push(`-H 'Authorization: Bearer ${escapeSingleQuotes(token)}'`);
-  }
-  if (body) {
-    headers.push(`-H 'Content-Type: application/json'`);
-  }
-  const data = body ? `-d '${escapeSingleQuotes(body)}'` : "";
-  return `curl -X ${method} ${headers.join(" ")} ${data} '${escapeSingleQuotes(url)}'`
-    .replace(/\s+/g, " ")
-    .trim();
-};
-
-const getEventType = (event: UniversalEvent) => event.type;
-
-const formatTime = (value: string) => {
-  if (!value) return "";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleTimeString();
-};
-
-const getEventCategory = (type: string) => type.split(".")[0] ?? type;
-
-const getEventClass = (type: string) => type.replace(/\./g, "-");
 
 const buildStubItem = (itemId: string, nativeItemId?: string | null): UniversalItem => {
   return {
@@ -146,112 +42,6 @@ const buildStubItem = (itemId: string, nativeItemId?: string | null): UniversalI
   } as UniversalItem;
 };
 
-const getMessageClass = (item: UniversalItem) => {
-  if (item.kind === "tool_call" || item.kind === "tool_result") return "tool";
-  if (item.kind === "system" || item.kind === "status") return "system";
-  if (item.role === "user") return "user";
-  if (item.role === "tool") return "tool";
-  if (item.role === "system") return "system";
-  return "assistant";
-};
-
-const getAvatarLabel = (messageClass: string) => {
-  if (messageClass === "user") return "U";
-  if (messageClass === "tool") return "T";
-  if (messageClass === "system") return "S";
-  if (messageClass === "error") return "!";
-  return "AI";
-};
-
-const renderContentPart = (part: ContentPart, index: number) => {
-  const partType = (part as { type?: string }).type ?? "unknown";
-  const key = `${partType}-${index}`;
-  switch (partType) {
-    case "text":
-      return (
-        <div key={key} className="part">
-          <div className="part-body">{(part as { text: string }).text}</div>
-        </div>
-      );
-    case "json":
-      return (
-        <div key={key} className="part">
-          <div className="part-title">json</div>
-          <pre className="code-block">{formatJson((part as { json: unknown }).json)}</pre>
-        </div>
-      );
-    case "tool_call": {
-      const { name, arguments: args, call_id } = part as {
-        name: string;
-        arguments: string;
-        call_id: string;
-      };
-      return (
-        <div key={key} className="part">
-          <div className="part-title">
-            tool call - {name}
-            {call_id ? ` - ${call_id}` : ""}
-          </div>
-          {args ? <pre className="code-block">{args}</pre> : <div className="muted">No arguments</div>}
-        </div>
-      );
-    }
-    case "tool_result": {
-      const { call_id, output } = part as { call_id: string; output: string };
-      return (
-        <div key={key} className="part">
-          <div className="part-title">tool result - {call_id}</div>
-          {output ? <pre className="code-block">{output}</pre> : <div className="muted">No output</div>}
-        </div>
-      );
-    }
-    case "file_ref": {
-      const { path, action, diff } = part as { path: string; action: string; diff?: string | null };
-      return (
-        <div key={key} className="part">
-          <div className="part-title">file - {action}</div>
-          <div className="part-body mono">{path}</div>
-          {diff && <pre className="code-block">{diff}</pre>}
-        </div>
-      );
-    }
-    case "reasoning": {
-      const { text, visibility } = part as { text: string; visibility: string };
-      return (
-        <div key={key} className="part">
-          <div className="part-title">reasoning - {visibility}</div>
-          <div className="part-body muted">{text}</div>
-        </div>
-      );
-    }
-    case "image": {
-      const { path, mime } = part as { path: string; mime?: string | null };
-      return (
-        <div key={key} className="part">
-          <div className="part-title">image {mime ? `- ${mime}` : ""}</div>
-          <div className="part-body mono">{path}</div>
-        </div>
-      );
-    }
-    case "status": {
-      const { label, detail } = part as { label: string; detail?: string | null };
-      return (
-        <div key={key} className="part">
-          <div className="part-title">status - {label}</div>
-          {detail && <div className="part-body">{detail}</div>}
-        </div>
-      );
-    }
-    default:
-      return (
-        <div key={key} className="part">
-          <div className="part-title">unknown</div>
-          <pre className="code-block">{formatJson(part)}</pre>
-        </div>
-      );
-  }
-};
-
 const getDefaultEndpoint = () => {
   if (typeof window === "undefined") return "http://127.0.0.1:2468";
   const { origin, protocol } = window.location;
@@ -262,6 +52,7 @@ const getDefaultEndpoint = () => {
 };
 
 export default function App() {
+  const issueTrackerUrl = "https://github.com/rivet-dev/sandbox-agent/issues/new";
   const [endpoint, setEndpoint] = useState(getDefaultEndpoint);
   const [token, setToken] = useState("");
   const [connected, setConnected] = useState(false);
@@ -287,7 +78,7 @@ export default function App() {
 
   const [polling, setPolling] = useState(false);
   const pollTimerRef = useRef<number | null>(null);
-  const [streamMode, setStreamMode] = useState<"poll" | "sse">("poll");
+  const [streamMode, setStreamMode] = useState<"poll" | "sse">("sse");
   const [eventError, setEventError] = useState<string | null>(null);
 
   const [questionSelections, setQuestionSelections] = useState<Record<string, string[][]>>({});
@@ -302,7 +93,7 @@ export default function App() {
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  const clientRef = useRef<SandboxDaemonClient | null>(null);
+  const clientRef = useRef<SandboxAgent | null>(null);
   const sseAbortRef = useRef<AbortController | null>(null);
 
   const logRequest = useCallback((entry: RequestLog) => {
@@ -312,7 +103,7 @@ export default function App() {
     });
   }, []);
 
-  const createClient = useCallback(() => {
+  const createClient = useCallback(async () => {
     const fetchWithLog: typeof fetch = async (input, init) => {
       const method = init?.method ?? "GET";
       const url =
@@ -340,15 +131,15 @@ export default function App() {
         logged = true;
         return response;
       } catch (error) {
-        const message = error instanceof Error ? error.message : "Request failed";
+        const messageText = error instanceof Error ? error.message : "Request failed";
         if (!logged) {
-          logRequest({ ...entry, status: 0, error: message });
+          logRequest({ ...entry, status: 0, error: messageText });
         }
         throw error;
       }
     };
 
-    const client = createSandboxDaemonClient({
+    const client = await SandboxAgent.connect({
       baseUrl: endpoint,
       token: token || undefined,
       fetch: fetchWithLog
@@ -357,7 +148,7 @@ export default function App() {
     return client;
   }, [endpoint, token, logRequest]);
 
-  const getClient = useCallback((): SandboxDaemonClient => {
+  const getClient = useCallback((): SandboxAgent => {
     if (!clientRef.current) {
       throw new Error("Not connected");
     }
@@ -365,7 +156,7 @@ export default function App() {
   }, []);
 
   const getErrorMessage = (error: unknown, fallback: string) => {
-    if (error instanceof SandboxDaemonError) {
+    if (error instanceof SandboxAgentError) {
       return error.problem?.detail ?? error.problem?.title ?? error.message;
     }
     return error instanceof Error ? error.message : fallback;
@@ -377,7 +168,7 @@ export default function App() {
       setConnectError(null);
     }
     try {
-      const client = createClient();
+      const client = await createClient();
       await client.getHealth();
       setConnected(true);
       await refreshAgents();
@@ -387,8 +178,8 @@ export default function App() {
       }
     } catch (error) {
       if (reportError) {
-        const message = getErrorMessage(error, "Unable to connect");
-        setConnectError(message);
+        const messageText = getErrorMessage(error, "Unable to connect");
+        setConnectError(messageText);
       }
       setConnected(false);
       clientRef.current = null;
@@ -416,7 +207,6 @@ export default function App() {
       const data = await getClient().listAgents();
       const agentList = data.agents ?? [];
       setAgents(agentList);
-      // Auto-load modes for installed agents
       for (const agent of agentList) {
         if (agent.installed) {
           loadModes(agent.id);
@@ -463,7 +253,6 @@ export default function App() {
       await getClient().postMessage(sessionId, { message });
       setMessage("");
 
-      // Auto-start polling if not already
       if (!polling) {
         if (streamMode === "poll") {
           startPolling();
@@ -476,28 +265,6 @@ export default function App() {
     }
   };
 
-  const createSession = async () => {
-    setSessionError(null);
-    try {
-      const body: {
-        agent: string;
-        agentMode?: string;
-        permissionMode?: string;
-        model?: string;
-        variant?: string;
-      } = { agent: agentId };
-      if (agentMode) body.agentMode = agentMode;
-      if (permissionMode) body.permissionMode = permissionMode;
-      if (model) body.model = model;
-      if (variant) body.variant = variant;
-
-      await getClient().createSession(sessionId, body);
-      await fetchSessions();
-    } catch (error) {
-      setSessionError(getErrorMessage(error, "Unable to create session"));
-    }
-  };
-
   const selectSession = (session: SessionInfo) => {
     setSessionId(session.sessionId);
     setAgentId(session.agent);
@@ -505,7 +272,6 @@ export default function App() {
     setPermissionMode(session.permissionMode);
     setModel(session.model ?? "");
     setVariant(session.variant ?? "");
-    // Reset events and offset when switching sessions
     setEvents([]);
     setOffset(0);
     offsetRef.current = 0;
@@ -524,7 +290,6 @@ export default function App() {
     offsetRef.current = 0;
     setSessionError(null);
 
-    // Create the session
     try {
       const body: {
         agent: string;
@@ -573,7 +338,7 @@ export default function App() {
     if (pollTimerRef.current) return;
     setPolling(true);
     fetchEvents();
-    pollTimerRef.current = window.setInterval(fetchEvents, 2500);
+    pollTimerRef.current = window.setInterval(fetchEvents, 500);
   };
 
   const stopPolling = () => {
@@ -838,17 +603,26 @@ export default function App() {
   }, [connected]);
 
   useEffect(() => {
+    if (!connected || !sessionId || polling) return;
+    const hasSession = sessions.some((session) => session.sessionId === sessionId);
+    if (!hasSession) return;
+    if (streamMode === "poll") {
+      startPolling();
+    } else {
+      startSse();
+    }
+  }, [connected, sessionId, polling, streamMode, sessions]);
+
+  useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [transcriptEntries]);
 
-  // Auto-load modes when agent changes
   useEffect(() => {
     if (connected && agentId && !modesByAgent[agentId]) {
       loadModes(agentId);
     }
   }, [connected, agentId]);
 
-  // Set default mode when modes are loaded
   useEffect(() => {
     const modes = modesByAgent[agentId];
     if (modes && modes.length > 0 && !agentMode) {
@@ -857,13 +631,12 @@ export default function App() {
   }, [modesByAgent, agentId]);
 
   const availableAgents = agents.length ? agents.map((agent) => agent.id) : defaultAgents;
-  const currentAgent = agents.find((a) => a.id === agentId);
+  const currentAgent = agents.find((agent) => agent.id === agentId);
   const activeModes = modesByAgent[agentId] ?? [];
-  const pendingApprovals = questionRequests.length + permissionRequests.length;
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
       sendMessage();
     }
   };
@@ -884,79 +657,16 @@ export default function App() {
 
   if (!connected) {
     return (
-      <div className="app">
-        <header className="header">
-          <div className="header-left">
-            <div className="logo">SA</div>
-            <span className="header-title">Sandbox Agent</span>
-          </div>
-        </header>
-
-        <main className="landing">
-          <div className="landing-container">
-            <div className="landing-hero">
-              <div className="landing-logo">SA</div>
-              <h1 className="landing-title">Sandbox Agent</h1>
-              <p className="landing-subtitle">
-                Universal API for running Claude Code, Codex, OpenCode, and Amp inside sandboxes.
-              </p>
-            </div>
-
-            <div className="connect-card">
-              <div className="connect-card-title">Connect to Daemon</div>
-
-              {connectError && (
-                <div className="banner error">{connectError}</div>
-              )}
-
-              <label className="field">
-                <span className="label">Endpoint</span>
-                <input
-                  className="input"
-                  type="text"
-                  placeholder="http://localhost:2468"
-                  value={endpoint}
-                  onChange={(e) => setEndpoint(e.target.value)}
-                />
-              </label>
-
-              <label className="field">
-                <span className="label">Token (optional)</span>
-                <input
-                  className="input"
-                  type="password"
-                  placeholder="Bearer token"
-                  value={token}
-                  onChange={(e) => setToken(e.target.value)}
-                />
-              </label>
-
-              <button
-                className="button primary"
-                onClick={connect}
-                disabled={connecting}
-              >
-                {connecting ? (
-                  <>
-                    <span className="spinner" />
-                    Connecting...
-                  </>
-                ) : (
-                  <>
-                    <Zap className="button-icon" />
-                    Connect
-                  </>
-                )}
-              </button>
-
-              <p className="hint">
-                Start the daemon with CORS enabled for browser access:<br />
-                <code>sandbox-daemon server --cors-allow-origin http://localhost:5173</code>
-              </p>
-            </div>
-          </div>
-        </main>
-      </div>
+      <ConnectScreen
+        endpoint={endpoint}
+        token={token}
+        connectError={connectError}
+        connecting={connecting}
+        onEndpointChange={setEndpoint}
+        onTokenChange={setToken}
+        onConnect={connect}
+        reportUrl={issueTrackerUrl}
+      />
     );
   }
 
@@ -968,6 +678,9 @@ export default function App() {
           <span className="header-title">Sandbox Agent</span>
         </div>
         <div className="header-right">
+          <a className="button ghost small" href={issueTrackerUrl} target="_blank" rel="noreferrer">
+            Report Bug
+          </a>
           <span className="header-endpoint">{endpoint}</span>
           <button className="button secondary small" onClick={disconnect}>
             Disconnect
@@ -976,535 +689,67 @@ export default function App() {
       </header>
 
       <main className="main-layout">
-        {/* Session Sidebar */}
-        <div className="session-sidebar">
-          <div className="sidebar-header">
-            <span className="sidebar-title">Sessions</span>
-            <div className="sidebar-header-actions">
-              <button
-                className="sidebar-icon-btn"
-                onClick={fetchSessions}
-                title="Refresh sessions"
-              >
-                <RefreshCw size={14} />
-              </button>
-              <button
-                className="sidebar-add-btn"
-                onClick={createNewSession}
-                title="New session"
-              >
-                <Plus size={14} />
-              </button>
-            </div>
-          </div>
+        <SessionSidebar
+          sessions={sessions}
+          selectedSessionId={sessionId}
+          onSelectSession={selectSession}
+          onRefresh={fetchSessions}
+          onCreateSession={createNewSession}
+        />
 
-          <div className="session-list">
-            {sessions.length === 0 ? (
-              <div className="sidebar-empty">
-                No sessions yet.
-              </div>
-            ) : (
-              sessions.map((session) => (
-                <button
-                  key={session.sessionId}
-                  className={`session-item ${session.sessionId === sessionId ? "active" : ""}`}
-                  onClick={() => selectSession(session)}
-                >
-                  <div className="session-item-id">{session.sessionId}</div>
-                  <div className="session-item-meta">
-                    <span className="session-item-agent">{session.agent}</span>
-                    <span className="session-item-events">{session.eventCount} events</span>
-                    {session.ended && <span className="session-item-ended">ended</span>}
-                  </div>
-                </button>
-              ))
-            )}
-          </div>
-        </div>
+        <ChatPanel
+          sessionId={sessionId}
+          polling={polling}
+          transcriptEntries={transcriptEntries}
+          sessionError={sessionError}
+          message={message}
+          onMessageChange={setMessage}
+          onSendMessage={sendMessage}
+          onKeyDown={handleKeyDown}
+          onCreateSession={createNewSession}
+          messagesEndRef={messagesEndRef}
+          agentId={agentId}
+          agentMode={agentMode}
+          permissionMode={permissionMode}
+          model={model}
+          variant={variant}
+          streamMode={streamMode}
+          availableAgents={availableAgents}
+          activeModes={activeModes}
+          currentAgentVersion={currentAgent?.version ?? null}
+          onAgentChange={setAgentId}
+          onAgentModeChange={setAgentMode}
+          onPermissionModeChange={setPermissionMode}
+          onModelChange={setModel}
+          onVariantChange={setVariant}
+          onStreamModeChange={setStreamMode}
+          onToggleStream={toggleStream}
+          questionRequests={questionRequests}
+          permissionRequests={permissionRequests}
+          questionSelections={questionSelections}
+          onSelectQuestionOption={selectQuestionOption}
+          onAnswerQuestion={answerQuestion}
+          onRejectQuestion={rejectQuestion}
+          onReplyPermission={replyPermission}
+        />
 
-        {/* Chat Panel */}
-        <div className="chat-panel">
-          <div className="panel-header">
-            <div className="panel-header-left">
-              <MessageSquare className="button-icon" />
-              <span className="panel-title">Session</span>
-              {sessionId && <span className="session-id-display">{sessionId}</span>}
-            </div>
-            {polling && (
-              <span className="pill accent">Live</span>
-            )}
-          </div>
-
-          <div className="messages-container">
-            {!sessionId ? (
-              <div className="empty-state">
-                <MessageSquare className="empty-state-icon" />
-                <div className="empty-state-title">No Session Selected</div>
-                <p className="empty-state-text">
-                  Create a new session to start chatting with an agent.
-                </p>
-                <button className="button primary" onClick={createNewSession}>
-                  <Plus className="button-icon" />
-                  Create Session
-                </button>
-              </div>
-            ) : transcriptEntries.length === 0 && !sessionError ? (
-              <div className="empty-state">
-                <Terminal className="empty-state-icon" />
-                <div className="empty-state-title">Ready to Chat</div>
-                <p className="empty-state-text">
-                  Send a message to start a conversation with the agent.
-                </p>
-              </div>
-            ) : (
-              <div className="messages">
-                {transcriptEntries.map((entry) => {
-                  if (entry.kind === "meta") {
-                    const messageClass = entry.meta?.severity === "error" ? "error" : "system";
-                    return (
-                      <div key={entry.id} className={`message ${messageClass}`}>
-                        <div className="avatar">{getAvatarLabel(messageClass)}</div>
-                        <div className="message-content">
-                          <div className="message-meta">
-                            <span>{entry.meta?.title ?? "Status"}</span>
-                          </div>
-                          {entry.meta?.detail && <div className="part-body">{entry.meta.detail}</div>}
-                        </div>
-                      </div>
-                    );
-                  }
-
-                  const item = entry.item;
-                  if (!item) return null;
-                  const hasParts = (item.content ?? []).length > 0;
-                  const isInProgress = item.status === "in_progress";
-                  const isFailed = item.status === "failed";
-                  const messageClass = getMessageClass(item);
-                  const statusLabel = item.status !== "completed" ? item.status.replace("_", " ") : "";
-                  const kindLabel = item.kind.replace("_", " ");
-
-                  return (
-                    <div key={entry.id} className={`message ${messageClass} ${isFailed ? "error" : ""}`}>
-                      <div className="avatar">{getAvatarLabel(isFailed ? "error" : messageClass)}</div>
-                      <div className="message-content">
-                        {(item.kind !== "message" || item.status !== "completed") && (
-                          <div className="message-meta">
-                            <span>{kindLabel}</span>
-                            {statusLabel && (
-                              <span className={`pill ${item.status === "failed" ? "danger" : "accent"}`}>
-                                {statusLabel}
-                              </span>
-                            )}
-                          </div>
-                        )}
-                        {hasParts ? (
-                          (item.content ?? []).map(renderContentPart)
-                        ) : entry.deltaText ? (
-                          <span>
-                            {entry.deltaText}
-                            {isInProgress && <span className="cursor" />}
-                          </span>
-                        ) : (
-                          <span className="muted">No content yet.</span>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
-                {sessionError && (
-                  <div className="message-error">
-                    {sessionError}
-                  </div>
-                )}
-                <div ref={messagesEndRef} />
-              </div>
-            )}
-          </div>
-
-          {/* Input Area */}
-          <div className="input-container">
-            <div className="input-wrapper">
-              <textarea
-                value={message}
-                onChange={(e) => setMessage(e.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder={sessionId ? "Send a message..." : "Select or create a session first"}
-                rows={1}
-                disabled={!sessionId}
-              />
-              <button
-                className="send-button"
-                onClick={sendMessage}
-                disabled={!sessionId || !message.trim()}
-              >
-                <Send />
-              </button>
-            </div>
-          </div>
-
-          {/* Setup Controls Row */}
-          <div className="setup-row">
-            <select
-              className="setup-select"
-              value={agentId}
-              onChange={(e) => setAgentId(e.target.value)}
-              title="Agent"
-            >
-              {availableAgents.map((id) => (
-                <option key={id} value={id}>{id}</option>
-              ))}
-            </select>
-
-            <select
-              className="setup-select"
-              value={agentMode}
-              onChange={(e) => setAgentMode(e.target.value)}
-              title="Mode"
-            >
-              {activeModes.length > 0 ? (
-                activeModes.map((mode) => (
-                  <option key={mode.id} value={mode.id}>{mode.name || mode.id}</option>
-                ))
-              ) : (
-                <option value="">mode</option>
-              )}
-            </select>
-
-            <select
-              className="setup-select"
-              value={permissionMode}
-              onChange={(e) => setPermissionMode(e.target.value)}
-              title="Permission Mode"
-            >
-              <option value="default">default</option>
-              <option value="plan">plan</option>
-              <option value="bypass">bypass</option>
-            </select>
-
-            <input
-              className="setup-input"
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              placeholder="model"
-              title="Model"
-            />
-
-            <input
-              className="setup-input"
-              value={variant}
-              onChange={(e) => setVariant(e.target.value)}
-              placeholder="variant"
-              title="Variant"
-            />
-
-            <div className="setup-stream">
-              <select
-                className="setup-select-small"
-                value={streamMode}
-                onChange={(e) => setStreamMode(e.target.value as "poll" | "sse")}
-                title="Stream Mode"
-              >
-                <option value="poll">poll</option>
-                <option value="sse">sse</option>
-              </select>
-              <button
-                className={`setup-stream-btn ${polling ? "active" : ""}`}
-                onClick={toggleStream}
-                title={polling ? "Stop streaming" : "Start streaming"}
-              >
-                {polling ? <PauseCircle size={14} /> : <PlayCircle size={14} />}
-              </button>
-            </div>
-
-            {currentAgent?.version && (
-              <span className="setup-version" title="Installed version">
-                v{currentAgent.version}
-              </span>
-            )}
-          </div>
-        </div>
-
-        {/* Debug Panel - Right */}
-        <div className="debug-panel">
-          <div className="debug-tabs">
-            <button
-              className={`debug-tab ${debugTab === "events" ? "active" : ""}`}
-              onClick={() => setDebugTab("events")}
-            >
-              <PlayCircle className="button-icon" style={{ marginRight: 4, width: 12, height: 12 }} />
-              Events
-              {events.length > 0 && (
-                <span className="debug-tab-badge">{events.length}</span>
-              )}
-            </button>
-            <button
-              className={`debug-tab ${debugTab === "log" ? "active" : ""}`}
-              onClick={() => setDebugTab("log")}
-            >
-              <Terminal className="button-icon" style={{ marginRight: 4, width: 12, height: 12 }} />
-              Request Log
-            </button>
-            <button
-              className={`debug-tab ${debugTab === "approvals" ? "active" : ""}`}
-              onClick={() => setDebugTab("approvals")}
-            >
-              <Shield className="button-icon" style={{ marginRight: 4, width: 12, height: 12 }} />
-              Approvals
-              {pendingApprovals > 0 && (
-                <span className="debug-tab-badge">{pendingApprovals}</span>
-              )}
-            </button>
-            <button
-              className={`debug-tab ${debugTab === "agents" ? "active" : ""}`}
-              onClick={() => setDebugTab("agents")}
-            >
-              <Cloud className="button-icon" style={{ marginRight: 4, width: 12, height: 12 }} />
-              Agents
-            </button>
-          </div>
-
-          <div className="debug-content">
-            {/* Log Tab */}
-            {debugTab === "log" && (
-              <>
-                <div className="inline-row" style={{ marginBottom: 12, justifyContent: "space-between" }}>
-                  <span className="card-meta">{requestLog.length} requests</span>
-                  <button className="button ghost small" onClick={() => setRequestLog([])}>
-                    Clear
-                  </button>
-                </div>
-
-                {requestLog.length === 0 ? (
-                  <div className="card-meta">No requests logged yet.</div>
-                ) : (
-                  requestLog.map((entry) => (
-                    <div key={entry.id} className="log-item">
-                      <span className="log-method">{entry.method}</span>
-                      <span className="log-url text-truncate">{entry.url}</span>
-                      <span className={`log-status ${entry.status && entry.status < 400 ? "ok" : "error"}`}>
-                        {entry.status || "ERR"}
-                      </span>
-                      <div className="log-meta">
-                        <span>{entry.time}{entry.error && ` - ${entry.error}`}</span>
-                        <button className="copy-button" onClick={() => handleCopy(entry)}>
-                          <Clipboard />
-                          {copiedLogId === entry.id ? "Copied" : "curl"}
-                        </button>
-                      </div>
-                    </div>
-                  ))
-                )}
-              </>
-            )}
-
-            {/* Events Tab */}
-            {debugTab === "events" && (
-              <>
-                <div className="inline-row" style={{ marginBottom: 12, justifyContent: "space-between" }}>
-                  <span className="card-meta">Offset: {offset}</span>
-                  <div className="inline-row">
-                    <button className="button ghost small" onClick={fetchEvents}>
-                      Fetch
-                    </button>
-                    <button className="button ghost small" onClick={resetEvents}>
-                      Clear
-                    </button>
-                  </div>
-                </div>
-
-                {events.length === 0 ? (
-                  <div className="card-meta">No events yet. Start streaming to receive events.</div>
-                ) : (
-                  <div className="event-list">
-                    {[...events].reverse().map((event) => {
-                      const type = getEventType(event);
-                      const category = getEventCategory(type);
-                      const eventClass = `${category} ${getEventClass(type)}`;
-                      return (
-                        <div key={event.event_id ?? event.sequence} className="event-item">
-                          <div className="event-header">
-                            <span className={`event-type ${eventClass}`}>{type}</span>
-                            <span className="event-time">{formatTime(event.time)}</span>
-                          </div>
-                          <div className="event-id">
-                            Event #{event.event_id || event.sequence} - seq {event.sequence} - {event.source}
-                            {event.synthetic ? " (synthetic)" : ""}
-                          </div>
-                          <pre className="code-block">{formatJson(event.data)}</pre>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </>
-            )}
-
-            {/* Approvals Tab */}
-            {debugTab === "approvals" && (
-              <>
-                {questionRequests.length === 0 && permissionRequests.length === 0 ? (
-                  <div className="card-meta">No pending approvals.</div>
-                ) : (
-                  <>
-                    {questionRequests.map((request) => {
-                      const selections = questionSelections[request.question_id] ?? [];
-                      const selected = selections[0] ?? [];
-                      const answered = selected.length > 0;
-                      return (
-                        <div key={request.question_id} className="card">
-                          <div className="card-header">
-                            <span className="card-title">
-                              <HelpCircle className="button-icon" style={{ marginRight: 6 }} />
-                              Question
-                            </span>
-                            <span className="pill accent">Pending</span>
-                          </div>
-                          <div style={{ marginTop: 12 }}>
-                            <div style={{ fontSize: 12, marginBottom: 8 }}>{request.prompt}</div>
-                            <div className="option-list">
-                              {request.options.map((option) => {
-                                const isSelected = selected.includes(option);
-                                return (
-                                  <label key={option} className="option-item">
-                                    <input
-                                      type="radio"
-                                      checked={isSelected}
-                                      onChange={() => selectQuestionOption(request.question_id, option)}
-                                    />
-                                    <span>{option}</span>
-                                  </label>
-                                );
-                              })}
-                            </div>
-                          </div>
-                          <div className="card-actions">
-                            <button
-                              className="button success small"
-                              disabled={!answered}
-                              onClick={() => answerQuestion(request)}
-                            >
-                              Reply
-                            </button>
-                            <button
-                              className="button danger small"
-                              onClick={() => rejectQuestion(request.question_id)}
-                            >
-                              Reject
-                            </button>
-                          </div>
-                        </div>
-                      );
-                    })}
-
-                    {permissionRequests.map((request) => (
-                      <div key={request.permission_id} className="card">
-                        <div className="card-header">
-                          <span className="card-title">
-                            <Shield className="button-icon" style={{ marginRight: 6 }} />
-                            Permission
-                          </span>
-                          <span className="pill accent">Pending</span>
-                        </div>
-                        <div className="card-meta" style={{ marginTop: 8 }}>
-                          {request.action}
-                        </div>
-                        {request.metadata !== null && request.metadata !== undefined && (
-                          <pre className="code-block">{formatJson(request.metadata)}</pre>
-                        )}
-                        <div className="card-actions">
-                          <button
-                            className="button success small"
-                            onClick={() => replyPermission(request.permission_id, "once")}
-                          >
-                            Allow Once
-                          </button>
-                          <button
-                            className="button secondary small"
-                            onClick={() => replyPermission(request.permission_id, "always")}
-                          >
-                            Always
-                          </button>
-                          <button
-                            className="button danger small"
-                            onClick={() => replyPermission(request.permission_id, "reject")}
-                          >
-                            Reject
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                  </>
-                )}
-              </>
-            )}
-
-            {/* Agents Tab */}
-            {debugTab === "agents" && (
-              <>
-                <div className="inline-row" style={{ marginBottom: 16 }}>
-                  <button className="button secondary small" onClick={refreshAgents}>
-                    <RefreshCw className="button-icon" /> Refresh
-                  </button>
-                </div>
-
-                {agents.length === 0 && (
-                  <div className="card-meta">No agents reported. Click refresh to check.</div>
-                )}
-
-                {(agents.length
-                  ? agents
-                  : defaultAgents.map((id) => ({
-                      id,
-                      installed: false,
-                      version: undefined,
-                      path: undefined,
-                      capabilities: emptyCapabilities
-                    }))).map((agent) => (
-                  <div key={agent.id} className="card">
-                    <div className="card-header">
-                      <span className="card-title">{agent.id}</span>
-                      <span className={`pill ${agent.installed ? "success" : "danger"}`}>
-                        {agent.installed ? "Installed" : "Missing"}
-                      </span>
-                    </div>
-                    <div className="card-meta">
-                      {agent.version ? `v${agent.version}` : "Version unknown"}
-                      {agent.path && <span className="mono muted" style={{ marginLeft: 8 }}>{agent.path}</span>}
-                    </div>
-                    <div style={{ marginTop: 8 }}>
-                      <CapabilityBadges capabilities={agent.capabilities ?? emptyCapabilities} />
-                    </div>
-                    {modesByAgent[agent.id] && modesByAgent[agent.id].length > 0 && (
-                      <div className="card-meta" style={{ marginTop: 8 }}>
-                        Modes: {modesByAgent[agent.id].map((m) => m.id).join(", ")}
-                      </div>
-                    )}
-                    <div className="card-actions">
-                      <button
-                        className="button secondary small"
-                        onClick={() => installAgent(agent.id, false)}
-                      >
-                        <Download className="button-icon" /> Install
-                      </button>
-                      <button
-                        className="button ghost small"
-                        onClick={() => installAgent(agent.id, true)}
-                      >
-                        Reinstall
-                      </button>
-                      <button
-                        className="button ghost small"
-                        onClick={() => loadModes(agent.id)}
-                      >
-                        Modes
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </>
-            )}
-          </div>
-        </div>
+        <DebugPanel
+          debugTab={debugTab}
+          onDebugTabChange={setDebugTab}
+          events={events}
+          offset={offset}
+          onFetchEvents={fetchEvents}
+          onResetEvents={resetEvents}
+          requestLog={requestLog}
+          copiedLogId={copiedLogId}
+          onClearRequestLog={() => setRequestLog([])}
+          onCopyRequestLog={handleCopy}
+          agents={agents}
+          defaultAgents={defaultAgents}
+          modesByAgent={modesByAgent}
+          onRefreshAgents={refreshAgents}
+          onInstallAgent={installAgent}
+        />
       </main>
     </div>
   );

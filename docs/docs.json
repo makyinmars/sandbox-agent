@@ -1,82 +1,72 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "theme": "almond",
-  "name": "Sandbox Agent SDK",
-  "colors": {
-    "primary": "#ff4f00",
-    "light": "#000000",
-    "dark": "#ffffff"
-  },
-  "favicon": "/favicon.svg",
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
-  },
-  "navigation": {
-    "tabs": [
-      {
-        "tab": "Guides",
-        "groups": [
-          {
-            "group": "Getting started",
-            "pages": [
-              "index",
-              "quickstart",
-              "architecture",
-              "agent-compatibility",
-              "universal-api"
-            ]
-          },
-          {
-            "group": "Operations",
-            "pages": [
-              "frontend",
-              "building-chat-ui"
-            ]
-          },
-          {
-            "group": "SDKs",
-            "pages": [
-              "sdks/typescript"
-            ]
-          }
-        ]
-      },
-      {
-        "tab": "Reference",
-        "groups": [
-          {
-            "group": "Interfaces",
-            "pages": [
-              "cli",
-              "http-api",
-              "typescript-sdk"
-            ]
-          },
-          {
-            "group": "API",
-            "openapi": "openapi.json"
-          }
-        ]
-      },
-      {
-        "tab": "Deployments",
-        "groups": [
-          {
-            "group": "Examples",
-            "pages": [
-              "deployments/docker",
-              "deployments/e2b",
-              "deployments/daytona",
-              "deployments/vercel-sandboxes",
-              "deployments/cloudflare-sandboxes"
-            ]
-          }
-        ]
-      }
-    ]
-  },
-  "styles": [
-    "/theme.css"
-  ]
+	"$schema": "https://mintlify.com/docs.json",
+	"theme": "willow",
+	"name": "Sandbox Agent SDK",
+	"appearance": {
+		"default": "dark",
+		"strict": true
+	},
+	"colors": {
+		"primary": "#ff4f00",
+		"light": "#ff4f00",
+		"dark": "#ff4f00"
+	},
+	"favicon": "/favicon.svg",
+	"logo": {
+		"light": "/logo/light.svg",
+		"dark": "/logo/dark.svg"
+	},
+	"navbar": {
+		"links": [
+			{
+				"label": "Discord",
+				"icon": "discord",
+				"href": "https://rivet.dev/discord"
+			},
+			{
+				"label": "GitHub",
+				"icon": "github",
+				"href": "https://github.com/rivet-dev/sandbox-agent"
+			}
+		]
+	},
+	"navigation": {
+		"pages": [
+			{
+				"group": "Getting started",
+				"pages": [
+					"index",
+					"quickstart",
+					"architecture",
+					"agent-compatibility",
+					"universal-api",
+					"frontend",
+					"building-chat-ui",
+					"persisting-chat-logs"
+				]
+			},
+			{
+				"group": "SDKs",
+				"pages": ["sdks/typescript"]
+			},
+			{
+				"group": "AI",
+				"pages": ["ai/skill", "ai/llms-txt"]
+			},
+			{
+				"group": "Reference",
+				"pages": ["cli", "telemetry", "http-api"]
+			},
+			{
+				"group": "Deploy",
+				"pages": [
+					"deploy/index",
+					"deploy/docker",
+					"deploy/e2b",
+					"deploy/daytona",
+					"deploy/vercel-sandboxes"
+				]
+			}
+		]
+	}
 }

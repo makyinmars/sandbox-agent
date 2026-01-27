@@ -51,10 +51,21 @@ export type webhooks = Record<string, never>;
 export interface components {
   schemas: {
     AgentCapabilities: {
+      commandExecution: boolean;
+      errorEvents: boolean;
+      fileAttachments: boolean;
+      fileChanges: boolean;
+      images: boolean;
+      mcpTools: boolean;
       permissions: boolean;
       planMode: boolean;
       questions: boolean;
+      reasoning: boolean;
+      sessionLifecycle: boolean;
+      streamingDeltas: boolean;
+      textMessages: boolean;
       toolCalls: boolean;
+      toolResults: boolean;
     };
     AgentError: {
       agent?: string | null;

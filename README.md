@@ -1,20 +1,25 @@
 # Sandbox Agent SDK
 
-Universal API for automatic coding agents in sandboxes. Supprots Claude Code, Codex, OpenCode, and Amp.
+Universal API for automatic coding agents in sandboxes. Supports Claude Code, Codex, OpenCode, and Amp.
+
+Docs: https://rivet.dev/docs/
 
 - **Any coding agent**: Universal API to interact with all agents with full feature coverage
 - **Server or SDK mode**: Run as an HTTP server or with the TypeScript SDK
 - **Universal session schema**: Universal schema to store agent transcripts
 - **Supports your sandbox provider**: Daytona, E2B, Vercel Sandboxes, and more
 - **Lightweight, portable Rust binary**: Install anywhere with 1 curl command
-- **OpenAPI spec**: Versioned API schema tracked in `docs/openapi.json`
+- **OpenAPI spec**: https://rivet.dev/docs/api
 
 Roadmap:
 
-[ ] Python SDK
-[ ] Automatic MCP & skillfile configuration
+- [ ] Python SDK
+- [ ] Automatic MCP & skill & hook configuration
+- [ ] Todo lists
+- [ ] Session diff
+- [ ] Subagents
 
-## Agent Support
+## Agent Compatibility
 
 | Feature | [Claude Code*](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) | [Codex](https://github.com/openai/codex) | [OpenCode](https://github.com/opencode-ai/opencode) | [Amp](https://ampcode.com) |
 |---------|:-----------:|:-----:|:--------:|:---:|
@@ -40,44 +45,123 @@ Want support for another agent? [Open an issue](https://github.com/anthropics/sa
 
 ## Architecture
 
-- TODO
-    - Local
-    - Remote/Sandboxed
+- Run the `sandbox-agent` daemon locally or inside a sandbox.
+- The daemon spawns agents, normalizes their event streams into a universal schema, and exposes a single HTTP/SSE API.
+- Clients (SDK, CLI, Inspector UI) all use the same `/v1` API for sessions and events.
+
+See https://rivet.dev/docs/architecture for a deeper walkthrough.
 
 ## Components
 
-- Server: TODO
-- SDK: TODO
-- Inspector: inspect.sandboxagent.dev
-- CLI: TODO
+- Server: Rust daemon (`sandbox-agent server`) exposing the HTTP + SSE API.
+- SDK: TypeScript client with embedded and server modes.
+- Inspector: `https://inspect.sandboxagent.dev` for browsing sessions and events.
+- CLI: `sandbox-agent` (same binary, plus npm wrapper) mirrors the HTTP endpoints.
 
 ## Quickstart
 
+### Skill
+
+Install skill with:
+
+```
+npx skills add https://sandboxagent.dev/docs
+```
+
 ### SDK
 
-- Local
-- Remote/Sandboxed 
+**Install**
 
-Docs
+```bash
+npm install sandbox-agent
+```
+
+**Setup**
+
+Local (embedded mode):
+
+```ts
+import { SandboxAgent } from "sandbox-agent";
+
+const client = await SandboxAgent.start();
+```
+
+Remote (server mode):
+
+```ts
+import { SandboxAgent } from "sandbox-agent";
+
+const client = await SandboxAgent.connect({
+  baseUrl: "http://127.0.0.1:2468",
+  token: process.env.SANDBOX_TOKEN,
+});
+```
+
+**API Overview**
+
+```ts
+const agents = await client.listAgents();
+
+await client.createSession("demo", {
+  agent: "codex",
+  agentMode: "default",
+  permissionMode: "plan",
+});
+
+await client.postMessage("demo", { message: "Hello from the SDK." });
+
+for await (const event of client.streamEvents("demo", { offset: 0 })) {
+  console.log(event.type, event.data);
+}
+```
+
+Full guide: https://rivet.dev/docs/sdks/typescript
 
 ### Server
 
-- Install server
-    - curl (fastest & does not require npm)
-    - npm i -g (slower)
-    - npx (for quick runs)
-- Run server
-- Auth
+Install the binary (fastest installation, no Node.js required):
 
-Docs
+```bash
+# Install it
+curl -fsSL https://releases.rivet.dev/sandbox-agent/latest/install.sh | sh
+# Run it
+sandbox-agent server --token "$SANDBOX_TOKEN" --host 127.0.0.1 --port 2468
+```
+
+To disable auth locally:
+
+```bash
+sandbox-agent server --no-token --host 127.0.0.1 --port 2468
+```
+
+Docs: https://rivet.dev/docs/quickstart
+Integration guides: https://rivet.dev/docs/deployments
 
 ### CLI
 
-Docs
+Install the CLI wrapper (optional but convenient):
 
-### Tip: Extracting API Keys
+```bash
+npm install -g @sandbox-agent/cli
+```
 
-TODO: npx command to get API keys
+Create a session and send a message:
+
+```bash
+sandbox-agent sessions create my-session --agent codex --endpoint http://127.0.0.1:2468 --token "$SANDBOX_TOKEN"
+sandbox-agent sessions send-message my-session --message "Hello" --endpoint http://127.0.0.1:2468 --token "$SANDBOX_TOKEN"
+```
+
+Docs: https://rivet.dev/docs/cli
+
+### Extract credentials
+
+```bash
+sandbox-agent credentials extract-env --export
+```
+
+This prints environment variables for your locally installed agents.
+Docs: https://rivet.dev/docs/quickstart
 
 ## Project Goals
 
@@ -115,16 +199,22 @@ The server is a single Rust binary that runs anywhere with a curl install. If yo
 Yes. Use `sandbox-agent credentials extract-env` to extract API keys from your local agent configs (Claude Code, Codex, OpenCode, Amp) and pass them to the sandbox environment.
 
 **Why Rust?**
-TODO
+Rust gives us a single static binary, fast startup, and predictable memory usage. That makes it
+easy to run inside sandboxes or in CI without shipping a large runtime.
 
 **Why not use stdio/JSON-RPC?**
 
 - has benefit of not having to listen on a port
 - more difficult to interact with, harder to analyze, doesn't support inspector for debugging
 - may add at some point
-- codex does this. claude sort of does this.
+- Codex does this and Claude has a JSON stream, but HTTP/SSE gives us a consistent API surface and inspector UI.
 
-**Why not OpenCode?**
+**Why not AI SDK?**
 
-- the harnesses do a lot of heavy lifting
-- the difference between opencode, claude, and codex is vast & vastly opinionated
+- AI SDK does not provide harness for bieng a fully fledged coding agent
+- Fronteir coding agent harnesses have a lot of work put in to complex things like swarms, compaction, etc
+
+**Why not OpenCode server?**
+
+- The harnesses do a lot of heavy lifting, but different agents have very different APIs and behavior.
+- A universal API lets you swap agents without rewriting your orchestration code.

@@ -1,6 +1,6 @@
 ---
 title: "Frontend Demo"
-description: "Run the Vite + React UI for testing the daemon."
+description: "Run the Vite + React UI for testing the server."
 ---
 
 The demo frontend lives at `frontend/packages/inspector`.
@@ -17,6 +17,6 @@ The UI expects:
 - Endpoint (e.g. `http://127.0.0.1:2468`)
 - Optional token
 
-When running the daemon, the inspector is also served automatically at `http://127.0.0.1:2468/ui`.
+When running the server, the inspector is also served automatically at `http://127.0.0.1:2468/ui`.
 
-If you see CORS errors, enable CORS on the daemon with `sandbox-daemon server --cors-allow-origin` and related flags.
+If you see CORS errors, enable CORS on the server with `sandbox-agent server --cors-allow-origin` and related flags.

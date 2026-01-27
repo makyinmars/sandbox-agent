@@ -3,18 +3,19 @@ title: "CLI"
 description: "CLI reference and server flags."
 ---
 
-The `sandbox-daemon` CLI mirrors the HTTP API so you can script everything without writing client code.
+The `sandbox-agent` CLI mirrors the HTTP API so you can script everything without writing client code.
 
 ## Server flags
 
 ```bash
-sandbox-daemon server --token "$SANDBOX_TOKEN" --host 127.0.0.1 --port 2468
+sandbox-agent server --token "$SANDBOX_TOKEN" --host 127.0.0.1 --port 2468
 ```
 
 - `--token`: global token for all requests.
 - `--no-token`: disable auth (local dev only).
 - `--host`, `--port`: bind address.
 - `--cors-allow-origin`, `--cors-allow-method`, `--cors-allow-header`, `--cors-allow-credentials`: configure CORS.
+- `--no-telemetry`: disable anonymous telemetry.
 
 ## Agent commands
 
@@ -22,7 +23,7 @@ sandbox-daemon server --token "$SANDBOX_TOKEN" --host 127.0.0.1 --port 2468
 <summary><strong>agents list</strong></summary>
 
 ```bash
-sandbox-daemon agents list --endpoint http://127.0.0.1:2468
+sandbox-agent agents list --endpoint http://127.0.0.1:2468
 ```
 </details>
 
@@ -30,7 +31,7 @@ sandbox-daemon agents list --endpoint http://127.0.0.1:2468
 <summary><strong>agents install</strong></summary>
 
 ```bash
-sandbox-daemon agents install claude --reinstall --endpoint http://127.0.0.1:2468
+sandbox-agent agents install claude --reinstall --endpoint http://127.0.0.1:2468
 ```
 </details>
 
@@ -38,7 +39,7 @@ sandbox-daemon agents install claude --reinstall --endpoint http://127.0.0.1:246
 <summary><strong>agents modes</strong></summary>
 
 ```bash
-sandbox-daemon agents modes claude --endpoint http://127.0.0.1:2468
+sandbox-agent agents modes claude --endpoint http://127.0.0.1:2468
 ```
 </details>
 
@@ -48,7 +49,7 @@ sandbox-daemon agents modes claude --endpoint http://127.0.0.1:2468
 <summary><strong>sessions create</strong></summary>
 
 ```bash
-sandbox-daemon sessions create my-session \
+sandbox-agent sessions create my-session \
   --agent claude \
   --agent-mode build \
   --permission-mode default \
@@ -60,7 +61,7 @@ sandbox-daemon sessions create my-session \
 <summary><strong>sessions send-message</strong></summary>
 
 ```bash
-sandbox-daemon sessions send-message my-session \
+sandbox-agent sessions send-message my-session \
   --message "Summarize the repository" \
   --endpoint http://127.0.0.1:2468
 ```
@@ -70,7 +71,7 @@ sandbox-daemon sessions send-message my-session \
 <summary><strong>sessions events</strong></summary>
 
 ```bash
-sandbox-daemon sessions events my-session --offset 0 --limit 50 --endpoint http://127.0.0.1:2468
+sandbox-agent sessions events my-session --offset 0 --limit 50 --endpoint http://127.0.0.1:2468
 ```
 </details>
 
@@ -78,7 +79,7 @@ sandbox-daemon sessions events my-session --offset 0 --limit 50 --endpoint http:
 <summary><strong>sessions events-sse</strong></summary>
 
 ```bash
-sandbox-daemon sessions events-sse my-session --offset 0 --endpoint http://127.0.0.1:2468
+sandbox-agent sessions events-sse my-session --offset 0 --endpoint http://127.0.0.1:2468
 ```
 </details>
 
@@ -86,7 +87,7 @@ sandbox-daemon sessions events-sse my-session --offset 0 --endpoint http://127.0
 <summary><strong>sessions reply-question</strong></summary>
 
 ```bash
-sandbox-daemon sessions reply-question my-session QUESTION_ID \
+sandbox-agent sessions reply-question my-session QUESTION_ID \
   --answers "yes" \
   --endpoint http://127.0.0.1:2468
 ```
@@ -96,7 +97,7 @@ sandbox-daemon sessions reply-question my-session QUESTION_ID \
 <summary><strong>sessions reject-question</strong></summary>
 
 ```bash
-sandbox-daemon sessions reject-question my-session QUESTION_ID --endpoint http://127.0.0.1:2468
+sandbox-agent sessions reject-question my-session QUESTION_ID --endpoint http://127.0.0.1:2468
 ```
 </details>
 
@@ -104,7 +105,7 @@ sandbox-daemon sessions reject-question my-session QUESTION_ID --endpoint http:/
 <summary><strong>sessions reply-permission</strong></summary>
 
 ```bash
-sandbox-daemon sessions reply-permission my-session PERMISSION_ID \
+sandbox-agent sessions reply-permission my-session PERMISSION_ID \
   --reply once \
   --endpoint http://127.0.0.1:2468
 ```

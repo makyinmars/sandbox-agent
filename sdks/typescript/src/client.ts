@@ -1,7 +1,4 @@
-import type {
-  SandboxDaemonSpawnHandle,
-  SandboxDaemonSpawnOptions,
-} from "./spawn.ts";
+import type { SandboxAgentSpawnHandle, SandboxAgentSpawnOptions } from "./spawn.ts";
 import type {
   AgentInstallRequest,
   AgentListResponse,
@@ -21,29 +18,27 @@ import type {
 
 const API_PREFIX = "/v1";
 
-export interface SandboxDaemonClientOptions {
+export interface SandboxAgentConnectOptions {
   baseUrl: string;
   token?: string;
   fetch?: typeof fetch;
   headers?: HeadersInit;
 }
 
-export interface SandboxDaemonConnectOptions {
-  baseUrl?: string;
-  token?: string;
+export interface SandboxAgentStartOptions {
+  spawn?: SandboxAgentSpawnOptions | boolean;
   fetch?: typeof fetch;
   headers?: HeadersInit;
-  spawn?: SandboxDaemonSpawnOptions | boolean;
 }
 
-export class SandboxDaemonError extends Error {
+export class SandboxAgentError extends Error {
   readonly status: number;
   readonly problem?: ProblemDetails;
   readonly response: Response;
 
   constructor(status: number, problem: ProblemDetails | undefined, response: Response) {
     super(problem?.title ?? `Request failed with status ${status}`);
-    this.name = "SandboxDaemonError";
+    this.name = "SandboxAgentError";
     this.status = status;
     this.problem = problem;
     this.response = response;
@@ -60,14 +55,14 @@ type RequestOptions = {
   signal?: AbortSignal;
 };
 
-export class SandboxDaemonClient {
+export class SandboxAgent {
   private readonly baseUrl: string;
   private readonly token?: string;
   private readonly fetcher: typeof fetch;
   private readonly defaultHeaders?: HeadersInit;
-  private spawnHandle?: SandboxDaemonSpawnHandle;
+  private spawnHandle?: SandboxAgentSpawnHandle;
 
-  constructor(options: SandboxDaemonClientOptions) {
+  private constructor(options: SandboxAgentConnectOptions) {
     this.baseUrl = options.baseUrl.replace(/\/$/, "");
     this.token = options.token;
     this.fetcher = options.fetch ?? globalThis.fetch;
@@ -78,23 +73,18 @@ export class SandboxDaemonClient {
     }
   }
 
-  static async connect(options: SandboxDaemonConnectOptions): Promise<SandboxDaemonClient> {
-    const spawnOptions = normalizeSpawnOptions(options.spawn, !options.baseUrl);
-    if (!spawnOptions.enabled) {
-      if (!options.baseUrl) {
-        throw new Error("baseUrl is required when autospawn is disabled.");
-      }
-      return new SandboxDaemonClient({
-        baseUrl: options.baseUrl,
-        token: options.token,
-        fetch: options.fetch,
-        headers: options.headers,
-      });
-    }
+  static async connect(options: SandboxAgentConnectOptions): Promise<SandboxAgent> {
+    return new SandboxAgent(options);
+  }
 
-    const { spawnSandboxDaemon } = await import("./spawn.js");
-    const handle = await spawnSandboxDaemon(spawnOptions, options.fetch ?? globalThis.fetch);
-    const client = new SandboxDaemonClient({
+  static async start(options: SandboxAgentStartOptions = {}): Promise<SandboxAgent> {
+    const spawnOptions = normalizeSpawnOptions(options.spawn, true);
+    if (!spawnOptions.enabled) {
+      throw new Error("SandboxAgent.start requires spawn to be enabled.");
+    }
+    const { spawnSandboxAgent } = await import("./spawn.js");
+    const handle = await spawnSandboxAgent(spawnOptions, options.fetch ?? globalThis.fetch);
+    const client = new SandboxAgent({
       baseUrl: handle.baseUrl,
       token: handle.token,
       fetch: options.fetch,
@@ -277,7 +267,7 @@ export class SandboxDaemonClient {
     const response = await this.fetcher(url, init);
     if (!response.ok) {
       const problem = await this.readProblem(response);
-      throw new SandboxDaemonError(response.status, problem, response);
+      throw new SandboxAgentError(response.status, problem, response);
     }
 
     return response;
@@ -309,20 +299,10 @@ export class SandboxDaemonClient {
   }
 }
 
-export const createSandboxDaemonClient = (options: SandboxDaemonClientOptions): SandboxDaemonClient => {
-  return new SandboxDaemonClient(options);
-};
-
-export const connectSandboxDaemonClient = (
-  options: SandboxDaemonConnectOptions,
-): Promise<SandboxDaemonClient> => {
-  return SandboxDaemonClient.connect(options);
-};
-
 const normalizeSpawnOptions = (
-  spawn: SandboxDaemonSpawnOptions | boolean | undefined,
+  spawn: SandboxAgentSpawnOptions | boolean | undefined,
   defaultEnabled: boolean,
-): SandboxDaemonSpawnOptions => {
+): SandboxAgentSpawnOptions => {
   if (typeof spawn === "boolean") {
     return { enabled: spawn };
   }

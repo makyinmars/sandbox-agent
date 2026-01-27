@@ -257,7 +257,7 @@ Defined in `sdks/typescript/src/spawn.ts`:
 6. **Cleanup**: On dispose, sends SIGTERM then SIGKILL if needed; also registers process exit handlers
 
 ```typescript
-const handle = await spawnSandboxDaemon({ log: "inherit" });
+const handle = await spawnSandboxAgent({ log: "inherit" });
 // handle.baseUrl = "http://127.0.0.1:<port>"
 // handle.token = "<generated>"
 // handle.dispose() to cleanup
@@ -267,12 +267,12 @@ const handle = await spawnSandboxDaemon({ log: "inherit" });
 
 Defined in `sdks/typescript/src/client.ts`:
 
-- Direct HTTP client to a remote `sandbox-daemon` server
+- Direct HTTP client to a remote `sandbox-agent` server
 - Uses provided `baseUrl` and optional `token`
 - No subprocess management
 
 ```typescript
-const client = new SandboxDaemonClient({
+const client = await SandboxAgent.connect({
   baseUrl: "http://remote-server:8080",
   token: "secret",
 });
@@ -280,26 +280,26 @@ const client = new SandboxDaemonClient({
 
 ### Auto-Detection
 
-`SandboxDaemonClient.connect()` chooses the mode automatically:
+`SandboxAgent` provides two factory methods:
 
 ```typescript
-// If baseUrl provided → server mode
-const client = await SandboxDaemonClient.connect({
+// Connect to existing server
+const client = await SandboxAgent.connect({
   baseUrl: "http://remote:8080",
 });
 
-// If no baseUrl → embedded mode (spawns subprocess)
-const client = await SandboxDaemonClient.connect({});
+// Start embedded subprocess
+const client = await SandboxAgent.start();
 
-// Explicit control
-const client = await SandboxDaemonClient.connect({
-  spawn: { enabled: true, port: 9000 },
+// With options
+const client = await SandboxAgent.start({
+  spawn: { port: 9000 },
 });
 ```
 
 The `spawn` option can be:
 - `true` / `false` - Enable/disable embedded mode
-- `SandboxDaemonSpawnOptions` - Fine-grained control over host, port, token, binary path, timeout, logging
+- `SandboxAgentSpawnOptions` - Fine-grained control over host, port, token, binary path, timeout, logging
 
 ## Authentication
 

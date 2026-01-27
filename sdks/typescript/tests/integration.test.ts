@@ -3,8 +3,8 @@ import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type ChildProcess } from "node:child_process";
-import { SandboxDaemonClient } from "../src/client.ts";
-import { spawnSandboxDaemon, isNodeRuntime } from "../src/spawn.ts";
+import { SandboxAgent } from "../src/client.ts";
+import { spawnSandboxAgent, isNodeRuntime } from "../src/spawn.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -38,8 +38,8 @@ if (BINARY_PATH && !process.env.SANDBOX_AGENT_BIN) {
 }
 
 describe.skipIf(SKIP_INTEGRATION)("Integration: spawn (local mode)", () => {
-  it("spawns daemon and connects", async () => {
-    const handle = await spawnSandboxDaemon({
+  it("spawns server and connects", async () => {
+    const handle = await spawnSandboxAgent({
       enabled: true,
       log: "silent",
       timeoutMs: 30000,
@@ -49,7 +49,7 @@ describe.skipIf(SKIP_INTEGRATION)("Integration: spawn (local mode)", () => {
       expect(handle.baseUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
       expect(handle.token).toBeTruthy();
 
-      const client = new SandboxDaemonClient({
+      const client = await SandboxAgent.connect({
         baseUrl: handle.baseUrl,
         token: handle.token,
       });
@@ -61,8 +61,8 @@ describe.skipIf(SKIP_INTEGRATION)("Integration: spawn (local mode)", () => {
     }
   });
 
-  it("SandboxDaemonClient.connect spawns automatically", async () => {
-    const client = await SandboxDaemonClient.connect({
+  it("SandboxAgent.start spawns automatically", async () => {
+    const client = await SandboxAgent.start({
       spawn: { log: "silent", timeoutMs: 30000 },
     });
 
@@ -79,7 +79,7 @@ describe.skipIf(SKIP_INTEGRATION)("Integration: spawn (local mode)", () => {
   });
 
   it("lists available agents", async () => {
-    const client = await SandboxDaemonClient.connect({
+    const client = await SandboxAgent.start({
       spawn: { log: "silent", timeoutMs: 30000 },
     });
 
@@ -95,31 +95,31 @@ describe.skipIf(SKIP_INTEGRATION)("Integration: spawn (local mode)", () => {
 });
 
 describe.skipIf(SKIP_INTEGRATION)("Integration: connect (remote mode)", () => {
-  let daemonProcess: ChildProcess;
+  let serverProcess: ChildProcess;
   let baseUrl: string;
   let token: string;
 
   beforeAll(async () => {
-    // Start daemon manually to simulate remote server
-    const handle = await spawnSandboxDaemon({
+    // Start server manually to simulate remote server
+    const handle = await spawnSandboxAgent({
       enabled: true,
       log: "silent",
       timeoutMs: 30000,
     });
-    daemonProcess = handle.child;
+    serverProcess = handle.child;
     baseUrl = handle.baseUrl;
     token = handle.token;
   });
 
   afterAll(async () => {
-    if (daemonProcess && daemonProcess.exitCode === null) {
-      daemonProcess.kill("SIGTERM");
+    if (serverProcess && serverProcess.exitCode === null) {
+      serverProcess.kill("SIGTERM");
       await new Promise<void>((resolve) => {
         const timeout = setTimeout(() => {
-          daemonProcess.kill("SIGKILL");
+          serverProcess.kill("SIGKILL");
           resolve();
         }, 5000);
-        daemonProcess.once("exit", () => {
+        serverProcess.once("exit", () => {
           clearTimeout(timeout);
           resolve();
         });
@@ -128,26 +128,17 @@ describe.skipIf(SKIP_INTEGRATION)("Integration: connect (remote mode)", () => {
   });
 
   it("connects to remote server", async () => {
-    const client = await SandboxDaemonClient.connect({
+    const client = await SandboxAgent.connect({
       baseUrl,
       token,
-      spawn: false,
     });
 
     const health = await client.getHealth();
     expect(health.status).toBe("ok");
   });
 
-  it("creates client directly without spawn", () => {
-    const client = new SandboxDaemonClient({
-      baseUrl,
-      token,
-    });
-    expect(client).toBeInstanceOf(SandboxDaemonClient);
-  });
-
   it("handles authentication", async () => {
-    const client = new SandboxDaemonClient({
+    const client = await SandboxAgent.connect({
       baseUrl,
       token,
     });
@@ -157,7 +148,7 @@ describe.skipIf(SKIP_INTEGRATION)("Integration: connect (remote mode)", () => {
   });
 
   it("rejects invalid token on protected endpoints", async () => {
-    const client = new SandboxDaemonClient({
+    const client = await SandboxAgent.connect({
       baseUrl,
       token: "invalid-token",
     });

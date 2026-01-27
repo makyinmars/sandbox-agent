@@ -1,20 +1,20 @@
 import type { ChildProcess } from "node:child_process";
 import type { AddressInfo } from "node:net";
 
-export type SandboxDaemonSpawnLogMode = "inherit" | "pipe" | "silent";
+export type SandboxAgentSpawnLogMode = "inherit" | "pipe" | "silent";
 
-export type SandboxDaemonSpawnOptions = {
+export type SandboxAgentSpawnOptions = {
   enabled?: boolean;
   host?: string;
   port?: number;
   token?: string;
   binaryPath?: string;
   timeoutMs?: number;
-  log?: SandboxDaemonSpawnLogMode;
+  log?: SandboxAgentSpawnLogMode;
   env?: Record<string, string>;
 };
 
-export type SandboxDaemonSpawnHandle = {
+export type SandboxAgentSpawnHandle = {
   baseUrl: string;
   token: string;
   child: ChildProcess;
@@ -32,10 +32,10 @@ export function isNodeRuntime(): boolean {
   return typeof process !== "undefined" && !!process.versions?.node;
 }
 
-export async function spawnSandboxDaemon(
-  options: SandboxDaemonSpawnOptions,
+export async function spawnSandboxAgent(
+  options: SandboxAgentSpawnOptions,
   fetcher?: typeof fetch,
-): Promise<SandboxDaemonSpawnHandle> {
+): Promise<SandboxAgentSpawnHandle> {
   if (!isNodeRuntime()) {
     throw new Error("Autospawn requires a Node.js runtime.");
   }
@@ -54,7 +54,7 @@ export async function spawnSandboxDaemon(
   const connectHost = bindHost === "0.0.0.0" || bindHost === "::" ? "127.0.0.1" : bindHost;
   const token = options.token ?? crypto.randomBytes(24).toString("hex");
   const timeoutMs = options.timeoutMs ?? 15_000;
-  const logMode: SandboxDaemonSpawnLogMode = options.log ?? "inherit";
+  const logMode: SandboxAgentSpawnLogMode = options.log ?? "inherit";
 
   const binaryPath =
     options.binaryPath ??

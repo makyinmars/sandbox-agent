@@ -8,8 +8,7 @@
     "url": "https://github.com/rivet-dev/sandbox-agent"
   },
   "bin": {
-    "sandbox-agent": "bin/sandbox-agent",
-    "sandbox-daemon": "bin/sandbox-agent"
+    "sandbox-agent": "bin/sandbox-agent"
   },
   "scripts": {
     "test": "vitest run"

@@ -31,7 +31,7 @@ Every event includes:
 - `event_id`, `sequence`, and `time` for ordering.
 - `session_id` for the universal session.
 - `native_session_id` for provider-specific debugging.
-- `event_type` with one of:
+- `type` with one of:
   - `session.started`, `session.ended`
   - `item.started`, `item.delta`, `item.completed`
   - `permission.requested`, `permission.resolved`
@@ -61,13 +61,13 @@ const items = new Map<string, ItemState>();
 const order: string[] = [];
 
 function applyEvent(event: UniversalEvent) {
-  if (event.event_type === "item.started") {
+  if (event.type === "item.started") {
     const item = event.data.item;
     items.set(item.item_id, { item, deltas: [] });
     order.push(item.item_id);
   }
 
-  if (event.event_type === "item.delta") {
+  if (event.type === "item.delta") {
     const { item_id, delta } = event.data;
     const state = items.get(item_id);
     if (state) {
@@ -75,7 +75,7 @@ function applyEvent(event: UniversalEvent) {
     }
   }
 
-  if (event.event_type === "item.completed") {
+  if (event.type === "item.completed") {
     const item = event.data.item;
     const state = items.get(item.item_id);
     if (state) {
@@ -141,23 +141,19 @@ receive the `raw` payload for each event.
 
 Both yield the same event payloads.
 
-## Mock mode for UI testing
+## Mock agent for UI testing
 
-Run the server with `--mock` to emit a looping, feature-complete event history for UI development:
+Use the built-in `mock` agent to exercise UI behaviors without external credentials:
 
 ```bash
-sandbox-agent server --mock --no-token
+curl -X POST http://127.0.0.1:2468/v1/sessions/demo-session \
+  -H "content-type: application/json" \
+  -d '{"agent":"mock"}'
 ```
 
-Behavior in mock mode:
-
-- Sessions emit a fixed history that covers every event type and content part.
-- The history repeats in a loop, with ~200ms between events and a ~2s pause between loops.
-- `session.started` and `session.ended` are included in every loop so UIs can exercise lifecycle handling.
-- `send-message` is accepted but does not change the mock stream.
-
-If your UI stops rendering after `session.ended`, disable that behavior while testing mock mode so the
-loop remains visible.
+The mock agent sends a prompt telling you what commands it accepts. Send messages like `demo`,
+`markdown`, or `permission` to emit specific event sequences. Any other text is echoed back as an
+assistant message so you can test rendering, streaming, and approval flows on demand.
 
 ## Reference implementation
 

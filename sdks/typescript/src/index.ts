@@ -1,12 +1,7 @@
-export {
-  SandboxDaemonClient,
-  SandboxDaemonError,
-  connectSandboxDaemonClient,
-  createSandboxDaemonClient,
-} from "./client.ts";
+export { SandboxAgent, SandboxAgentError } from "./client.ts";
 export type {
-  SandboxDaemonClientOptions,
-  SandboxDaemonConnectOptions,
+  SandboxAgentConnectOptions,
+  SandboxAgentStartOptions,
 } from "./client.ts";
 export type {
   AgentCapabilities,
@@ -52,4 +47,4 @@ export type {
   UniversalItem,
 } from "./types.ts";
 export type { components, paths } from "./generated/openapi.ts";
-export type { SandboxDaemonSpawnOptions, SandboxDaemonSpawnLogMode } from "./spawn.ts";
+export type { SandboxAgentSpawnOptions, SandboxAgentSpawnLogMode } from "./spawn.ts";

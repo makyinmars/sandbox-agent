@@ -12,7 +12,7 @@ use tempfile::TempDir;
 use sandbox_agent_agent_management::agents::{AgentId, AgentManager};
 use sandbox_agent_agent_management::testing::{test_agents_from_env, TestAgentConfig};
 use sandbox_agent_agent_credentials::ExtractedCredentials;
-use sandbox_agent::router::{build_router, AppState, AuthConfig, MockConfig};
+use sandbox_agent::router::{build_router, AppState, AuthConfig};
 use tower::util::ServiceExt;
 use tower_http::cors::CorsLayer;
 
@@ -39,7 +39,7 @@ impl TestApp {
         let install_dir = tempfile::tempdir().expect("create temp install dir");
         let manager = AgentManager::new(install_dir.path())
             .expect("create agent manager");
-        let state = AppState::new(auth, manager, MockConfig::disabled());
+        let state = AppState::new(auth, manager);
         let mut app = build_router(state);
         if let Some(cors) = cors {
             app = app.layer(cors);

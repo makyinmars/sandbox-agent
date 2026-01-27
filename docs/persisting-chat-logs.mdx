@@ -1,0 +1,21 @@
+---
+title: "Persisting Chat Logs"
+description: "Persist event streams so you can resume sessions and keep durable chat history."
+---
+
+Persisting chat logs is easiest when you treat the event stream as the source of truth.
+
+## Recommended approach
+
+- Store the offset of the last message you have seen (the last event id).
+- Update your server to stream events from the Events API using that offset.
+- Write the resulting messages and events to your own database.
+
+This lets you resume from a known offset after a disconnect and prevents duplicate writes.
+
+## Recommended: Rivet Actors
+
+If you want a managed way to keep long-running streams alive, consider [Rivet Actors](https://rivet.dev).
+They handle continuous event streaming plus fast reads and writes of data for agents, with built-in
+realtime support and observability. You can use them to stream `/events/sse` per session and persist
+each event to your database as it arrives.

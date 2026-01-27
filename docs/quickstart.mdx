@@ -1,20 +1,20 @@
 ---
 title: "Quickstart"
-description: "Start the daemon and send your first message."
+description: "Start the server and send your first message."
 ---
 
-## 1. Run the daemon
+## 1. Run the server
 
 Use the installed binary, or `cargo run` in development.
 
 ```bash
-sandbox-daemon server --token "$SANDBOX_TOKEN" --host 127.0.0.1 --port 2468
+sandbox-agent server --token "$SANDBOX_TOKEN" --host 127.0.0.1 --port 2468
 ```
 
 If you want to run without auth (local dev only):
 
 ```bash
-sandbox-daemon server --no-token --host 127.0.0.1 --port 2468
+sandbox-agent server --no-token --host 127.0.0.1 --port 2468
 ```
 
 If you're running from source instead of the installed CLI:
@@ -25,10 +25,10 @@ cargo run -p sandbox-agent -- server --token "$SANDBOX_TOKEN" --host 127.0.0.1 -
 
 ### CORS (frontend usage)
 
-If you are calling the daemon from a browser, enable CORS explicitly:
+If you are calling the server from a browser, enable CORS explicitly:
 
 ```bash
-sandbox-daemon server \
+sandbox-agent server \
   --token "$SANDBOX_TOKEN" \
   --cors-allow-origin "http://localhost:5173" \
   --cors-allow-method "GET" \
@@ -75,7 +75,7 @@ curl "http://127.0.0.1:2468/v1/sessions/my-session/events/sse?offset=0" \
 The CLI mirrors the HTTP API:
 
 ```bash
-sandbox-daemon sessions create my-session --agent claude --endpoint http://127.0.0.1:2468 --token "$SANDBOX_TOKEN"
+sandbox-agent sessions create my-session --agent claude --endpoint http://127.0.0.1:2468 --token "$SANDBOX_TOKEN"
 
-sandbox-daemon sessions send-message my-session --message "Hello" --endpoint http://127.0.0.1:2468 --token "$SANDBOX_TOKEN"
+sandbox-agent sessions send-message my-session --message "Hello" --endpoint http://127.0.0.1:2468 --token "$SANDBOX_TOKEN"
 ```

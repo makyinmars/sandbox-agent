@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, type Mock } from "vitest";
-import { SandboxDaemonClient, SandboxDaemonError } from "../src/client.ts";
+import { SandboxAgent, SandboxAgentError } from "../src/client.ts";
 
 function createMockFetch(
   response: unknown,
@@ -23,18 +23,18 @@ function createMockFetchError(status: number, problem: unknown): Mock<typeof fet
   );
 }
 
-describe("SandboxDaemonClient", () => {
-  describe("constructor", () => {
-    it("creates client with baseUrl", () => {
-      const client = new SandboxDaemonClient({
+describe("SandboxAgent", () => {
+  describe("connect", () => {
+    it("creates client with baseUrl", async () => {
+      const client = await SandboxAgent.connect({
         baseUrl: "http://localhost:8080",
       });
-      expect(client).toBeInstanceOf(SandboxDaemonClient);
+      expect(client).toBeInstanceOf(SandboxAgent);
     });
 
     it("strips trailing slash from baseUrl", async () => {
       const mockFetch = createMockFetch({ status: "ok" });
-      const client = new SandboxDaemonClient({
+      const client = await SandboxAgent.connect({
         baseUrl: "http://localhost:8080/",
         fetch: mockFetch,
       });
@@ -47,41 +47,33 @@ describe("SandboxDaemonClient", () => {
       );
     });
 
-    it("throws if fetch is not available", () => {
+    it("throws if fetch is not available", async () => {
       const originalFetch = globalThis.fetch;
       // @ts-expect-error - testing missing fetch
       globalThis.fetch = undefined;
 
-      expect(() => {
-        new SandboxDaemonClient({
+      await expect(
+        SandboxAgent.connect({
           baseUrl: "http://localhost:8080",
-        });
-      }).toThrow("Fetch API is not available");
+        })
+      ).rejects.toThrow("Fetch API is not available");
 
       globalThis.fetch = originalFetch;
     });
   });
 
-  describe("connect", () => {
-    it("creates client without spawn when baseUrl provided", async () => {
-      const client = await SandboxDaemonClient.connect({
-        baseUrl: "http://localhost:8080",
-        spawn: false,
-      });
-      expect(client).toBeInstanceOf(SandboxDaemonClient);
-    });
-
-    it("throws when no baseUrl and spawn disabled", async () => {
-      await expect(
-        SandboxDaemonClient.connect({ spawn: false })
-      ).rejects.toThrow("baseUrl is required when autospawn is disabled");
+  describe("start", () => {
+    it("rejects when spawn disabled", async () => {
+      await expect(SandboxAgent.start({ spawn: false })).rejects.toThrow(
+        "SandboxAgent.start requires spawn to be enabled."
+      );
     });
   });
 
   describe("getHealth", () => {
     it("returns health response", async () => {
       const mockFetch = createMockFetch({ status: "ok" });
-      const client = new SandboxDaemonClient({
+      const client = await SandboxAgent.connect({
         baseUrl: "http://localhost:8080",
         fetch: mockFetch,
       });
@@ -100,7 +92,7 @@ describe("SandboxDaemonClient", () => {
     it("returns agent list", async () => {
       const agents = { agents: [{ id: "claude", installed: true }] };
       const mockFetch = createMockFetch(agents);
-      const client = new SandboxDaemonClient({
+      const client = await SandboxAgent.connect({
         baseUrl: "http://localhost:8080",
         fetch: mockFetch,
       });
@@ -115,7 +107,7 @@ describe("SandboxDaemonClient", () => {
     it("creates session with agent", async () => {
       const response = { healthy: true, agentSessionId: "abc123" };
       const mockFetch = createMockFetch(response);
-      const client = new SandboxDaemonClient({
+      const client = await SandboxAgent.connect({
         baseUrl: "http://localhost:8080",
         fetch: mockFetch,
       });
@@ -136,7 +128,7 @@ describe("SandboxDaemonClient", () => {
 
     it("encodes session ID in URL", async () => {
       const mockFetch = createMockFetch({ healthy: true });
-      const client = new SandboxDaemonClient({
+      const client = await SandboxAgent.connect({
         baseUrl: "http://localhost:8080",
         fetch: mockFetch,
       });
@@ -155,7 +147,7 @@ describe("SandboxDaemonClient", () => {
       const mockFetch = vi.fn().mockResolvedValue(
         new Response(null, { status: 204 })
       );
-      const client = new SandboxDaemonClient({
+      const client = await SandboxAgent.connect({
         baseUrl: "http://localhost:8080",
         fetch: mockFetch,
       });
@@ -176,7 +168,7 @@ describe("SandboxDaemonClient", () => {
     it("returns events", async () => {
       const events = { events: [], hasMore: false };
       const mockFetch = createMockFetch(events);
-      const client = new SandboxDaemonClient({
+      const client = await SandboxAgent.connect({
         baseUrl: "http://localhost:8080",
         fetch: mockFetch,
       });
@@ -188,7 +180,7 @@ describe("SandboxDaemonClient", () => {
 
     it("passes query parameters", async () => {
       const mockFetch = createMockFetch({ events: [], hasMore: false });
-      const client = new SandboxDaemonClient({
+      const client = await SandboxAgent.connect({
         baseUrl: "http://localhost:8080",
         fetch: mockFetch,
       });
@@ -205,7 +197,7 @@ describe("SandboxDaemonClient", () => {
   describe("authentication", () => {
     it("includes authorization header when token provided", async () => {
       const mockFetch = createMockFetch({ status: "ok" });
-      const client = new SandboxDaemonClient({
+      const client = await SandboxAgent.connect({
         baseUrl: "http://localhost:8080",
         token: "test-token",
         fetch: mockFetch,
@@ -227,7 +219,7 @@ describe("SandboxDaemonClient", () => {
   });
 
   describe("error handling", () => {
-    it("throws SandboxDaemonError on non-ok response", async () => {
+    it("throws SandboxAgentError on non-ok response", async () => {
       const problem = {
         type: "error",
         title: "Not Found",
@@ -235,20 +227,20 @@ describe("SandboxDaemonClient", () => {
         detail: "Session not found",
       };
       const mockFetch = createMockFetchError(404, problem);
-      const client = new SandboxDaemonClient({
+      const client = await SandboxAgent.connect({
         baseUrl: "http://localhost:8080",
         fetch: mockFetch,
       });
 
       await expect(client.getEvents("nonexistent")).rejects.toThrow(
-        SandboxDaemonError
+        SandboxAgentError
       );
 
       try {
         await client.getEvents("nonexistent");
       } catch (e) {
-        expect(e).toBeInstanceOf(SandboxDaemonError);
-        const error = e as SandboxDaemonError;
+        expect(e).toBeInstanceOf(SandboxAgentError);
+        const error = e as SandboxAgentError;
         expect(error.status).toBe(404);
         expect(error.problem?.title).toBe("Not Found");
       }
@@ -260,7 +252,7 @@ describe("SandboxDaemonClient", () => {
       const mockFetch = vi.fn().mockResolvedValue(
         new Response(null, { status: 204 })
       );
-      const client = new SandboxDaemonClient({
+      const client = await SandboxAgent.connect({
         baseUrl: "http://localhost:8080",
         fetch: mockFetch,
       });
@@ -284,7 +276,7 @@ describe("SandboxDaemonClient", () => {
       const mockFetch = vi.fn().mockResolvedValue(
         new Response(null, { status: 204 })
       );
-      const client = new SandboxDaemonClient({
+      const client = await SandboxAgent.connect({
         baseUrl: "http://localhost:8080",
         fetch: mockFetch,
       });

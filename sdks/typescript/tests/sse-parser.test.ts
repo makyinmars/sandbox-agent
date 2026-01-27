@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, type Mock } from "vitest";
-import { SandboxDaemonClient } from "../src/client.ts";
+import { SandboxAgent } from "../src/client.ts";
 import type { UniversalEvent } from "../src/types.ts";
 
 function createMockResponse(chunks: string[]): Response {
@@ -51,7 +51,7 @@ describe("SSE Parser", () => {
     const event = createEvent(1);
     const mockFetch = createMockFetch([`data: ${JSON.stringify(event)}\n\n`]);
 
-    const client = new SandboxDaemonClient({
+    const client = await SandboxAgent.connect({
       baseUrl: "http://localhost:8080",
       fetch: mockFetch,
     });
@@ -73,7 +73,7 @@ describe("SSE Parser", () => {
       `data: ${JSON.stringify(event2)}\n\n`,
     ]);
 
-    const client = new SandboxDaemonClient({
+    const client = await SandboxAgent.connect({
       baseUrl: "http://localhost:8080",
       fetch: mockFetch,
     });
@@ -97,7 +97,7 @@ describe("SSE Parser", () => {
       fullMessage.slice(10),
     ]);
 
-    const client = new SandboxDaemonClient({
+    const client = await SandboxAgent.connect({
       baseUrl: "http://localhost:8080",
       fetch: mockFetch,
     });
@@ -118,7 +118,7 @@ describe("SSE Parser", () => {
       `data: ${JSON.stringify(event1)}\n\ndata: ${JSON.stringify(event2)}\n\n`,
     ]);
 
-    const client = new SandboxDaemonClient({
+    const client = await SandboxAgent.connect({
       baseUrl: "http://localhost:8080",
       fetch: mockFetch,
     });
@@ -139,7 +139,7 @@ describe("SSE Parser", () => {
       `data: ${JSON.stringify(event)}\n\n`,
     ]);
 
-    const client = new SandboxDaemonClient({
+    const client = await SandboxAgent.connect({
       baseUrl: "http://localhost:8080",
       fetch: mockFetch,
     });
@@ -158,7 +158,7 @@ describe("SSE Parser", () => {
       `data: ${JSON.stringify(event)}\r\n\r\n`,
     ]);
 
-    const client = new SandboxDaemonClient({
+    const client = await SandboxAgent.connect({
       baseUrl: "http://localhost:8080",
       fetch: mockFetch,
     });
@@ -174,7 +174,7 @@ describe("SSE Parser", () => {
   it("handles empty stream", async () => {
     const mockFetch = createMockFetch([]);
 
-    const client = new SandboxDaemonClient({
+    const client = await SandboxAgent.connect({
       baseUrl: "http://localhost:8080",
       fetch: mockFetch,
     });
@@ -190,7 +190,7 @@ describe("SSE Parser", () => {
   it("passes query parameters", async () => {
     const mockFetch = createMockFetch([]);
 
-    const client = new SandboxDaemonClient({
+    const client = await SandboxAgent.connect({
       baseUrl: "http://localhost:8080",
       fetch: mockFetch,
     });

@@ -29,6 +29,7 @@ pub enum AgentId {
     Codex,
     Opencode,
     Amp,
+    Mock,
 }
 
 impl AgentId {
@@ -38,6 +39,7 @@ impl AgentId {
             AgentId::Codex => "codex",
             AgentId::Opencode => "opencode",
             AgentId::Amp => "amp",
+            AgentId::Mock => "mock",
         }
     }
 
@@ -47,6 +49,7 @@ impl AgentId {
             AgentId::Codex => "codex",
             AgentId::Opencode => "opencode",
             AgentId::Amp => "amp",
+            AgentId::Mock => "mock",
         }
     }
 
@@ -56,6 +59,7 @@ impl AgentId {
             "codex" => Some(AgentId::Codex),
             "opencode" => Some(AgentId::Opencode),
             "amp" => Some(AgentId::Amp),
+            "mock" => Some(AgentId::Mock),
             _ => None,
         }
     }
@@ -138,6 +142,11 @@ impl AgentManager {
             AgentId::Codex => install_codex(&install_path, self.platform, options.version.as_deref())?,
             AgentId::Opencode => install_opencode(&install_path, self.platform, options.version.as_deref())?,
             AgentId::Amp => install_amp(&install_path, self.platform, options.version.as_deref())?,
+            AgentId::Mock => {
+                if !install_path.exists() {
+                    fs::write(&install_path, b"mock")?;
+                }
+            }
         }
 
         Ok(InstallResult {
@@ -147,6 +156,9 @@ impl AgentManager {
     }
 
     pub fn is_installed(&self, agent: AgentId) -> bool {
+        if agent == AgentId::Mock {
+            return true;
+        }
         self.binary_path(agent).exists()
             || find_in_path(agent.binary_name()).is_some()
             || default_install_dir().join(agent.binary_name()).exists()
@@ -157,6 +169,9 @@ impl AgentManager {
     }
 
     pub fn version(&self, agent: AgentId) -> Result<Option<String>, AgentError> {
+        if agent == AgentId::Mock {
+            return Ok(Some("builtin".to_string()));
+        }
         let path = self.resolve_binary(agent)?;
         let attempts = [vec!["--version"], vec!["version"], vec!["-V"]];
         for args in attempts {
@@ -173,6 +188,11 @@ impl AgentManager {
     }
 
     pub fn spawn(&self, agent: AgentId, options: SpawnOptions) -> Result<SpawnResult, AgentError> {
+        if agent == AgentId::Mock {
+            return Err(AgentError::UnsupportedAgent {
+                agent: agent.as_str().to_string(),
+            });
+        }
         if agent == AgentId::Codex {
             return self.spawn_codex_app_server(options);
         }
@@ -245,6 +265,11 @@ impl AgentManager {
                     session_id: extract_session_id(agent, &events),
                     result: extract_result_text(agent, &events),
                     events,
+                });
+            }
+            AgentId::Mock => {
+                return Err(AgentError::UnsupportedAgent {
+                    agent: agent.as_str().to_string(),
                 });
             }
         }
@@ -550,6 +575,11 @@ impl AgentManager {
             AgentId::Amp => {
                 return Ok(build_amp_command(&path, &working_dir, options));
             }
+            AgentId::Mock => {
+                return Err(AgentError::UnsupportedAgent {
+                    agent: agent.as_str().to_string(),
+                });
+            }
         }
 
         for (key, value) in &options.env {
@@ -844,6 +874,7 @@ fn extract_session_id(agent: AgentId, events: &[Value]) -> Option<String> {
                     return Some(id);
                 }
             }
+            AgentId::Mock => {}
         }
     }
     None
@@ -921,6 +952,7 @@ fn extract_result_text(agent: AgentId, events: &[Value]) -> Option<String> {
                 Some(buffer)
             }
         }
+        AgentId::Mock => None,
     }
 }
 

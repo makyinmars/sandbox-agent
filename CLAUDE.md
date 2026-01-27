@@ -34,7 +34,7 @@ Universal schema guidance:
 - Do not make breaking changes to API endpoints.
 - When changing API routes, ensure the HTTP/SSE test suite has full coverage of every route.
 - When agent schema changes, ensure API tests cover the new schema and event shapes end-to-end.
-- When the universal schema changes, update mock-mode events to cover the new fields or event types.
+- When the universal schema changes, update mock-agent events to cover the new fields or event types.
 - Update `docs/conversion.md` whenever agent-native schema terms, synthetic events, identifier mappings, or conversion logic change.
 - Never use synthetic data or mocked responses in tests.
 - Never manually write agent types; always use generated types in `resources/agent-schemas/`. If types are broken, fix the generated types.
@@ -59,21 +59,6 @@ Universal schema guidance:
 - `sandbox-agent sessions reply-question` ↔ `POST /v1/sessions/{sessionId}/questions/{questionId}/reply`
 - `sandbox-agent sessions reject-question` ↔ `POST /v1/sessions/{sessionId}/questions/{questionId}/reject`
 - `sandbox-agent sessions reply-permission` ↔ `POST /v1/sessions/{sessionId}/permissions/{permissionId}/reply`
-
-### Default port references (update when CLI default changes)
-
-- `frontend/packages/inspector/src/App.tsx`
-- `README.md`
-- `docs/cli.mdx`
-- `docs/frontend.mdx`
-- `docs/index.mdx`
-- `docs/quickstart.mdx`
-- `docs/typescript-sdk.mdx`
-- `docs/deployments/cloudflare-sandboxes.mdx`
-- `docs/deployments/daytona.mdx`
-- `docs/deployments/docker.mdx`
-- `docs/deployments/e2b.mdx`
-- `docs/deployments/vercel-sandboxes.mdx`
 
 ## Git Commits
 

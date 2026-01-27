@@ -11,9 +11,10 @@ use sandbox_agent_agent_management::credentials::{
     ProviderCredentials,
 };
 use sandbox_agent::router::{
-    AgentInstallRequest, AppState, AuthConfig, CreateSessionRequest, MessageRequest, MockConfig,
+    AgentInstallRequest, AppState, AuthConfig, CreateSessionRequest, MessageRequest,
     PermissionReply, PermissionReplyRequest, QuestionReplyRequest,
 };
+use sandbox_agent::telemetry;
 use sandbox_agent::router::{AgentListResponse, AgentModesResponse, CreateSessionResponse, EventsResponse};
 use sandbox_agent::router::build_router;
 use sandbox_agent::ui;
@@ -28,8 +29,8 @@ const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 2468;
 
 #[derive(Parser, Debug)]
-#[command(name = "sandbox-daemon", bin_name = "sandbox-agent")]
-#[command(about = "Sandbox daemon for managing coding agents", version)]
+#[command(name = "sandbox-agent", bin_name = "sandbox-agent")]
+#[command(about = "Sandbox agent server for managing coding agents", version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -43,7 +44,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run the sandbox daemon HTTP server.
+    /// Run the sandbox agent HTTP server.
     Server(ServerArgs),
     /// Manage installed agents and their modes.
     Agents(AgentsArgs),
@@ -73,8 +74,8 @@ struct ServerArgs {
     #[arg(long = "cors-allow-credentials", short = 'C')]
     cors_allow_credentials: bool,
 
-    #[arg(long)]
-    mock: bool,
+    #[arg(long = "no-telemetry")]
+    no_telemetry: bool,
 }
 
 #[derive(Args, Debug)]
@@ -280,7 +281,7 @@ struct CredentialsExtractEnvArgs {
 
 #[derive(Debug, Error)]
 enum CliError {
-    #[error("missing command: run `sandbox-daemon server` to start the daemon")]
+    #[error("missing command: run `sandbox-agent server` to start the server")]
     MissingCommand,
     #[error("missing --token or --no-token for server mode")]
     MissingToken,
@@ -337,12 +338,7 @@ fn run_server(cli: &Cli, server: &ServerArgs) -> Result<(), CliError> {
 
     let agent_manager =
         AgentManager::new(default_install_dir()).map_err(|err| CliError::Server(err.to_string()))?;
-    let mock = if server.mock {
-        MockConfig::enabled()
-    } else {
-        MockConfig::disabled()
-    };
-    let state = AppState::new(auth, agent_manager, mock);
+    let state = AppState::new(auth, agent_manager);
     let mut router = build_router(state);
 
     if let Some(cors) = build_cors_layer(server)? {
@@ -360,7 +356,13 @@ fn run_server(cli: &Cli, server: &ServerArgs) -> Result<(), CliError> {
         .build()
         .map_err(|err| CliError::Server(err.to_string()))?;
 
+    let telemetry_enabled = telemetry::telemetry_enabled(server.no_telemetry);
+
     runtime.block_on(async move {
+        if telemetry_enabled {
+            telemetry::log_enabled_message();
+            telemetry::spawn_telemetry_task();
+        }
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         tracing::info!(addr = %addr, "server listening");
         if ui::is_enabled() {
@@ -383,7 +385,7 @@ fn default_install_dir() -> PathBuf {
 fn run_client(command: &Command, cli: &Cli) -> Result<(), CliError> {
     match command {
         Command::Server(_) => Err(CliError::Server(
-            "server subcommand must be invoked as `sandbox-daemon server`".to_string(),
+            "server subcommand must be invoked as `sandbox-agent server`".to_string(),
         )),
         Command::Agents(subcommand) => run_agents(&subcommand.command, cli),
         Command::Sessions(subcommand) => run_sessions(&subcommand.command, cli),
