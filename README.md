@@ -62,6 +62,10 @@ Docs
 
 ### Server
 
+- Install server
+    - curl (fastest & does not require npm)
+    - npm i -g (slower)
+    - npx (for quick runs)
 - Run server
 - Auth
 
@@ -70,6 +74,10 @@ Docs
 ### CLI
 
 Docs
+
+### Tip: Extracting API Keys
+
+TODO: npx command to get API keys
 
 ## Project Goals
 

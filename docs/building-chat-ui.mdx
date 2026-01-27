@@ -1,0 +1,167 @@
+---
+title: "Building a Chat UI"
+description: "Design a client that renders universal session events consistently across providers."
+---
+
+This guide explains how to build a chat UI that works across all agents using the universal event
+stream.
+
+## High-level flow
+
+1. List agents and read their capabilities.
+2. Create a session for the selected agent.
+3. Send user messages.
+4. Subscribe to events (polling or SSE).
+5. Render items and deltas into a stable message timeline.
+
+## Use agent capabilities
+
+Capabilities tell you which features are supported for the selected agent:
+
+- `tool_calls` and `tool_results` indicate tool execution events.
+- `questions` and `permissions` indicate HITL flows.
+- `plan_mode` indicates that the agent supports plan-only execution.
+
+Use these to enable or disable UI affordances (tool panels, approval buttons, etc.).
+
+## Event model
+
+Every event includes:
+
+- `event_id`, `sequence`, and `time` for ordering.
+- `session_id` for the universal session.
+- `native_session_id` for provider-specific debugging.
+- `event_type` with one of:
+  - `session.started`, `session.ended`
+  - `item.started`, `item.delta`, `item.completed`
+  - `permission.requested`, `permission.resolved`
+  - `question.requested`, `question.resolved`
+  - `error`, `agent.unparsed`
+- `data` which holds the payload for the event type.
+- `synthetic` and `source` to show daemon-generated events.
+- `raw` (optional) when `include_raw=true`.
+
+## Rendering items
+
+Items are emitted in three phases:
+
+- `item.started`: first snapshot of a message or tool item.
+- `item.delta`: incremental updates (token streaming or synthetic deltas).
+- `item.completed`: final snapshot.
+
+Recommended render flow:
+
+```ts
+type ItemState = {
+  item: UniversalItem;
+  deltas: string[];
+};
+
+const items = new Map<string, ItemState>();
+const order: string[] = [];
+
+function applyEvent(event: UniversalEvent) {
+  if (event.event_type === "item.started") {
+    const item = event.data.item;
+    items.set(item.item_id, { item, deltas: [] });
+    order.push(item.item_id);
+  }
+
+  if (event.event_type === "item.delta") {
+    const { item_id, delta } = event.data;
+    const state = items.get(item_id);
+    if (state) {
+      state.deltas.push(delta);
+    }
+  }
+
+  if (event.event_type === "item.completed") {
+    const item = event.data.item;
+    const state = items.get(item.item_id);
+    if (state) {
+      state.item = item;
+    }
+  }
+}
+```
+
+When rendering, combine the item content with accumulated deltas. If you receive a delta before a
+started event (should not happen), treat it as an error.
+
+## Content parts
+
+Each `UniversalItem` has `content` parts. Your UI can branch on `part.type`:
+
+- `text` for normal chat text.
+- `tool_call` and `tool_result` for tool execution.
+- `file_ref` for file read/write/patch previews.
+- `reasoning` if you display public reasoning text.
+- `status` for progress updates.
+- `image` for image outputs.
+
+Treat `item.kind` as the primary layout decision (message vs tool call vs system), and use content
+parts for the detailed rendering.
+
+## Questions and permissions
+
+Question and permission events are out-of-band from item flow. Render them as modal or inline UI
+blocks that must be resolved via:
+
+- `POST /v1/sessions/{session_id}/questions/{question_id}/reply`
+- `POST /v1/sessions/{session_id}/questions/{question_id}/reject`
+- `POST /v1/sessions/{session_id}/permissions/{permission_id}/reply`
+
+If an agent does not advertise these capabilities, keep those UI controls hidden.
+
+## Error and unparsed events
+
+- `error` events are structured failures from the daemon or agent.
+- `agent.unparsed` indicates the provider emitted something the converter could not parse.
+
+Treat `agent.unparsed` as a hard failure in development so you can fix converters quickly.
+
+## Event ordering
+
+Prefer `sequence` for ordering. It is monotonic for a given session. The `time` field is for
+timestamps, not ordering.
+
+## Handling session end
+
+`session.ended` includes the reason and who terminated it. Disable input after a terminal event.
+
+## Optional raw payloads
+
+If you need provider-level debugging, pass `include_raw=true` when streaming or polling events to
+receive the `raw` payload for each event.
+
+## SSE vs polling
+
+- SSE gives low-latency updates and simplifies streaming UIs.
+- Polling is simpler to debug and works in any environment.
+
+Both yield the same event payloads.
+
+## Mock mode for UI testing
+
+Run the server with `--mock` to emit a looping, feature-complete event history for UI development:
+
+```bash
+sandbox-agent server --mock --no-token
+```
+
+Behavior in mock mode:
+
+- Sessions emit a fixed history that covers every event type and content part.
+- The history repeats in a loop, with ~200ms between events and a ~2s pause between loops.
+- `session.started` and `session.ended` are included in every loop so UIs can exercise lifecycle handling.
+- `send-message` is accepted but does not change the mock stream.
+
+If your UI stops rendering after `session.ended`, disable that behavior while testing mock mode so the
+loop remains visible.
+
+## Reference implementation
+
+The [Inspector chat UI](https://github.com/rivet-dev/sandbox-agent/blob/main/frontend/packages/inspector/src/App.tsx)
+is a complete reference implementation showing how to build a chat interface using the universal event
+stream. It demonstrates session management, event rendering, item lifecycle handling, and HITL approval
+flows.

@@ -1,5 +1,6 @@
 ## launch
 
+- examples for daytona, e2b
 - provide mock data for validating your rendering
     - provides history with all items, then iterates thorugh all items on a stream
     - this is a special type of serve function

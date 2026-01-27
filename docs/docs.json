@@ -30,7 +30,14 @@
           {
             "group": "Operations",
             "pages": [
-              "frontend"
+              "frontend",
+              "building-chat-ui"
+            ]
+          },
+          {
+            "group": "SDKs",
+            "pages": [
+              "sdks/typescript"
             ]
           }
         ]

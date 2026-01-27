@@ -2,7 +2,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use sandbox_agent_agent_management::agents::AgentManager;
-use sandbox_agent::router::{build_router, AppState, AuthConfig};
+use sandbox_agent::router::{build_router, AppState, AuthConfig, MockConfig};
 use sandbox_agent::ui;
 use tempfile::TempDir;
 use tower::util::ServiceExt;
@@ -15,7 +15,7 @@ async fn serves_inspector_ui() {
 
     let install_dir = TempDir::new().expect("create temp install dir");
     let manager = AgentManager::new(install_dir.path()).expect("create agent manager");
-    let state = AppState::new(AuthConfig::disabled(), manager);
+    let state = AppState::new(AuthConfig::disabled(), manager, MockConfig::disabled());
     let app = build_router(state);
 
     let request = Request::builder()

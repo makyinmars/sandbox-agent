@@ -65,6 +65,34 @@ use sandbox_agent_agent_management::credentials::{
 };
 use crate::ui;
 
+const MOCK_EVENT_DELAY_MS: u64 = 200;
+const MOCK_LOOP_DELAY_MS: u64 = 2000;
+
+#[derive(Debug, Clone)]
+pub struct MockConfig {
+    enabled: bool,
+    event_delay: Duration,
+    loop_delay: Duration,
+}
+
+impl MockConfig {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            event_delay: Duration::ZERO,
+            loop_delay: Duration::ZERO,
+        }
+    }
+
+    pub fn enabled() -> Self {
+        Self {
+            enabled: true,
+            event_delay: Duration::from_millis(MOCK_EVENT_DELAY_MS),
+            loop_delay: Duration::from_millis(MOCK_LOOP_DELAY_MS),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct AppState {
     auth: AuthConfig,
@@ -73,9 +101,9 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(auth: AuthConfig, agent_manager: AgentManager) -> Self {
+    pub fn new(auth: AuthConfig, agent_manager: AgentManager, mock: MockConfig) -> Self {
         let agent_manager = Arc::new(agent_manager);
-        let session_manager = Arc::new(SessionManager::new(agent_manager.clone()));
+        let session_manager = Arc::new(SessionManager::new(agent_manager.clone(), mock));
         Self {
             auth,
             agent_manager,
@@ -565,6 +593,7 @@ struct SessionManager {
     sessions: Mutex<HashMap<String, SessionState>>,
     opencode_server: Mutex<Option<OpencodeServer>>,
     http_client: Client,
+    mock: MockConfig,
 }
 
 #[derive(Debug)]
@@ -580,12 +609,13 @@ struct SessionSubscription {
 }
 
 impl SessionManager {
-    fn new(agent_manager: Arc<AgentManager>) -> Self {
+    fn new(agent_manager: Arc<AgentManager>, mock: MockConfig) -> Self {
         Self {
             agent_manager,
             sessions: Mutex::new(HashMap::new()),
             opencode_server: Mutex::new(None),
             http_client: Client::new(),
+            mock,
         }
     }
 
@@ -600,6 +630,10 @@ impl SessionManager {
             if sessions.contains_key(&session_id) {
                 return Err(SandboxError::SessionAlreadyExists { session_id });
             }
+        }
+
+        if self.mock.enabled {
+            return self.create_mock_session(session_id, agent_id, request).await;
         }
 
         let manager = self.agent_manager.clone();
@@ -660,6 +694,32 @@ impl SessionManager {
         })
     }
 
+    async fn create_mock_session(
+        self: &Arc<Self>,
+        session_id: String,
+        agent_id: AgentId,
+        request: CreateSessionRequest,
+    ) -> Result<CreateSessionResponse, SandboxError> {
+        let mut session = SessionState::new(session_id.clone(), agent_id, &request)?;
+        session.native_session_id = Some(format!("mock-{session_id}"));
+        let native_session_id = session.native_session_id.clone();
+
+        let mut sessions = self.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+        drop(sessions);
+
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            manager.run_mock_loop(session_id).await;
+        });
+
+        Ok(CreateSessionResponse {
+            healthy: true,
+            error: None,
+            native_session_id,
+        })
+    }
+
     async fn agent_modes(&self, agent: AgentId) -> Result<Vec<AgentModeInfo>, SandboxError> {
         if agent != AgentId::Opencode {
             return Ok(agent_modes_for(agent));
@@ -683,6 +743,11 @@ impl SessionManager {
         session_id: String,
         message: String,
     ) -> Result<(), SandboxError> {
+        if self.mock.enabled {
+            self.session_snapshot(&session_id, false).await?;
+            return Ok(());
+        }
+
         let session_snapshot = self.session_snapshot(&session_id, false).await?;
         if session_snapshot.agent == AgentId::Opencode {
             self.ensure_opencode_stream(session_id.clone()).await?;
@@ -833,6 +898,43 @@ impl SessionManager {
         question_id: &str,
         answers: Vec<Vec<String>>,
     ) -> Result<(), SandboxError> {
+        if self.mock.enabled {
+            let pending = {
+                let mut sessions = self.sessions.lock().await;
+                let session = sessions.get_mut(session_id).ok_or_else(|| SandboxError::SessionNotFound {
+                    session_id: session_id.to_string(),
+                })?;
+                if let Some(err) = session.ended_error() {
+                    return Err(err);
+                }
+                session.take_question(question_id)
+            };
+            let (prompt, options) = match pending {
+                Some(pending) => (pending.prompt, pending.options),
+                None => (
+                    "Mock question prompt".to_string(),
+                    vec!["Option A".to_string(), "Option B".to_string()],
+                ),
+            };
+            let response = answers
+                .first()
+                .and_then(|inner| inner.first())
+                .cloned();
+            let resolved = EventConversion::new(
+                UniversalEventType::QuestionResolved,
+                UniversalEventData::Question(QuestionEventData {
+                    question_id: question_id.to_string(),
+                    prompt,
+                    options,
+                    response,
+                    status: QuestionStatus::Answered,
+                }),
+            )
+            .synthetic();
+            let _ = self.record_conversions(session_id, vec![resolved]).await;
+            return Ok(());
+        }
+
         let (agent, native_session_id, pending_question) = {
             let mut sessions = self.sessions.lock().await;
             let session = sessions.get_mut(session_id).ok_or_else(|| SandboxError::SessionNotFound {
@@ -891,6 +993,39 @@ impl SessionManager {
         session_id: &str,
         question_id: &str,
     ) -> Result<(), SandboxError> {
+        if self.mock.enabled {
+            let pending = {
+                let mut sessions = self.sessions.lock().await;
+                let session = sessions.get_mut(session_id).ok_or_else(|| SandboxError::SessionNotFound {
+                    session_id: session_id.to_string(),
+                })?;
+                if let Some(err) = session.ended_error() {
+                    return Err(err);
+                }
+                session.take_question(question_id)
+            };
+            let (prompt, options) = match pending {
+                Some(pending) => (pending.prompt, pending.options),
+                None => (
+                    "Mock question prompt".to_string(),
+                    vec!["Option A".to_string(), "Option B".to_string()],
+                ),
+            };
+            let resolved = EventConversion::new(
+                UniversalEventType::QuestionResolved,
+                UniversalEventData::Question(QuestionEventData {
+                    question_id: question_id.to_string(),
+                    prompt,
+                    options,
+                    response: None,
+                    status: QuestionStatus::Rejected,
+                }),
+            )
+            .synthetic();
+            let _ = self.record_conversions(session_id, vec![resolved]).await;
+            return Ok(());
+        }
+
         let (agent, native_session_id, pending_question) = {
             let mut sessions = self.sessions.lock().await;
             let session = sessions.get_mut(session_id).ok_or_else(|| SandboxError::SessionNotFound {
@@ -945,6 +1080,40 @@ impl SessionManager {
         permission_id: &str,
         reply: PermissionReply,
     ) -> Result<(), SandboxError> {
+        if self.mock.enabled {
+            let pending = {
+                let mut sessions = self.sessions.lock().await;
+                let session = sessions.get_mut(session_id).ok_or_else(|| SandboxError::SessionNotFound {
+                    session_id: session_id.to_string(),
+                })?;
+                if let Some(err) = session.ended_error() {
+                    return Err(err);
+                }
+                session.take_permission(permission_id)
+            };
+
+            let (action, metadata) = match pending {
+                Some(pending) => (pending.action, pending.metadata),
+                None => ("mock.permission".to_string(), None),
+            };
+            let status = match reply {
+                PermissionReply::Reject => PermissionStatus::Denied,
+                PermissionReply::Once | PermissionReply::Always => PermissionStatus::Approved,
+            };
+            let resolved = EventConversion::new(
+                UniversalEventType::PermissionResolved,
+                UniversalEventData::Permission(PermissionEventData {
+                    permission_id: permission_id.to_string(),
+                    action,
+                    status,
+                    metadata,
+                }),
+            )
+            .synthetic();
+            let _ = self.record_conversions(session_id, vec![resolved]).await;
+            return Ok(());
+        }
+
         let reply_for_status = reply.clone();
         let (agent, native_session_id, codex_sender, pending_permission) = {
             let mut sessions = self.sessions.lock().await;
@@ -1053,6 +1222,50 @@ impl SessionManager {
         }
 
         Ok(())
+    }
+
+    async fn run_mock_loop(self: Arc<Self>, session_id: String) {
+        let mut cycle = 0_u64;
+        let event_delay = self.mock.event_delay;
+        let loop_delay = self.mock.loop_delay;
+
+        loop {
+            if self.is_session_ended(&session_id).await {
+                return;
+            }
+            let snapshot = match self.session_snapshot(&session_id, true).await {
+                Ok(snapshot) => snapshot,
+                Err(_) => return,
+            };
+            cycle = cycle.saturating_add(1);
+            let conversions = mock_event_conversions(cycle, &snapshot);
+            for conversion in conversions {
+                if self
+                    .record_conversions(&session_id, vec![conversion])
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                if event_delay != Duration::ZERO {
+                    sleep(event_delay).await;
+                }
+                if self.is_session_ended(&session_id).await {
+                    return;
+                }
+            }
+            if loop_delay != Duration::ZERO {
+                sleep(loop_delay).await;
+            }
+        }
+    }
+
+    async fn is_session_ended(&self, session_id: &str) -> bool {
+        let sessions = self.sessions.lock().await;
+        match sessions.get(session_id) {
+            Some(session) => session.ended,
+            None => true,
+        }
     }
 
     async fn session_snapshot(
@@ -1756,10 +1969,22 @@ pub struct AgentModesResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentCapabilities {
+    // TODO: add agent-agnostic tests that cover every capability flag here.
     pub plan_mode: bool,
     pub permissions: bool,
     pub questions: bool,
     pub tool_calls: bool,
+    pub tool_results: bool,
+    pub text_messages: bool,
+    pub images: bool,
+    pub file_attachments: bool,
+    pub session_lifecycle: bool,
+    pub error_events: bool,
+    pub reasoning: bool,
+    pub command_execution: bool,
+    pub file_changes: bool,
+    pub mcp_tools: bool,
+    pub streaming_deltas: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
@@ -2246,24 +2471,68 @@ fn agent_capabilities_for(agent: AgentId) -> AgentCapabilities {
             permissions: false,
             questions: false,
             tool_calls: false,
+            tool_results: false,
+            text_messages: true,
+            images: false,
+            file_attachments: false,
+            session_lifecycle: false,
+            error_events: false,
+            reasoning: false,
+            command_execution: false,
+            file_changes: false,
+            mcp_tools: false,
+            streaming_deltas: false,
         },
         AgentId::Codex => AgentCapabilities {
             plan_mode: true,
             permissions: true,
             questions: false,
             tool_calls: true,
+            tool_results: true,
+            text_messages: true,
+            images: true,
+            file_attachments: true,
+            session_lifecycle: true,
+            error_events: true,
+            reasoning: true,
+            command_execution: true,
+            file_changes: true,
+            mcp_tools: true,
+            streaming_deltas: true,
         },
         AgentId::Opencode => AgentCapabilities {
             plan_mode: false,
             permissions: false,
             questions: false,
             tool_calls: true,
+            tool_results: true,
+            text_messages: true,
+            images: true,
+            file_attachments: true,
+            session_lifecycle: true,
+            error_events: true,
+            reasoning: false,
+            command_execution: false,
+            file_changes: false,
+            mcp_tools: false,
+            streaming_deltas: true,
         },
         AgentId::Amp => AgentCapabilities {
             plan_mode: false,
             permissions: false,
             questions: false,
             tool_calls: true,
+            tool_results: true,
+            text_messages: true,
+            images: false,
+            file_attachments: false,
+            session_lifecycle: false,
+            error_events: true,
+            reasoning: false,
+            command_execution: false,
+            file_changes: false,
+            mcp_tools: false,
+            streaming_deltas: false,
         },
     }
 }
@@ -3170,6 +3439,441 @@ fn text_delta_from_parts(parts: &[ContentPart]) -> Option<String> {
     } else {
         Some(delta)
     }
+}
+
+fn mock_event_conversions(loop_index: u64, session: &SessionSnapshot) -> Vec<EventConversion> {
+    let prefix = format!("mock_{loop_index}");
+    let system_native = format!("{prefix}_system");
+    let user_native = format!("{prefix}_user");
+    let assistant_native = format!("{prefix}_assistant");
+    let status_native = format!("{prefix}_status");
+    let tool_call_native = format!("{prefix}_tool_call");
+    let tool_result_native = format!("{prefix}_tool_result");
+    let image_native = format!("{prefix}_image");
+    let unknown_native = format!("{prefix}_unknown");
+    let permission_id = format!("{prefix}_permission");
+    let permission_deny_id = format!("{prefix}_permission_denied");
+    let question_id = format!("{prefix}_question");
+    let question_reject_id = format!("{prefix}_question_reject");
+    let call_id = format!("{prefix}_call");
+
+    let metadata = json!({
+        "agent": session.agent.as_str(),
+        "agentMode": session.agent_mode.clone(),
+        "permissionMode": session.permission_mode.clone(),
+        "model": session.model.clone(),
+        "variant": session.variant.clone(),
+        "mockCycle": loop_index,
+    });
+
+    let mut events = Vec::new();
+
+    events.push(
+        EventConversion::new(
+            UniversalEventType::SessionStarted,
+            UniversalEventData::SessionStarted(SessionStartedData {
+                metadata: Some(metadata),
+            }),
+        )
+        .synthetic(),
+    );
+
+    events.push(mock_item_event(
+        UniversalEventType::ItemStarted,
+        mock_item(
+            system_native.clone(),
+            ItemKind::System,
+            ItemRole::System,
+            ItemStatus::InProgress,
+            vec![ContentPart::Text {
+                text: "System ready for mock events.".to_string(),
+            }],
+        ),
+    ));
+    events.push(mock_item_event(
+        UniversalEventType::ItemCompleted,
+        mock_item(
+            system_native,
+            ItemKind::System,
+            ItemRole::System,
+            ItemStatus::Completed,
+            vec![ContentPart::Text {
+                text: "System ready for mock events.".to_string(),
+            }],
+        ),
+    ));
+
+    events.push(mock_item_event(
+        UniversalEventType::ItemStarted,
+        mock_item(
+            user_native.clone(),
+            ItemKind::Message,
+            ItemRole::User,
+            ItemStatus::InProgress,
+            vec![ContentPart::Text {
+                text: "User: run the mock pipeline.".to_string(),
+            }],
+        ),
+    ));
+    events.push(mock_item_event(
+        UniversalEventType::ItemCompleted,
+        mock_item(
+            user_native,
+            ItemKind::Message,
+            ItemRole::User,
+            ItemStatus::Completed,
+            vec![ContentPart::Text {
+                text: "User: run the mock pipeline.".to_string(),
+            }],
+        ),
+    ));
+
+    let assistant_parts = vec![
+        ContentPart::Text {
+            text: "Mock assistant response with rich content.".to_string(),
+        },
+        ContentPart::Reasoning {
+            text: "Public reasoning for display.".to_string(),
+            visibility: ReasoningVisibility::Public,
+        },
+        ContentPart::Reasoning {
+            text: "Private reasoning hidden by default.".to_string(),
+            visibility: ReasoningVisibility::Private,
+        },
+        ContentPart::Json {
+            json: json!({
+                "stage": "analysis",
+                "ok": true,
+                "cycle": loop_index
+            }),
+        },
+    ];
+    events.push(mock_item_event(
+        UniversalEventType::ItemStarted,
+        mock_item(
+            assistant_native.clone(),
+            ItemKind::Message,
+            ItemRole::Assistant,
+            ItemStatus::InProgress,
+            assistant_parts.clone(),
+        ),
+    ));
+    events.push(mock_delta(assistant_native.clone(), "Mock assistant "));
+    events.push(mock_delta(assistant_native.clone(), "streaming delta."));
+    events.push(mock_item_event(
+        UniversalEventType::ItemCompleted,
+        mock_item(
+            assistant_native,
+            ItemKind::Message,
+            ItemRole::Assistant,
+            ItemStatus::Completed,
+            assistant_parts,
+        ),
+    ));
+
+    events.push(mock_item_event(
+        UniversalEventType::ItemStarted,
+        mock_item(
+            status_native.clone(),
+            ItemKind::Status,
+            ItemRole::Assistant,
+            ItemStatus::InProgress,
+            vec![ContentPart::Status {
+                label: "Indexing".to_string(),
+                detail: Some("2 files".to_string()),
+            }],
+        ),
+    ));
+    events.push(mock_item_event(
+        UniversalEventType::ItemCompleted,
+        mock_item(
+            status_native,
+            ItemKind::Status,
+            ItemRole::Assistant,
+            ItemStatus::Completed,
+            vec![ContentPart::Status {
+                label: "Indexing".to_string(),
+                detail: Some("Done".to_string()),
+            }],
+        ),
+    ));
+
+    let tool_call_part = ContentPart::ToolCall {
+        name: "mock.search".to_string(),
+        arguments: "{\"query\":\"example\"}".to_string(),
+        call_id: call_id.clone(),
+    };
+    events.push(mock_item_event(
+        UniversalEventType::ItemStarted,
+        mock_item(
+            tool_call_native.clone(),
+            ItemKind::ToolCall,
+            ItemRole::Assistant,
+            ItemStatus::InProgress,
+            vec![tool_call_part.clone()],
+        ),
+    ));
+    events.push(mock_item_event(
+        UniversalEventType::ItemCompleted,
+        mock_item(
+            tool_call_native,
+            ItemKind::ToolCall,
+            ItemRole::Assistant,
+            ItemStatus::Completed,
+            vec![tool_call_part],
+        ),
+    ));
+
+    let tool_result_parts = vec![
+        ContentPart::ToolResult {
+            call_id: call_id.clone(),
+            output: "mock search results".to_string(),
+        },
+        ContentPart::FileRef {
+            path: format!("{prefix}/readme.md"),
+            action: FileAction::Read,
+            diff: None,
+        },
+        ContentPart::FileRef {
+            path: format!("{prefix}/output.txt"),
+            action: FileAction::Write,
+            diff: Some("+mock output\n".to_string()),
+        },
+        ContentPart::FileRef {
+            path: format!("{prefix}/patch.txt"),
+            action: FileAction::Patch,
+            diff: Some("@@ -1,1 +1,1 @@\n-old\n+new\n".to_string()),
+        },
+    ];
+    events.push(mock_item_event(
+        UniversalEventType::ItemStarted,
+        mock_item(
+            tool_result_native.clone(),
+            ItemKind::ToolResult,
+            ItemRole::Tool,
+            ItemStatus::InProgress,
+            tool_result_parts.clone(),
+        ),
+    ));
+    events.push(mock_item_event(
+        UniversalEventType::ItemCompleted,
+        mock_item(
+            tool_result_native,
+            ItemKind::ToolResult,
+            ItemRole::Tool,
+            ItemStatus::Failed,
+            tool_result_parts,
+        ),
+    ));
+
+    let image_parts = vec![
+        ContentPart::Text {
+            text: "Here is a mock image output.".to_string(),
+        },
+        ContentPart::Image {
+            path: format!("{prefix}/image.png"),
+            mime: Some("image/png".to_string()),
+        },
+    ];
+    events.push(mock_item_event(
+        UniversalEventType::ItemStarted,
+        mock_item(
+            image_native.clone(),
+            ItemKind::Message,
+            ItemRole::Assistant,
+            ItemStatus::InProgress,
+            image_parts.clone(),
+        ),
+    ));
+    events.push(mock_item_event(
+        UniversalEventType::ItemCompleted,
+        mock_item(
+            image_native,
+            ItemKind::Message,
+            ItemRole::Assistant,
+            ItemStatus::Completed,
+            image_parts,
+        ),
+    ));
+
+    events.push(mock_item_event(
+        UniversalEventType::ItemStarted,
+        mock_item(
+            unknown_native.clone(),
+            ItemKind::Unknown,
+            ItemRole::Assistant,
+            ItemStatus::InProgress,
+            vec![ContentPart::Text {
+                text: "Unknown item kind example.".to_string(),
+            }],
+        ),
+    ));
+    events.push(mock_item_event(
+        UniversalEventType::ItemCompleted,
+        mock_item(
+            unknown_native,
+            ItemKind::Unknown,
+            ItemRole::Assistant,
+            ItemStatus::Completed,
+            vec![ContentPart::Text {
+                text: "Unknown item kind example.".to_string(),
+            }],
+        ),
+    ));
+
+    let permission_metadata = json!({
+        "codexRequestKind": "commandExecution",
+        "command": "echo mock"
+    });
+    events.push(EventConversion::new(
+        UniversalEventType::PermissionRequested,
+        UniversalEventData::Permission(PermissionEventData {
+            permission_id: permission_id.clone(),
+            action: "command_execution".to_string(),
+            status: PermissionStatus::Requested,
+            metadata: Some(permission_metadata),
+        }),
+    ));
+    events.push(EventConversion::new(
+        UniversalEventType::PermissionResolved,
+        UniversalEventData::Permission(PermissionEventData {
+            permission_id: permission_id,
+            action: "command_execution".to_string(),
+            status: PermissionStatus::Approved,
+            metadata: None,
+        }),
+    ));
+
+    let permission_metadata_deny = json!({
+        "codexRequestKind": "fileChange",
+        "path": format!("{prefix}/deny.txt")
+    });
+    events.push(EventConversion::new(
+        UniversalEventType::PermissionRequested,
+        UniversalEventData::Permission(PermissionEventData {
+            permission_id: permission_deny_id.clone(),
+            action: "file_change".to_string(),
+            status: PermissionStatus::Requested,
+            metadata: Some(permission_metadata_deny),
+        }),
+    ));
+    events.push(EventConversion::new(
+        UniversalEventType::PermissionResolved,
+        UniversalEventData::Permission(PermissionEventData {
+            permission_id: permission_deny_id,
+            action: "file_change".to_string(),
+            status: PermissionStatus::Denied,
+            metadata: None,
+        }),
+    ));
+
+    events.push(EventConversion::new(
+        UniversalEventType::QuestionRequested,
+        UniversalEventData::Question(QuestionEventData {
+            question_id: question_id.clone(),
+            prompt: "Choose a color".to_string(),
+            options: vec!["Red".to_string(), "Blue".to_string()],
+            response: None,
+            status: QuestionStatus::Requested,
+        }),
+    ));
+    events.push(EventConversion::new(
+        UniversalEventType::QuestionResolved,
+        UniversalEventData::Question(QuestionEventData {
+            question_id: question_id,
+            prompt: "Choose a color".to_string(),
+            options: vec!["Red".to_string(), "Blue".to_string()],
+            response: Some("Blue".to_string()),
+            status: QuestionStatus::Answered,
+        }),
+    ));
+
+    events.push(EventConversion::new(
+        UniversalEventType::QuestionRequested,
+        UniversalEventData::Question(QuestionEventData {
+            question_id: question_reject_id.clone(),
+            prompt: "Allow mock experiment?".to_string(),
+            options: vec!["Yes".to_string(), "No".to_string()],
+            response: None,
+            status: QuestionStatus::Requested,
+        }),
+    ));
+    events.push(EventConversion::new(
+        UniversalEventType::QuestionResolved,
+        UniversalEventData::Question(QuestionEventData {
+            question_id: question_reject_id,
+            prompt: "Allow mock experiment?".to_string(),
+            options: vec!["Yes".to_string(), "No".to_string()],
+            response: None,
+            status: QuestionStatus::Rejected,
+        }),
+    ));
+
+    events.push(
+        EventConversion::new(
+            UniversalEventType::Error,
+            UniversalEventData::Error(ErrorData {
+                message: "Mock error event.".to_string(),
+                code: Some("mock_error".to_string()),
+                details: Some(json!({ "cycle": loop_index })),
+            }),
+        )
+        .synthetic(),
+    );
+    events.push(agent_unparsed(
+        "mock.stream",
+        "unsupported payload",
+        json!({ "raw": "mock" }),
+    ));
+
+    events.push(
+        EventConversion::new(
+            UniversalEventType::SessionEnded,
+            UniversalEventData::SessionEnded(SessionEndedData {
+                reason: SessionEndReason::Completed,
+                terminated_by: TerminatedBy::Agent,
+            }),
+        )
+        .synthetic(),
+    );
+
+    events
+}
+
+fn mock_item(
+    native_item_id: String,
+    kind: ItemKind,
+    role: ItemRole,
+    status: ItemStatus,
+    content: Vec<ContentPart>,
+) -> UniversalItem {
+    UniversalItem {
+        item_id: String::new(),
+        native_item_id: Some(native_item_id),
+        parent_id: None,
+        kind,
+        role: Some(role),
+        content,
+        status,
+    }
+}
+
+fn mock_item_event(event_type: UniversalEventType, item: UniversalItem) -> EventConversion {
+    EventConversion::new(
+        event_type,
+        UniversalEventData::Item(ItemEventData { item }),
+    )
+}
+
+fn mock_delta(native_item_id: String, delta: &str) -> EventConversion {
+    EventConversion::new(
+        UniversalEventType::ItemDelta,
+        UniversalEventData::ItemDelta(ItemDeltaData {
+            item_id: String::new(),
+            native_item_id: Some(native_item_id),
+            delta: delta.to_string(),
+        }),
+    )
 }
 
 fn agent_unparsed(location: &str, error: &str, raw: Value) -> EventConversion {

@@ -1,0 +1,130 @@
+---
+title: "TypeScript SDK"
+description: "Use the generated client to manage sessions and stream events."
+---
+
+The TypeScript SDK is generated from the OpenAPI spec that ships with the daemon. It provides a typed
+client for sessions, events, and agent operations.
+
+## Install
+
+```bash
+npm install sandbox-agent
+```
+
+## Create a client
+
+```ts
+import { SandboxDaemonClient } from "sandbox-agent";
+
+const client = new SandboxDaemonClient({
+  baseUrl: "http://127.0.0.1:2468",
+  token: process.env.SANDBOX_TOKEN,
+});
+```
+
+Or with the factory helper:
+
+```ts
+import { createSandboxDaemonClient } from "sandbox-agent";
+
+const client = createSandboxDaemonClient({
+  baseUrl: "http://127.0.0.1:2468",
+});
+```
+
+## Autospawn (Node only)
+
+If you run locally, the SDK can launch the daemon for you.
+
+```ts
+import { connectSandboxDaemonClient } from "sandbox-agent";
+
+const client = await connectSandboxDaemonClient({
+  spawn: { enabled: true },
+});
+
+await client.dispose();
+```
+
+Autospawn uses the local `sandbox-agent` binary. Install `@sandbox-agent/cli` (recommended) or set
+`SANDBOX_AGENT_BIN` to a custom path.
+
+## Sessions and messages
+
+```ts
+await client.createSession("demo-session", {
+  agent: "codex",
+  agent_mode: "default",
+  permission_mode: "plan",
+});
+
+await client.postMessage("demo-session", { message: "Hello" });
+```
+
+List agents and pick a compatible one:
+
+```ts
+const agents = await client.listAgents();
+const codex = agents.agents.find((agent) => agent.id === "codex");
+console.log(codex?.capabilities);
+```
+
+## Poll events
+
+```ts
+const events = await client.getEvents("demo-session", {
+  offset: 0,
+  limit: 200,
+  include_raw: false,
+});
+
+for (const event of events.events) {
+  console.log(event.event_type, event.data);
+}
+```
+
+## Stream events (SSE)
+
+```ts
+for await (const event of client.streamEvents("demo-session", {
+  offset: 0,
+  include_raw: false,
+})) {
+  console.log(event.event_type, event.data);
+}
+```
+
+The SDK parses `text/event-stream` into `UniversalEvent` objects. If you want full control, use
+`getEventsSse()` and parse the stream yourself.
+
+## Optional raw payloads
+
+Set `include_raw: true` on `getEvents` or `streamEvents` to include the raw provider payload in
+`event.raw`. This is useful for debugging and conversion analysis.
+
+## Error handling
+
+All HTTP errors throw `SandboxDaemonError`:
+
+```ts
+import { SandboxDaemonError } from "sandbox-agent";
+
+try {
+  await client.postMessage("missing-session", { message: "Hi" });
+} catch (error) {
+  if (error instanceof SandboxDaemonError) {
+    console.error(error.status, error.problem);
+  }
+}
+```
+
+## Types
+
+The SDK exports OpenAPI-derived types for events, items, and capabilities:
+
+```ts
+import type { UniversalEvent, UniversalItem, AgentCapabilities } from "sandbox-agent";
+```
+
+See `docs/universal-api.mdx` for the universal schema fields and semantics.

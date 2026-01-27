@@ -17,6 +17,7 @@ use sandbox_agent::router::{
     AgentCapabilities,
     AgentListResponse,
     AuthConfig,
+    MockConfig,
 };
 
 const PROMPT: &str = "Reply with exactly the single word OK.";
@@ -41,7 +42,11 @@ impl TestApp {
         let install_dir = tempfile::tempdir().expect("create temp install dir");
         let manager = AgentManager::new(install_dir.path())
             .expect("create agent manager");
-        let state = sandbox_agent::router::AppState::new(AuthConfig::disabled(), manager);
+        let state = sandbox_agent::router::AppState::new(
+            AuthConfig::disabled(),
+            manager,
+            MockConfig::disabled(),
+        );
         let app = build_router(state);
         Self {
             app,

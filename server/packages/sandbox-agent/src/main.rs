@@ -11,7 +11,7 @@ use sandbox_agent_agent_management::credentials::{
     ProviderCredentials,
 };
 use sandbox_agent::router::{
-    AgentInstallRequest, AppState, AuthConfig, CreateSessionRequest, MessageRequest,
+    AgentInstallRequest, AppState, AuthConfig, CreateSessionRequest, MessageRequest, MockConfig,
     PermissionReply, PermissionReplyRequest, QuestionReplyRequest,
 };
 use sandbox_agent::router::{AgentListResponse, AgentModesResponse, CreateSessionResponse, EventsResponse};
@@ -72,6 +72,9 @@ struct ServerArgs {
 
     #[arg(long = "cors-allow-credentials", short = 'C')]
     cors_allow_credentials: bool,
+
+    #[arg(long)]
+    mock: bool,
 }
 
 #[derive(Args, Debug)]
@@ -334,7 +337,12 @@ fn run_server(cli: &Cli, server: &ServerArgs) -> Result<(), CliError> {
 
     let agent_manager =
         AgentManager::new(default_install_dir()).map_err(|err| CliError::Server(err.to_string()))?;
-    let state = AppState::new(auth, agent_manager);
+    let mock = if server.mock {
+        MockConfig::enabled()
+    } else {
+        MockConfig::disabled()
+    };
+    let state = AppState::new(auth, agent_manager, mock);
     let mut router = build_router(state);
 
     if let Some(cors) = build_cors_layer(server)? {

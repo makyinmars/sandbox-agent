@@ -2,6 +2,7 @@ import {
   Clipboard,
   Cloud,
   Download,
+  GitBranch,
   HelpCircle,
   MessageSquare,
   PauseCircle,
@@ -11,6 +12,7 @@ import {
   Send,
   Shield,
   Terminal,
+  Wrench,
   Zap
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -85,14 +87,24 @@ const formatJson = (value: unknown) => {
 
 const escapeSingleQuotes = (value: string) => value.replace(/'/g, `'\\''`);
 
-const formatCapabilities = (capabilities: AgentCapabilities) => {
-  const parts = [
-    `planMode ${capabilities.planMode ? "✓" : "—"}`,
-    `permissions ${capabilities.permissions ? "✓" : "—"}`,
-    `questions ${capabilities.questions ? "✓" : "—"}`,
-    `toolCalls ${capabilities.toolCalls ? "✓" : "—"}`
+const CapabilityBadges = ({ capabilities }: { capabilities: AgentCapabilities }) => {
+  const items = [
+    { key: "planMode", label: "Plan", icon: GitBranch, enabled: capabilities.planMode },
+    { key: "permissions", label: "Perms", icon: Shield, enabled: capabilities.permissions },
+    { key: "questions", label: "Q&A", icon: HelpCircle, enabled: capabilities.questions },
+    { key: "toolCalls", label: "Tools", icon: Wrench, enabled: capabilities.toolCalls }
   ];
-  return parts.join(" · ");
+
+  return (
+    <div className="capability-badges">
+      {items.map(({ key, label, icon: Icon, enabled }) => (
+        <span key={key} className={`capability-badge ${enabled ? "enabled" : "disabled"}`}>
+          <Icon size={12} />
+          <span>{label}</span>
+        </span>
+      ))}
+    </div>
+  );
 };
 
 const buildCurl = (method: string, url: string, body?: string, token?: string) => {
@@ -1459,8 +1471,8 @@ export default function App() {
                       {agent.version ? `v${agent.version}` : "Version unknown"}
                       {agent.path && <span className="mono muted" style={{ marginLeft: 8 }}>{agent.path}</span>}
                     </div>
-                    <div className="card-meta" style={{ marginTop: 8 }}>
-                      Capabilities: {formatCapabilities(agent.capabilities ?? emptyCapabilities)}
+                    <div style={{ marginTop: 8 }}>
+                      <CapabilityBadges capabilities={agent.capabilities ?? emptyCapabilities} />
                     </div>
                     {modesByAgent[agent.id] && modesByAgent[agent.id].length > 0 && (
                       <div className="card-meta" style={{ marginTop: 8 }}>
