@@ -744,7 +744,6 @@ export default function App() {
     }
   }, [modesByAgent, agentId]);
 
-  const availableAgents = agents.length ? agents.map((agent) => agent.id) : defaultAgents;
   const currentAgent = agents.find((agent) => agent.id === agentId);
   const activeModes = modesByAgent[agentId] ?? [];
   const modesLoading = modesLoadingByAgent[agentId] ?? false;
@@ -822,7 +821,7 @@ export default function App() {
           onSelectSession={selectSession}
           onRefresh={fetchSessions}
           onCreateSession={createNewSession}
-          availableAgents={availableAgents}
+          agents={agents.length ? agents : defaultAgents.map((id) => ({ id, installed: false, capabilities: {} }) as AgentInfo)}
           agentsLoading={agentsLoading}
           agentsError={agentsError}
           sessionsLoading={sessionsLoading}
@@ -840,7 +839,7 @@ export default function App() {
           onSendMessage={sendMessage}
           onKeyDown={handleKeyDown}
           onCreateSession={createNewSession}
-          availableAgents={availableAgents}
+          agents={agents.length ? agents : defaultAgents.map((id) => ({ id, installed: false, capabilities: {} }) as AgentInfo)}
           agentsLoading={agentsLoading}
           agentsError={agentsError}
           messagesEndRef={messagesEndRef}

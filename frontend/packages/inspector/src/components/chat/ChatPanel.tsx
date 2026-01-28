@@ -1,6 +1,6 @@
 import { MessageSquare, PauseCircle, PlayCircle, Plus, Terminal } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import type { AgentModeInfo, PermissionEventData, QuestionEventData } from "sandbox-agent";
+import type { AgentInfo, AgentModeInfo, PermissionEventData, QuestionEventData } from "sandbox-agent";
 import ApprovalsTab from "../debug/ApprovalsTab";
 import ChatInput from "./ChatInput";
 import ChatMessages from "./ChatMessages";
@@ -18,7 +18,7 @@ const ChatPanel = ({
   onSendMessage,
   onKeyDown,
   onCreateSession,
-  availableAgents,
+  agents,
   agentsLoading,
   agentsError,
   messagesEndRef,
@@ -58,7 +58,7 @@ const ChatPanel = ({
   onSendMessage: () => void;
   onKeyDown: (event: React.KeyboardEvent<HTMLTextAreaElement>) => void;
   onCreateSession: (agentId: string) => void;
-  availableAgents: string[];
+  agents: AgentInfo[];
   agentsLoading: boolean;
   agentsError: string | null;
   messagesEndRef: React.RefObject<HTMLDivElement>;
@@ -188,20 +188,26 @@ const ChatPanel = ({
                 <div className="empty-state-menu">
                   {agentsLoading && <div className="sidebar-add-status">Loading agents...</div>}
                   {agentsError && <div className="sidebar-add-status error">{agentsError}</div>}
-                  {!agentsLoading && !agentsError && availableAgents.length === 0 && (
+                  {!agentsLoading && !agentsError && agents.length === 0 && (
                     <div className="sidebar-add-status">No agents available.</div>
                   )}
                   {!agentsLoading && !agentsError &&
-                    availableAgents.map((id) => (
+                    agents.map((agent) => (
                       <button
-                        key={id}
+                        key={agent.id}
                         className="sidebar-add-option"
                         onClick={() => {
-                          onCreateSession(id);
+                          onCreateSession(agent.id);
                           setShowAgentMenu(false);
                         }}
                       >
-                        {agentLabels[id] ?? id}
+                        <span className="agent-option-name">{agentLabels[agent.id] ?? agent.id}</span>
+                        {agent.installed && (
+                          <span className="agent-option-badges">
+                            <span className="agent-badge installed">Installed</span>
+                            {agent.version && <span className="agent-badge version">v{agent.version}</span>}
+                          </span>
+                        )}
                       </button>
                     ))}
                 </div>

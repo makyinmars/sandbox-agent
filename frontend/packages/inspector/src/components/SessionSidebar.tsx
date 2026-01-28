@@ -1,6 +1,6 @@
 import { Plus, RefreshCw } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import type { SessionInfo } from "sandbox-agent";
+import type { AgentInfo, SessionInfo } from "sandbox-agent";
 
 const SessionSidebar = ({
   sessions,
@@ -8,7 +8,7 @@ const SessionSidebar = ({
   onSelectSession,
   onRefresh,
   onCreateSession,
-  availableAgents,
+  agents,
   agentsLoading,
   agentsError,
   sessionsLoading,
@@ -19,7 +19,7 @@ const SessionSidebar = ({
   onSelectSession: (session: SessionInfo) => void;
   onRefresh: () => void;
   onCreateSession: (agentId: string) => void;
-  availableAgents: string[];
+  agents: AgentInfo[];
   agentsLoading: boolean;
   agentsError: string | null;
   sessionsLoading: boolean;
@@ -68,20 +68,26 @@ const SessionSidebar = ({
               <div className="sidebar-add-menu">
                 {agentsLoading && <div className="sidebar-add-status">Loading agents...</div>}
                 {agentsError && <div className="sidebar-add-status error">{agentsError}</div>}
-                {!agentsLoading && !agentsError && availableAgents.length === 0 && (
+                {!agentsLoading && !agentsError && agents.length === 0 && (
                   <div className="sidebar-add-status">No agents available.</div>
                 )}
                 {!agentsLoading && !agentsError &&
-                  availableAgents.map((id) => (
+                  agents.map((agent) => (
                     <button
-                      key={id}
+                      key={agent.id}
                       className="sidebar-add-option"
                       onClick={() => {
-                        onCreateSession(id);
+                        onCreateSession(agent.id);
                         setShowMenu(false);
                       }}
                     >
-                      {agentLabels[id] ?? id}
+                      <span className="agent-option-name">{agentLabels[agent.id] ?? agent.id}</span>
+                      {agent.installed && (
+                        <span className="agent-option-badges">
+                          <span className="agent-badge installed">Installed</span>
+                          {agent.version && <span className="agent-badge version">v{agent.version}</span>}
+                        </span>
+                      )}
                     </button>
                   ))}
               </div>
