@@ -12,9 +12,7 @@ const DebugPanel = ({
   onDebugTabChange,
   events,
   offset,
-  onFetchEvents,
   onResetEvents,
-  eventsLoading,
   eventsError,
   requestLog,
   copiedLogId,
@@ -32,9 +30,7 @@ const DebugPanel = ({
   onDebugTabChange: (tab: DebugTab) => void;
   events: UniversalEvent[];
   offset: number;
-  onFetchEvents: () => void;
   onResetEvents: () => void;
-  eventsLoading: boolean;
   eventsError: string | null;
   requestLog: RequestLog[];
   copiedLogId: number | null;
@@ -80,9 +76,7 @@ const DebugPanel = ({
           <EventsTab
             events={events}
             offset={offset}
-            onFetch={onFetchEvents}
             onClear={onResetEvents}
-            loading={eventsLoading}
             error={eventsError}
           />
         )}

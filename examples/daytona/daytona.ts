@@ -1,5 +1,6 @@
 import { Daytona } from "@daytonaio/sdk";
-import { pathToFileURL } from "node:url";
+import { pathToFileURL, fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
 import {
   ensureUrl,
   logInspectorUrl,
@@ -7,8 +8,8 @@ import {
   waitForHealth,
 } from "../shared/sandbox-agent-client.ts";
 
-const INSTALL_SCRIPT = "curl -fsSL https://releases.rivet.dev/sandbox-agent/latest/install.sh | sh";
 const DEFAULT_PORT = 3000;
+const BINARY_PATH = resolve(dirname(fileURLToPath(import.meta.url)), "../../target/release/sandbox-agent");
 
 export async function setupDaytonaSandboxAgent(): Promise<{
   baseUrl: string;
@@ -21,57 +22,47 @@ export async function setupDaytonaSandboxAgent(): Promise<{
   const language = process.env.DAYTONA_LANGUAGE || "typescript";
 
   const daytona = new Daytona();
-  const sandbox = await daytona.create({
-    language,
-  });
+  console.log("Creating sandbox...");
+  const sandbox = await daytona.create({ language });
 
-  await sandbox.process.executeCommand(`bash -lc "${INSTALL_SCRIPT}"`);
+  console.log("Uploading sandbox-agent...");
+  await sandbox.fs.uploadFile(BINARY_PATH, "/home/daytona/sandbox-agent");
+  await sandbox.fs.setFilePermissions("/home/daytona/sandbox-agent", { mode: "755" });
 
-  const tokenFlag = token ? "--token $SANDBOX_TOKEN" : "--no-token";
-  const serverCommand = `nohup sandbox-agent server ${tokenFlag} --host 0.0.0.0 --port ${port} >/tmp/sandbox-agent.log 2>&1 &`;
-  await sandbox.process.executeCommand(`bash -lc "${serverCommand}"`);
+  console.log("Starting server...");
+  const tokenFlag = token ? `--token ${token}` : "--no-token";
+  await sandbox.process.executeCommand(
+    `nohup /home/daytona/sandbox-agent server ${tokenFlag} --host 0.0.0.0 --port ${port} >/tmp/sandbox-agent.log 2>&1 &`
+  );
 
   const preview = await sandbox.getPreviewLink(port);
-  const extraHeaders: Record<string, string> = {};
+  const extraHeaders: Record<string, string> = {
+    "x-daytona-skip-preview-warning": "true",
+  };
   if (preview.token) {
     extraHeaders["x-daytona-preview-token"] = preview.token;
   }
-  extraHeaders["x-daytona-skip-preview-warning"] = "true";
 
   const baseUrl = ensureUrl(preview.url);
+  console.log("Waiting for health...");
   await waitForHealth({ baseUrl, token, extraHeaders });
   logInspectorUrl({ baseUrl, token });
-
-  const cleanup = async () => {
-    try {
-      await sandbox.delete(60);
-    } catch {
-      // ignore cleanup errors
-    }
-  };
 
   return {
     baseUrl,
     token,
     extraHeaders,
-    cleanup,
+    cleanup: async () => {
+      try { await sandbox.delete(60); } catch {}
+    },
   };
 }
 
 async function main(): Promise<void> {
   const { baseUrl, token, extraHeaders, cleanup } = await setupDaytonaSandboxAgent();
 
-  const exitHandler = async () => {
-    await cleanup();
-    process.exit(0);
-  };
-
-  process.on("SIGINT", () => {
-    void exitHandler();
-  });
-  process.on("SIGTERM", () => {
-    void exitHandler();
-  });
+  process.on("SIGINT", () => void cleanup().then(() => process.exit(0)));
+  process.on("SIGTERM", () => void cleanup().then(() => process.exit(0)));
 
   await runPrompt({ baseUrl, token, extraHeaders });
 }

@@ -503,14 +503,36 @@ export default function App() {
     offsetRef.current = 0;
   };
 
-  const handleCopy = async (entry: RequestLog) => {
-    try {
-      await navigator.clipboard.writeText(entry.curl);
+  const handleCopy = (entry: RequestLog) => {
+    const text = entry.curl;
+    const onSuccess = () => {
       setCopiedLogId(entry.id);
       window.setTimeout(() => setCopiedLogId(null), 1500);
-    } catch {
-      setCopiedLogId(null);
+    };
+
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(onSuccess).catch(() => {
+        fallbackCopy(text, onSuccess);
+      });
+    } else {
+      fallbackCopy(text, onSuccess);
     }
+  };
+
+  const fallbackCopy = (text: string, onSuccess?: () => void) => {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.select();
+    try {
+      document.execCommand("copy");
+      onSuccess?.();
+    } catch (err) {
+      console.error("Failed to copy:", err);
+    }
+    document.body.removeChild(textarea);
   };
 
   const selectQuestionOption = (requestId: string, optionLabel: string) => {
@@ -887,9 +909,7 @@ export default function App() {
           onDebugTabChange={setDebugTab}
           events={events}
           offset={offset}
-          onFetchEvents={fetchEvents}
           onResetEvents={resetEvents}
-          eventsLoading={eventsLoading}
           eventsError={eventError}
           requestLog={requestLog}
           copiedLogId={copiedLogId}

@@ -29,57 +29,69 @@ const ChatSetup = ({
 }) => {
   return (
     <div className="setup-row">
-      <select
-        className="setup-select"
-        value={agentMode}
-        onChange={(e) => onAgentModeChange(e.target.value)}
-        title="Mode"
-        disabled={!hasSession || modesLoading || Boolean(modesError)}
-      >
-        {modesLoading ? (
-          <option value="">Loading modes...</option>
-        ) : modesError ? (
-          <option value="">{modesError}</option>
-        ) : activeModes.length > 0 ? (
-          activeModes.map((mode) => (
-            <option key={mode.id} value={mode.id}>
-              {mode.name || mode.id}
-            </option>
-          ))
-        ) : (
-          <option value="">Mode</option>
-        )}
-      </select>
+      <div className="setup-field">
+        <span className="setup-label">Mode</span>
+        <select
+          className="setup-select"
+          value={agentMode}
+          onChange={(e) => onAgentModeChange(e.target.value)}
+          title="Mode"
+          disabled={!hasSession || modesLoading || Boolean(modesError)}
+        >
+          {modesLoading ? (
+            <option value="">Loading modes...</option>
+          ) : modesError ? (
+            <option value="">{modesError}</option>
+          ) : activeModes.length > 0 ? (
+            activeModes.map((mode) => (
+              <option key={mode.id} value={mode.id}>
+                {mode.name || mode.id}
+              </option>
+            ))
+          ) : (
+            <option value="">Mode</option>
+          )}
+        </select>
+      </div>
 
-      <select
-        className="setup-select"
-        value={permissionMode}
-        onChange={(e) => onPermissionModeChange(e.target.value)}
-        title="Permission Mode"
-        disabled={!hasSession}
-      >
-        <option value="default">Default</option>
-        <option value="plan">Plan</option>
-        <option value="bypass">Bypass</option>
-      </select>
+      <div className="setup-field">
+        <span className="setup-label">Permission</span>
+        <select
+          className="setup-select"
+          value={permissionMode}
+          onChange={(e) => onPermissionModeChange(e.target.value)}
+          title="Permission Mode"
+          disabled={!hasSession}
+        >
+          <option value="default">Default</option>
+          <option value="plan">Plan</option>
+          <option value="bypass">Bypass</option>
+        </select>
+      </div>
 
-      <input
-        className="setup-input"
-        value={model}
-        onChange={(e) => onModelChange(e.target.value)}
-        placeholder="Model"
-        title="Model"
-        disabled={!hasSession}
-      />
+      <div className="setup-field">
+        <span className="setup-label">Model</span>
+        <input
+          className="setup-input"
+          value={model}
+          onChange={(e) => onModelChange(e.target.value)}
+          placeholder="Model"
+          title="Model"
+          disabled={!hasSession}
+        />
+      </div>
 
-      <input
-        className="setup-input"
-        value={variant}
-        onChange={(e) => onVariantChange(e.target.value)}
-        placeholder="Variant"
-        title="Variant"
-        disabled={!hasSession}
-      />
+      <div className="setup-field">
+        <span className="setup-label">Variant</span>
+        <input
+          className="setup-input"
+          value={variant}
+          onChange={(e) => onVariantChange(e.target.value)}
+          placeholder="Variant"
+          title="Variant"
+          disabled={!hasSession}
+        />
+      </div>
     </div>
   );
 };

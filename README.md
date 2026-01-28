@@ -9,6 +9,7 @@ Docs: https://rivet.dev/docs/
 - **Universal session schema**: Universal schema to store agent transcripts
 - **Supports your sandbox provider**: Daytona, E2B, Vercel Sandboxes, and more
 - **Lightweight, portable Rust binary**: Install anywhere with 1 curl command
+- **Automatic agent installation**: Agents are installed on-demand when first used
 - **OpenAPI spec**: https://rivet.dev/docs/api
 
 Roadmap:
@@ -16,8 +17,6 @@ Roadmap:
 - [ ] Python SDK
 - [ ] Automatic MCP & skill & hook configuration
 - [ ] Todo lists
-- [ ] Session diff
-- [ ] Subagents
 
 ## Agent Compatibility
 

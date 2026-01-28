@@ -7,16 +7,12 @@ import { getEventCategory, getEventClass, getEventIcon, getEventKey, getEventTyp
 const EventsTab = ({
   events,
   offset,
-  onFetch,
   onClear,
-  loading,
   error
 }: {
   events: UniversalEvent[];
   offset: number;
-  onFetch: () => void;
   onClear: () => void;
-  loading: boolean;
   error: string | null;
 }) => {
   const [collapsedEvents, setCollapsedEvents] = useState<Record<string, boolean>>({});
@@ -64,9 +60,6 @@ const EventsTab = ({
       <div className="inline-row" style={{ marginBottom: 12, justifyContent: "space-between" }}>
         <span className="card-meta">Offset: {offset}</span>
         <div className="inline-row">
-          <button className="button ghost small" onClick={onFetch} disabled={loading}>
-            {loading ? "Loading..." : "Fetch"}
-          </button>
           <button
             type="button"
             className="button ghost small"
@@ -74,7 +67,7 @@ const EventsTab = ({
             disabled={events.length === 0}
             title="Copy all events as JSON"
           >
-            {copied ? "Copied" : "Copy"}
+            {copied ? "Copied" : "Copy JSON"}
           </button>
           <button className="button ghost small" onClick={onClear}>
             Clear
@@ -86,7 +79,7 @@ const EventsTab = ({
 
       {events.length === 0 ? (
         <div className="card-meta">
-          {loading ? "Loading events..." : "No events yet. Start streaming to receive events."}
+          No events yet. Start streaming to receive events.
         </div>
       ) : (
         <div className="event-list">
