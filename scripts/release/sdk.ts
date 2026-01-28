@@ -99,13 +99,17 @@ export async function publishCrates(opts: ReleaseOpts) {
 		}
 
 		// Publish
+		// Use --no-verify to skip the verification step because:
+		// 1. Code was already built/checked in the setup phase
+		// 2. Verification downloads published dependencies which may not have the latest
+		//    changes yet (crates.io indexing takes time)
 		console.log(`==> Publishing to crates.io: ${crateName}@${opts.version}`);
 
 		try {
 			await $({
 				stdio: "inherit",
 				cwd: cratePath,
-			})`cargo publish --allow-dirty`;
+			})`cargo publish --allow-dirty --no-verify`;
 			console.log(`✅ Published ${crateName}@${opts.version}`);
 		} catch (err) {
 			console.error(`❌ Failed to publish ${crateName}`);
