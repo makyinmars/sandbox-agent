@@ -43,12 +43,7 @@ const buildStubItem = (itemId: string, nativeItemId?: string | null): UniversalI
 };
 
 const getDefaultEndpoint = () => {
-  if (typeof window === "undefined") return "http://127.0.0.1:2468";
-  const { origin, protocol } = window.location;
-  if (!origin || origin === "null" || protocol === "file:") {
-    return "http://127.0.0.1:2468";
-  }
-  return origin;
+  return "http://localhost:2468";
 };
 
 const getInitialConnection = () => {
