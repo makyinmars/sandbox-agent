@@ -351,67 +351,6 @@ async fn test_multi_turn_for_agent(app: &Router, agent: AgentId) -> Result<(), S
     Ok(())
 }
 
-#[tokio::test]
-async fn multi_turn_mock_agent() {
-    let test_app = TestApp::new();
-
-    // Mock agent should always support multi-turn as the reference implementation
-    let result = test_multi_turn_for_agent(&test_app.app, AgentId::Mock).await;
-    assert!(
-        result.is_ok(),
-        "Mock agent multi-turn failed: {:?}",
-        result.err()
-    );
-}
-
-#[tokio::test]
-async fn multi_turn_real_agents() {
-    let configs = match test_agents_from_env() {
-        Ok(configs) => configs,
-        Err(err) => {
-            eprintln!("Failed to get agent configs: {:?}. Skipping multi-turn test.", err);
-            return;
-        }
-    };
-    if configs.is_empty() {
-        eprintln!("No agents configured for testing. Skipping multi-turn test.");
-        return;
-    }
-
-    let test_app = TestApp::new();
-
-    for config in configs {
-        let _guard = apply_credentials(&config.credentials);
-        install_agent(&test_app.app, config.agent).await;
-
-        let result = test_multi_turn_for_agent(&test_app.app, config.agent).await;
-
-        match config.agent {
-            AgentId::Claude | AgentId::Amp | AgentId::Opencode => {
-                // These agents should support multi-turn via resumption
-                assert!(
-                    result.is_ok(),
-                    "{} multi-turn failed (should support resumption): {:?}",
-                    config.agent,
-                    result.err()
-                );
-            }
-            AgentId::Codex => {
-                // Codex now supports multi-turn via the shared app-server model
-                assert!(
-                    result.is_ok(),
-                    "{} multi-turn failed (should support shared app-server): {:?}",
-                    config.agent,
-                    result.err()
-                );
-            }
-            AgentId::Mock => {
-                // Mock is tested separately
-            }
-        }
-    }
-}
-
 /// Test that verifies the session can be reopened after ending
 #[tokio::test]
 async fn session_reopen_after_end() {

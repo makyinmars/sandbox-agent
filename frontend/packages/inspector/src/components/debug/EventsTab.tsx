@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronRight, Copy, Check } from "lucide-react";
+import { ChevronDown, ChevronRight } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { UniversalEvent } from "sandbox-agent";
 import { formatJson, formatTime } from "../../utils/format";
@@ -52,7 +52,6 @@ const EventsTab = ({
             disabled={events.length === 0}
             title="Copy all events as JSON"
           >
-            {copied ? <Check size={14} /> : <Copy size={14} />}
             {copied ? "Copied" : "Copy"}
           </button>
           <button className="button ghost small" onClick={onClear}>

@@ -201,9 +201,11 @@ const ChatPanel = ({
                           setShowAgentMenu(false);
                         }}
                       >
-                        <span className="agent-option-name">{agentLabels[agent.id] ?? agent.id}</span>
+                        <div className="agent-option-left">
+                          <span className="agent-option-name">{agentLabels[agent.id] ?? agent.id}</span>
+                          {agent.version && <span className="agent-badge version">v{agent.version}</span>}
+                        </div>
                         {agent.installed && <span className="agent-badge installed">Installed</span>}
-                        {agent.version && <span className="agent-badge version">v{agent.version}</span>}
                       </button>
                     ))}
                 </div>
