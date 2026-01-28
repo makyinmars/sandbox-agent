@@ -34,6 +34,32 @@ export async function updateVersion(opts: ReleaseOpts) {
 		},
 	];
 
+	// Update internal crate versions in workspace dependencies
+	// These need to match the new version so cargo publish can resolve them correctly
+	const internalCrates = [
+		"sandbox-agent",
+		"sandbox-agent-error",
+		"sandbox-agent-agent-management",
+		"sandbox-agent-agent-credentials",
+		"sandbox-agent-universal-agent-schema",
+		"sandbox-agent-extracted-agent-schemas",
+	];
+
+	const cargoTomlPath = `${opts.root}/Cargo.toml`;
+	let cargoContent = await fs.readFile(cargoTomlPath, "utf-8");
+
+	for (const crate of internalCrates) {
+		// Match: crate-name = { version = "x.y.z", path = "..." }
+		const pattern = new RegExp(
+			`(${crate.replace(/-/g, "-")} = \\{ version = ")[^"]+(",)`,
+			"g"
+		);
+		cargoContent = cargoContent.replace(pattern, `$1${opts.version}$2`);
+	}
+
+	await fs.writeFile(cargoTomlPath, cargoContent);
+	await $({ cwd: opts.root })`git add Cargo.toml`;
+
 	// Substitute all files
 	for (const { path: globPath, find, replace } of findReplace) {
 		const paths = await glob(globPath, { cwd: opts.root });
