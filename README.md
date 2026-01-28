@@ -1,6 +1,10 @@
-# Sandbox Agent SDK
+<p align="center">
+  <img src=".github/media/banner.png" alt="Sandbox Agent SDK" />
+</p>
 
-Universal API for automatic coding agents in sandboxes. Supports Claude Code, Codex, OpenCode, and Amp.
+<p align="center">
+  Universal API for automatic coding agents in sandboxes. Supports Claude Code, Codex, OpenCode, and Amp.
+</p>
 
 Docs: https://rivet.dev/docs/
 
