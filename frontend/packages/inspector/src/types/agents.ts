@@ -31,5 +31,6 @@ export const emptyCapabilities: AgentCapabilitiesView = {
   commandExecution: false,
   fileChanges: false,
   mcpTools: false,
-  streamingDeltas: false
+  streamingDeltas: false,
+  sharedProcess: false
 };
