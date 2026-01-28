@@ -668,6 +668,7 @@
           "fileChanges",
           "mcpTools",
           "streamingDeltas",
+          "itemStarted",
           "sharedProcess"
         ],
         "properties": {
@@ -684,6 +685,9 @@
             "type": "boolean"
           },
           "images": {
+            "type": "boolean"
+          },
+          "itemStarted": {
             "type": "boolean"
           },
           "mcpTools": {

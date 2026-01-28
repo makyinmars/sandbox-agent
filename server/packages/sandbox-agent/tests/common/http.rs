@@ -572,12 +572,27 @@ fn normalize_item(item: &Value) -> Value {
         map.insert("status".to_string(), Value::String(status.to_string()));
     }
     if let Some(content) = item.get("content").and_then(Value::as_array) {
-        let types = content
+        let mut types = content
             .iter()
             .filter_map(|part| part.get("type").and_then(Value::as_str))
             .filter(|value| *value != "reasoning" && *value != "status")
             .map(|value| Value::String(value.to_string()))
             .collect::<Vec<_>>();
+        let is_assistant_message = item
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind == "message")
+            && item
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| role == "assistant");
+        let is_in_progress = item
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status == "in_progress");
+        if types.is_empty() && is_assistant_message && is_in_progress {
+            types.push(Value::String("text".to_string()));
+        }
         map.insert("content_types".to_string(), Value::Array(types));
     }
     Value::Object(map)

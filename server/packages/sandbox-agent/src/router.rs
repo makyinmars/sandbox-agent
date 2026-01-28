@@ -267,6 +267,8 @@ struct SessionState {
     session_started_emitted: bool,
     last_claude_message_id: Option<String>,
     claude_message_counter: u64,
+    pending_assistant_native_ids: VecDeque<String>,
+    pending_assistant_counter: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -322,7 +324,38 @@ impl SessionState {
             session_started_emitted: false,
             last_claude_message_id: None,
             claude_message_counter: 0,
+            pending_assistant_native_ids: VecDeque::new(),
+            pending_assistant_counter: 0,
         })
+    }
+
+    fn next_pending_assistant_native_id(&mut self) -> String {
+        self.pending_assistant_counter += 1;
+        format!(
+            "{}_pending_assistant_{}",
+            self.session_id, self.pending_assistant_counter
+        )
+    }
+
+    fn enqueue_pending_assistant_start(&mut self) -> EventConversion {
+        let native_item_id = self.next_pending_assistant_native_id();
+        self.pending_assistant_native_ids
+            .push_back(native_item_id.clone());
+        EventConversion::new(
+            UniversalEventType::ItemStarted,
+            UniversalEventData::Item(ItemEventData {
+                item: UniversalItem {
+                    item_id: String::new(),
+                    native_item_id: Some(native_item_id),
+                    parent_id: None,
+                    kind: ItemKind::Message,
+                    role: Some(ItemRole::Assistant),
+                    content: Vec::new(),
+                    status: ItemStatus::InProgress,
+                },
+            }),
+        )
+        .synthetic()
     }
 
     fn record_conversions(&mut self, conversions: Vec<EventConversion>) -> Vec<UniversalEvent> {
@@ -357,6 +390,54 @@ impl SessionState {
         }
 
         let mut conversions = Vec::new();
+        if !agent_supports_item_started(self.agent) {
+            if conversion.event_type == UniversalEventType::ItemStarted {
+                if let UniversalEventData::Item(ref data) = conversion.data {
+                    let is_assistant_message = data.item.kind == ItemKind::Message
+                        && matches!(data.item.role, Some(ItemRole::Assistant));
+                    if is_assistant_message {
+                        let keep = data
+                            .item
+                            .native_item_id
+                            .as_ref()
+                            .map(|id| self.pending_assistant_native_ids.contains(id))
+                            .unwrap_or(false);
+                        if !keep {
+                            return conversions;
+                        }
+                    }
+                }
+            }
+            match conversion.event_type {
+                UniversalEventType::ItemCompleted => {
+                    if let UniversalEventData::Item(ref mut data) = conversion.data {
+                        let is_assistant_message = data.item.kind == ItemKind::Message
+                            && matches!(data.item.role, Some(ItemRole::Assistant));
+                        if is_assistant_message {
+                            if let Some(pending) = self.pending_assistant_native_ids.pop_front() {
+                                data.item.native_item_id = Some(pending);
+                                data.item.item_id.clear();
+                            }
+                        }
+                    }
+                }
+                UniversalEventType::ItemDelta => {
+                    if let UniversalEventData::ItemDelta(ref mut data) = conversion.data {
+                        let is_user = data
+                            .native_item_id
+                            .as_ref()
+                            .is_some_and(|id| id.starts_with("user_"));
+                        if !is_user {
+                            if let Some(pending) = self.pending_assistant_native_ids.front() {
+                                data.native_item_id = Some(pending.clone());
+                                data.item_id.clear();
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         match conversion.event_type {
             UniversalEventType::ItemStarted | UniversalEventType::ItemCompleted => {
                 if let UniversalEventData::Item(ref mut data) = conversion.data {
@@ -1505,11 +1586,21 @@ impl SessionManager {
             self.ensure_opencode_stream(session_id.clone()).await?;
             self.send_opencode_prompt(&session_snapshot, &message)
                 .await?;
+            if !agent_supports_item_started(session_snapshot.agent) {
+                let _ = self
+                    .emit_synthetic_assistant_start(&session_snapshot.session_id)
+                    .await;
+            }
             return Ok(());
         }
         if session_snapshot.agent == AgentId::Codex {
             // Use the shared Codex app-server
             self.send_codex_turn(&session_snapshot, &message).await?;
+            if !agent_supports_item_started(session_snapshot.agent) {
+                let _ = self
+                    .emit_synthetic_assistant_start(&session_snapshot.session_id)
+                    .await;
+            }
             return Ok(());
         }
 
@@ -1537,6 +1628,12 @@ impl SessionManager {
                 })?;
 
         let spawn_result = spawn_result.map_err(|err| map_spawn_error(agent_id, err))?;
+        if !agent_supports_item_started(session_snapshot.agent) {
+            let _ = self
+                .emit_synthetic_assistant_start(&session_snapshot.session_id)
+                .await;
+        }
+
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             manager
@@ -1544,6 +1641,23 @@ impl SessionManager {
                 .await;
         });
 
+        Ok(())
+    }
+
+    async fn emit_synthetic_assistant_start(
+        &self,
+        session_id: &str,
+    ) -> Result<(), SandboxError> {
+        let conversion = {
+            let mut sessions = self.sessions.lock().await;
+            let session = Self::session_mut(&mut sessions, session_id).ok_or_else(|| {
+                SandboxError::SessionNotFound {
+                    session_id: session_id.to_string(),
+                }
+            })?;
+            session.enqueue_pending_assistant_start()
+        };
+        let _ = self.record_conversions(session_id, vec![conversion]).await?;
         Ok(())
     }
 
@@ -3023,6 +3137,7 @@ pub struct AgentCapabilities {
     pub file_changes: bool,
     pub mcp_tools: bool,
     pub streaming_deltas: bool,
+    pub item_started: bool,
     /// Whether this agent uses a shared long-running server process (vs per-turn subprocess)
     pub shared_process: bool,
 }
@@ -3602,6 +3717,10 @@ fn agent_supports_resume(agent: AgentId) -> bool {
     matches!(agent, AgentId::Claude | AgentId::Amp | AgentId::Opencode | AgentId::Codex)
 }
 
+fn agent_supports_item_started(agent: AgentId) -> bool {
+    agent_capabilities_for(agent).item_started
+}
+
 fn agent_capabilities_for(agent: AgentId) -> AgentCapabilities {
     match agent {
         // Headless Claude CLI does not expose AskUserQuestion and does not emit tool_result,
@@ -3623,6 +3742,7 @@ fn agent_capabilities_for(agent: AgentId) -> AgentCapabilities {
             file_changes: false,
             mcp_tools: false,
             streaming_deltas: false,
+            item_started: false,
             shared_process: false, // per-turn subprocess with --resume
         },
         AgentId::Codex => AgentCapabilities {
@@ -3642,6 +3762,7 @@ fn agent_capabilities_for(agent: AgentId) -> AgentCapabilities {
             file_changes: true,
             mcp_tools: true,
             streaming_deltas: true,
+            item_started: true,
             shared_process: true, // shared app-server via JSON-RPC
         },
         AgentId::Opencode => AgentCapabilities {
@@ -3661,6 +3782,7 @@ fn agent_capabilities_for(agent: AgentId) -> AgentCapabilities {
             file_changes: false,
             mcp_tools: false,
             streaming_deltas: true,
+            item_started: true,
             shared_process: true, // shared HTTP server
         },
         AgentId::Amp => AgentCapabilities {
@@ -3680,6 +3802,7 @@ fn agent_capabilities_for(agent: AgentId) -> AgentCapabilities {
             file_changes: false,
             mcp_tools: false,
             streaming_deltas: false,
+            item_started: false,
             shared_process: false, // per-turn subprocess with --continue
         },
         AgentId::Mock => AgentCapabilities {
@@ -3699,6 +3822,7 @@ fn agent_capabilities_for(agent: AgentId) -> AgentCapabilities {
             file_changes: true,
             mcp_tools: true,
             streaming_deltas: true,
+            item_started: true,
             shared_process: false, // in-memory mock (no subprocess)
         },
     }

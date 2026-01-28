@@ -13,6 +13,7 @@ export type AgentCapabilitiesView = AgentCapabilities & {
   fileChanges?: boolean;
   mcpTools?: boolean;
   streamingDeltas?: boolean;
+  itemStarted?: boolean;
 };
 
 export const emptyCapabilities: AgentCapabilitiesView = {
@@ -32,5 +33,6 @@ export const emptyCapabilities: AgentCapabilitiesView = {
   fileChanges: false,
   mcpTools: false,
   streamingDeltas: false,
+  itemStarted: false,
   sharedProcess: false
 };

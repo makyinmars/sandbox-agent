@@ -59,6 +59,7 @@ export interface components {
       fileAttachments: boolean;
       fileChanges: boolean;
       images: boolean;
+      itemStarted: boolean;
       mcpTools: boolean;
       permissions: boolean;
       planMode: boolean;

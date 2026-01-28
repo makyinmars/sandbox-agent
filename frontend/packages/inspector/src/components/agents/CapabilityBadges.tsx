@@ -3,6 +3,7 @@ import {
   Activity,
   AlertTriangle,
   Brain,
+  CircleDot,
   Download,
   FileDiff,
   Gauge,
@@ -35,7 +36,8 @@ const badges = [
   { key: "commandExecution", label: "Commands", icon: Terminal },
   { key: "fileChanges", label: "File Changes", icon: FileDiff },
   { key: "mcpTools", label: "MCP", icon: Plug },
-  { key: "streamingDeltas", label: "Deltas", icon: Activity }
+  { key: "streamingDeltas", label: "Deltas", icon: Activity },
+  { key: "itemStarted", label: "Item Start", icon: CircleDot }
 ] as const;
 
 type BadgeItem = (typeof badges)[number];

@@ -853,6 +853,7 @@ export default function App() {
           agentsLoading={agentsLoading}
           agentsError={agentsError}
           messagesEndRef={messagesEndRef}
+          agentId={agentId}
           agentLabel={agentLabel}
           agentMode={agentMode}
           permissionMode={permissionMode}

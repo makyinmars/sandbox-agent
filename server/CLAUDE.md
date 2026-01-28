@@ -105,3 +105,10 @@ cargo test -p sandbox-agent --test http_endpoints
 ## Universal Schema
 
 When modifying agent conversion code in `server/packages/universal-agent-schema/src/agents/` or adding/changing properties on the universal schema, update the feature matrix in `README.md` to reflect which agents support which features.
+
+## Capabilities sync
+
+When updating agent capabilities (flags or values), keep them in sync across:
+- `README.md` (feature matrix / documented support)
+- server Rust implementation (`AgentCapabilities` + `agent_capabilities_for`)
+- frontend capability views/badges (Inspector UI)
