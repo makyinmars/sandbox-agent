@@ -25,10 +25,9 @@ export async function tagDocker(opts: ReleaseOpts) {
 		await $({ stdio: "inherit" })`docker manifest inspect ${IMAGE}:${sourceCommit}-arm64`;
 		console.log(`==> Both images exist`);
 	} catch (error) {
-		console.error(`==> Error inspecting images:`, error);
-		throw new Error(
-			`Images ${IMAGE}:${sourceCommit}-{amd64,arm64} do not exist on Docker Hub. Error: ${error}`,
-		);
+		console.warn(`⚠️ Docker images ${IMAGE}:${sourceCommit}-{amd64,arm64} not found - skipping Docker tagging`);
+		console.warn(`   To enable Docker tagging, build and push images first, then retry the release.`);
+		return;
 	}
 
 	// Create and push manifest with version
