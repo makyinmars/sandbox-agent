@@ -49,23 +49,27 @@ export function Navigation() {
           <div className="flex w-full items-center justify-between px-3">
             {/* Left side: Logo + Nav */}
             <div className="flex items-center gap-4">
-              <a href="/" className="flex items-center gap-3">
-                <img src="/rivet-icon.svg" alt="Rivet" className="size-8" />
+              <div className="flex items-center gap-3">
+                <a href="https://rivet.dev" className="flex items-center">
+                  <img src="/rivet-icon.svg" alt="Rivet" className="size-8" />
+                </a>
                 <span className="text-white/30">|</span>
-                <img src="/logos/sanboxagent.svg" alt="Sandbox Agent SDK" className="h-6 w-auto" />
-              </a>
+                <a href="/" className="flex items-center">
+                  <img src="/logos/sandboxagent.svg" alt="Sandbox Agent SDK" className="h-6 w-auto" />
+                </a>
+              </div>
 
               {/* Desktop Nav */}
               <div className="hidden md:flex items-center">
                 <NavItem href="/docs">Docs</NavItem>
-                <NavItem href="/changelog">Changelog</NavItem>
+                <NavItem href="https://github.com/rivet-dev/sandbox-agent/releases">Changelog</NavItem>
               </div>
             </div>
 
             {/* Right side */}
             <div className="hidden md:flex flex-row items-center">
               <a
-                href="https://discord.gg/sandbox-agent"
+                href="https://discord.gg/auCecybynK"
                 className="inline-flex items-center justify-center whitespace-nowrap rounded-md border border-white/10 px-4 py-2 h-10 text-sm mr-2 hover:border-white/20 text-white/90 hover:text-white transition-colors"
                 aria-label="Discord"
               >
@@ -107,7 +111,7 @@ export function Navigation() {
               Docs
             </a>
             <a
-              href="/changelog"
+              href="https://github.com/rivet-dev/sandbox-agent/releases"
               className="block py-2 px-3 text-white/80 hover:text-white hover:bg-white/5 rounded-lg transition-colors"
               onClick={() => setMobileMenuOpen(false)}
             >
@@ -115,7 +119,7 @@ export function Navigation() {
             </a>
             <div className="border-t border-white/10 pt-2 mt-2 space-y-2">
               <a
-                href="https://discord.gg/sandbox-agent"
+                href="https://discord.gg/auCecybynK"
                 className="flex items-center gap-2 py-2 px-3 text-white/80 hover:text-white hover:bg-white/5 rounded-lg transition-colors"
                 onClick={() => setMobileMenuOpen(false)}
                 aria-label="Discord"
