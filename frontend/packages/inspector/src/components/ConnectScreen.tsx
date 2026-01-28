@@ -1,4 +1,5 @@
-import { Zap } from "lucide-react";
+import { AlertTriangle, Zap } from "lucide-react";
+import { isHttpsToHttpConnection, isLocalNetworkTarget } from "../lib/permissions";
 
 const ConnectScreen = ({
   endpoint,
@@ -49,6 +50,18 @@ const ConnectScreen = ({
             <div className="connect-card-title">Connect to Server</div>
 
             {connectError && <div className="banner error">{connectError}</div>}
+
+            {isHttpsToHttpConnection(window.location.href, endpoint) &&
+              isLocalNetworkTarget(endpoint) && (
+                <div className="banner warning">
+                  <AlertTriangle size={16} />
+                  <span>
+                    Connecting from HTTPS to a local HTTP server requires{" "}
+                    <strong>local network access</strong> permission. Your browser may prompt you to
+                    allow this connection.
+                  </span>
+                </div>
+              )}
 
             <label className="field">
               <span className="label">Endpoint</span>

@@ -154,8 +154,14 @@ export default function App() {
       };
       let logged = false;
 
+      // Add targetAddressSpace for local network access from HTTPS
+      const fetchInit = {
+        ...init,
+        targetAddressSpace: "loopback"
+      };
+
       try {
-        const response = await fetch(input, init);
+        const response = await fetch(input, fetchInit);
         logRequest({ ...entry, status: response.status });
         logged = true;
         return response;
