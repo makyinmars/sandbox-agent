@@ -6,23 +6,19 @@ expression: value
   seq: 1
   session: started
   type: session.started
-- metadata: true
-  seq: 2
-  session: started
-  type: session.started
 - item:
     content_types:
       - text
     kind: message
     role: user
     status: in_progress
-  seq: 3
+  seq: 2
   type: item.started
 - delta:
     delta: "<redacted>"
     item_id: "<redacted>"
     native_item_id: "<redacted>"
-  seq: 4
+  seq: 3
   type: item.delta
 - item:
     content_types:
@@ -30,11 +26,11 @@ expression: value
     kind: message
     role: user
     status: completed
-  seq: 5
+  seq: 4
   type: item.completed
 - permission:
     action: command_execution
     id: "<redacted>"
     status: requested
-  seq: 6
+  seq: 5
   type: permission.requested

@@ -6,23 +6,19 @@ expression: normalized
   seq: 1
   session: started
   type: session.started
-- metadata: true
-  seq: 2
-  session: started
-  type: session.started
 - item:
     content_types:
       - text
     kind: message
     role: user
     status: in_progress
-  seq: 3
+  seq: 2
   type: item.started
 - delta:
     delta: "<redacted>"
     item_id: "<redacted>"
     native_item_id: "<redacted>"
-  seq: 4
+  seq: 3
   type: item.delta
 - item:
     content_types:
@@ -30,7 +26,7 @@ expression: normalized
     kind: message
     role: user
     status: completed
-  seq: 5
+  seq: 4
   type: item.completed
 - item:
     content_types:
@@ -38,13 +34,13 @@ expression: normalized
     kind: message
     role: assistant
     status: in_progress
-  seq: 6
+  seq: 5
   type: item.started
 - delta:
     delta: "<redacted>"
     item_id: "<redacted>"
     native_item_id: "<redacted>"
-  seq: 7
+  seq: 6
   type: item.delta
 - item:
     content_types:
@@ -52,5 +48,5 @@ expression: normalized
     kind: message
     role: assistant
     status: completed
-  seq: 8
+  seq: 7
   type: item.completed

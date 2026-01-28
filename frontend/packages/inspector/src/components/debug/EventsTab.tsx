@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { ChevronDown, ChevronRight, Copy, Check } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { UniversalEvent } from "sandbox-agent";
 import { formatJson, formatTime } from "../../utils/format";
@@ -20,6 +20,17 @@ const EventsTab = ({
   error: string | null;
 }) => {
   const [collapsedEvents, setCollapsedEvents] = useState<Record<string, boolean>>({});
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(events, null, 2));
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      console.error("Failed to copy events:", err);
+    }
+  };
 
   useEffect(() => {
     if (events.length === 0) {
@@ -34,6 +45,15 @@ const EventsTab = ({
         <div className="inline-row">
           <button className="button ghost small" onClick={onFetch} disabled={loading}>
             {loading ? "Loading..." : "Fetch"}
+          </button>
+          <button
+            className="button ghost small"
+            onClick={handleCopy}
+            disabled={events.length === 0}
+            title="Copy all events as JSON"
+          >
+            {copied ? <Check size={14} /> : <Copy size={14} />}
+            {copied ? "Copied" : "Copy"}
           </button>
           <button className="button ghost small" onClick={onClear}>
             Clear

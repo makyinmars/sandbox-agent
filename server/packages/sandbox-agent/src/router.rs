@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -46,6 +46,7 @@ use sandbox_agent_agent_management::credentials::{
 use crate::agent_server_logs::AgentServerLogs;
 
 const MOCK_EVENT_DELAY_MS: u64 = 200;
+static USER_MESSAGE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub struct AppState {
@@ -263,6 +264,7 @@ struct SessionState {
     broadcaster: broadcast::Sender<UniversalEvent>,
     opencode_stream_started: bool,
     codex_sender: Option<mpsc::UnboundedSender<String>>,
+    session_started_emitted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -315,6 +317,7 @@ impl SessionState {
             broadcaster,
             opencode_stream_started: false,
             codex_sender: None,
+            session_started_emitted: false,
         })
     }
 
@@ -394,6 +397,18 @@ impl SessionState {
     }
 
     fn push_event(&mut self, conversion: EventConversion) -> Option<UniversalEvent> {
+        if conversion.event_type == UniversalEventType::SessionStarted {
+            if self.session_started_emitted {
+                return None;
+            }
+            self.session_started_emitted = true;
+        }
+        if conversion.event_type == UniversalEventType::SessionEnded
+            && agent_supports_resume(self.agent)
+            && !conversion.synthetic
+        {
+            return None;
+        }
         if conversion.event_type == UniversalEventType::ItemStarted {
             if let UniversalEventData::Item(ref data) = conversion.data {
                 if self.item_started.contains(&data.item.item_id) {
@@ -1463,6 +1478,11 @@ impl SessionManager {
             self.send_mock_message(session_id, message).await?;
             return Ok(());
         }
+        if matches!(session_snapshot.agent, AgentId::Claude | AgentId::Amp) {
+            let _ = self
+                .record_conversions(&session_id, user_message_conversions(&message))
+                .await;
+        }
         if session_snapshot.agent == AgentId::Opencode {
             self.ensure_opencode_stream(session_id.clone()).await?;
             self.send_opencode_prompt(&session_snapshot, &message)
@@ -2067,15 +2087,17 @@ impl SessionManager {
         let status = tokio::task::spawn_blocking(move || child.wait()).await;
         match status {
             Ok(Ok(status)) if status.success() => {
-                let message = format!("agent exited with status {:?}", status);
-                self.mark_session_ended(
-                    &session_id,
-                    status.code(),
-                    &message,
-                    SessionEndReason::Completed,
-                    TerminatedBy::Agent,
-                )
-                .await;
+                if !agent_supports_resume(agent) {
+                    let message = format!("agent exited with status {:?}", status);
+                    self.mark_session_ended(
+                        &session_id,
+                        status.code(),
+                        &message,
+                        SessionEndReason::Completed,
+                        TerminatedBy::Agent,
+                    )
+                    .await;
+                }
             }
             Ok(Ok(status)) => {
                 let message = format!("agent exited with status {:?}", status);
@@ -5032,6 +5054,46 @@ fn mock_user_message(prefix: &str, text: &str) -> Vec<EventConversion> {
                 content,
             ),
         ),
+    ]
+}
+
+fn user_message_conversions(text: &str) -> Vec<EventConversion> {
+    let id = USER_MESSAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let native_item_id = format!("user_{id}");
+    let content = vec![ContentPart::Text {
+        text: text.to_string(),
+    }];
+    vec![
+        EventConversion::new(
+            UniversalEventType::ItemStarted,
+            UniversalEventData::Item(ItemEventData {
+                item: UniversalItem {
+                    item_id: String::new(),
+                    native_item_id: Some(native_item_id.clone()),
+                    parent_id: None,
+                    kind: ItemKind::Message,
+                    role: Some(ItemRole::User),
+                    content: content.clone(),
+                    status: ItemStatus::InProgress,
+                },
+            }),
+        )
+        .synthetic(),
+        EventConversion::new(
+            UniversalEventType::ItemCompleted,
+            UniversalEventData::Item(ItemEventData {
+                item: UniversalItem {
+                    item_id: String::new(),
+                    native_item_id: Some(native_item_id),
+                    parent_id: None,
+                    kind: ItemKind::Message,
+                    role: Some(ItemRole::User),
+                    content,
+                    status: ItemStatus::Completed,
+                },
+            }),
+        )
+        .synthetic(),
     ]
 }
 
