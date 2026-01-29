@@ -9,7 +9,7 @@
 
 - **Any coding agent**: Universal API to interact with all agents with full feature coverage
 - **Server or SDK mode**: Run as an HTTP server or with the TypeScript SDK
-- **Universal session schema**: [Universal schema](https://sandboxagent.dev/docs/universal-schema) to store agent transcripts
+- **Universal session schema**: [Session transcript schema](https://sandboxagent.dev/docs/session-transcript-schema) to store agent transcripts
 - **Supports your sandbox provider**: Daytona, E2B, Vercel Sandboxes, and more
 - **Lightweight, portable Rust binary**: Install anywhere with 1 curl command
 - **Automatic agent installation**: Agents are installed on-demand when first used
@@ -160,9 +160,9 @@ Debug sessions and events with the [Inspector UI](https://inspect.sandboxagent.d
 
 [Explore API](https://sandboxagent.dev/docs/api-reference) — [View Specification](https://github.com/rivet-dev/sandbox-agent/blob/main/docs/openapi.json)
 
-### Universal Schema
+### Session Transcript Schema
 
-All events follow a [universal schema](https://sandboxagent.dev/docs/universal-schema) that normalizes differences between agents.
+All events follow a [session transcript schema](https://sandboxagent.dev/docs/session-transcript-schema) that normalizes differences between agents.
 
 ### Tip: Extract credentials
 

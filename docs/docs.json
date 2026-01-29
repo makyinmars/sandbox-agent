@@ -62,8 +62,7 @@
 				"pages": [
 					"cli",
 					"inspector",
-					"universal-schema",
-					"agent-compatibility",
+					"session-transcript-schema",
 					"cors",
 					{
 						"group": "AI",

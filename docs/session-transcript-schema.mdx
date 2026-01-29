@@ -1,12 +1,84 @@
 ---
-title: "Universal Schema"
-description: "Reference for the universal event and item schema."
+title: "Session Transcript Schema"
+description: "Universal event schema for session transcripts across all agents."
 icon: "brackets-curly"
 ---
 
-The universal schema normalizes events from all supported agents (Claude Code, Codex, OpenCode, Amp) into a consistent format. This lets you build UIs and persistence layers that work with any agent without special-casing.
+Each coding agent outputs events in its own native format. The sandbox-agent converts these into a universal event schema, giving you a consistent session transcript regardless of which agent you use.
 
 The schema is defined in [OpenAPI format](https://github.com/rivet-dev/sandbox-agent/blob/main/docs/openapi.json). See the [HTTP API Reference](/api-reference) for endpoint documentation.
+
+## Coverage Matrix
+
+This table shows which agent capabilities appear in the universal event stream. All agents retain their full native capabilities—this only reflects what's normalized into the schema.
+
+| Feature            | Claude | Codex | OpenCode     | Amp          |
+|--------------------|:------:|:-----:|:------------:|:------------:|
+| Stability          | Stable | Stable| Experimental | Experimental |
+| Text Messages      |   ✓    |   ✓   |      ✓       |      ✓       |
+| Tool Calls         |   ✓    |   ✓   |      ✓       |      ✓       |
+| Tool Results       |   ✓    |   ✓   |      ✓       |      ✓       |
+| Questions (HITL)   |   ✓    |       |      ✓       |              |
+| Permissions (HITL) |   ✓    |   ✓   |      ✓       |      -       |
+| Images             |   -    |   ✓   |      ✓       |      -       |
+| File Attachments   |   -    |   ✓   |      ✓       |      -       |
+| Session Lifecycle  |   -    |   ✓   |      ✓       |      -       |
+| Error Events       |   -    |   ✓   |      ✓       |      ✓       |
+| Reasoning/Thinking |   -    |   ✓   |      -       |      -       |
+| Command Execution  |   -    |   ✓   |      -       |      -       |
+| File Changes       |   -    |   ✓   |      -       |      -       |
+| MCP Tools          |   -    |   ✓   |      -       |      -       |
+| Streaming Deltas   |   ✓    |   ✓   |      ✓       |      -       |
+
+Agents: [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) · [Codex](https://github.com/openai/codex) · [OpenCode](https://github.com/opencode-ai/opencode) · [Amp](https://ampcode.com)
+
+- ✓ = Appears in session events
+- \- = Agent supports natively, schema conversion coming soon
+- (blank) = Not supported by agent
+
+<AccordionGroup>
+  <Accordion title="Text Messages">
+    Basic message exchange between user and assistant.
+  </Accordion>
+  <Accordion title="Tool Calls & Results">
+    Visibility into tool invocations (file reads, command execution, etc.) and their results. When not natively supported, tool activity is embedded in message content.
+  </Accordion>
+  <Accordion title="Questions (HITL)">
+    Interactive questions the agent asks the user. Emits `question.requested` and `question.resolved` events.
+  </Accordion>
+  <Accordion title="Permissions (HITL)">
+    Permission requests for sensitive operations. Emits `permission.requested` and `permission.resolved` events.
+  </Accordion>
+  <Accordion title="Images">
+    Support for image attachments in messages.
+  </Accordion>
+  <Accordion title="File Attachments">
+    Support for file attachments in messages.
+  </Accordion>
+  <Accordion title="Session Lifecycle">
+    Native `session.started` and `session.ended` events. When not supported, the daemon emits synthetic lifecycle events.
+  </Accordion>
+  <Accordion title="Error Events">
+    Structured error events for runtime failures.
+  </Accordion>
+  <Accordion title="Reasoning/Thinking">
+    Extended thinking or reasoning content with visibility controls.
+  </Accordion>
+  <Accordion title="Command Execution">
+    Detailed command execution events with stdout/stderr.
+  </Accordion>
+  <Accordion title="File Changes">
+    Structured file modification events with diffs.
+  </Accordion>
+  <Accordion title="MCP Tools">
+    Model Context Protocol tool support.
+  </Accordion>
+  <Accordion title="Streaming Deltas">
+    Native streaming of content deltas. When not supported, the daemon emits a single synthetic delta before `item.completed`.
+  </Accordion>
+</AccordionGroup>
+
+Want support for another agent? [Open an issue](https://github.com/rivet-dev/sandbox-agent/issues/new) to request it.
 
 ## UniversalEvent
 
