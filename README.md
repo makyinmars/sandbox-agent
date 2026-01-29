@@ -19,14 +19,14 @@
 
 ## Agent Compatibility
 
-| Feature | [Claude Code*](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) | [Codex](https://github.com/openai/codex) | [OpenCode](https://github.com/opencode-ai/opencode) | [Amp](https://ampcode.com) |
+| Feature | [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) | [Codex](https://github.com/openai/codex) | [OpenCode](https://github.com/opencode-ai/opencode) | [Amp](https://ampcode.com) |
 |---------|:-----------:|:-----:|:--------:|:---:|
 | Stability | Stable | Stable | Experimental | Experimental |
 | Text Messages | ✓ | ✓ | ✓ | ✓ |
-| Tool Calls | —* | ✓ | ✓ | ✓ |
-| Tool Results | —* | ✓ | ✓ | ✓ |
-| Questions (HITL) | —* | | ✓ | |
-| Permissions (HITL) | —* | | ✓ | |
+| Tool Calls | ✓ | ✓ | ✓ | ✓ |
+| Tool Results | ✓ | ✓ | ✓ | ✓ |
+| Questions (HITL) | ✓ | | ✓ | |
+| Permissions (HITL) | ✓ | | ✓ | |
 | Images | | ✓ | ✓ | |
 | File Attachments | | ✓ | ✓ | |
 | Session Lifecycle | | ✓ | ✓ | |
@@ -35,11 +35,9 @@
 | Command Execution | | ✓ | | |
 | File Changes | | ✓ | | |
 | MCP Tools | | ✓ | | |
-| Streaming Deltas | | ✓ | ✓ | |
+| Streaming Deltas | ✓ | ✓ | ✓ | |
 
-\* Coming imminently
-
-Want support for another agent? [Open an issue](https://github.com/anthropics/sandbox-agent/issues/new) to request it.
+Want support for another agent? [Open an issue](https://github.com/rivet-dev/sandbox-agent/issues/new) to request it.
 
 ## Architecture
 
