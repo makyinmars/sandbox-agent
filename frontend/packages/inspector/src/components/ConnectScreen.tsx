@@ -1,6 +1,8 @@
 import { AlertTriangle, Zap } from "lucide-react";
 import { isHttpsToHttpConnection, isLocalNetworkTarget } from "../lib/permissions";
 
+const logoUrl = `${import.meta.env.BASE_URL}logos/sandboxagent.svg`;
+
 const ConnectScreen = ({
   endpoint,
   token,
@@ -24,7 +26,7 @@ const ConnectScreen = ({
     <div className="app">
       <header className="header">
         <div className="header-left">
-          <img src="/logos/sandboxagent.svg" alt="Sandbox Agent" className="logo-text" style={{ height: '20px', width: 'auto' }} />
+          <img src={logoUrl} alt="Sandbox Agent" className="logo-text" style={{ height: '20px', width: 'auto' }} />
         </div>
         {reportUrl && (
           <div className="header-right">
@@ -38,7 +40,7 @@ const ConnectScreen = ({
       <main className="landing">
         <div className="landing-container">
           <div className="landing-hero">
-            <img src="/logos/sandboxagent.svg" alt="Sandbox Agent" style={{ height: '32px', width: 'auto', marginBottom: '20px' }} />
+            <img src={logoUrl} alt="Sandbox Agent" style={{ height: '32px', width: 'auto', marginBottom: '20px' }} />
           </div>
 
           <div className="connect-card">

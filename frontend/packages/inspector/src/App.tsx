@@ -18,6 +18,7 @@ import SessionSidebar from "./components/SessionSidebar";
 import type { RequestLog } from "./types/requestLog";
 import { buildCurl } from "./utils/http";
 
+const logoUrl = `${import.meta.env.BASE_URL}logos/sandboxagent.svg`;
 const defaultAgents = ["claude", "codex", "opencode", "amp", "mock"];
 
 type ItemEventData = {
@@ -887,7 +888,7 @@ export default function App() {
     <div className="app">
       <header className="header">
         <div className="header-left">
-          <img src="/logos/sandboxagent.svg" alt="Sandbox Agent" className="logo-text" style={{ height: '20px', width: 'auto' }} />
+          <img src={logoUrl} alt="Sandbox Agent" className="logo-text" style={{ height: '20px', width: 'auto' }} />
         </div>
         <div className="header-right">
           <a className="button ghost small" href={issueTrackerUrl} target="_blank" rel="noreferrer">
