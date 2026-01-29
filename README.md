@@ -27,22 +27,22 @@ Which agent features are normalized into the universal event schema. All agents 
 | Text Messages      |   ✓    |   ✓   |      ✓       |      ✓       |
 | Tool Calls         |   ✓    |   ✓   |      ✓       |      ✓       |
 | Tool Results       |   ✓    |   ✓   |      ✓       |      ✓       |
-| Questions (HITL)   |   ✓    |   ○   |      ✓       |      ○       |
-| Permissions (HITL) |   ✓    |   ○   |      ✓       |      ○       |
-| Images             |   ○    |   ✓   |      ✓       |      ○       |
-| File Attachments   |   ○    |   ✓   |      ✓       |      ○       |
-| Session Lifecycle  |   ○    |   ✓   |      ✓       |      ○       |
-| Error Events       |   ○    |   ✓   |      ✓       |      ✓       |
-| Reasoning/Thinking |   ○    |   ✓   |              |              |
-| Command Execution  |   ○    |   ✓   |              |              |
-| File Changes       |   ○    |   ✓   |              |              |
-| MCP Tools          |   ○    |   ✓   |              |              |
-| Streaming Deltas   |   ✓    |   ✓   |      ✓       |      ○       |
+| Questions (HITL)   |   ✓    |       |      ✓       |              |
+| Permissions (HITL) |   ✓    |   ✓   |      ✓       |      -       |
+| Images             |   -    |   ✓   |      ✓       |      -       |
+| File Attachments   |   -    |   ✓   |      ✓       |      -       |
+| Session Lifecycle  |   -    |   ✓   |      ✓       |      -       |
+| Error Events       |   -    |   ✓   |      ✓       |      ✓       |
+| Reasoning/Thinking |   -    |   ✓   |              |              |
+| Command Execution  |   -    |   ✓   |              |              |
+| File Changes       |   -    |   ✓   |              |              |
+| MCP Tools          |   -    |   ✓   |              |              |
+| Streaming Deltas   |   ✓    |   ✓   |      ✓       |      -       |
 
 Agents: [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) · [Codex](https://github.com/openai/codex) · [OpenCode](https://github.com/opencode-ai/opencode) · [Amp](https://ampcode.com)
 
 - ✓ = Supported in universal schema
-- ○ = Supported by agent, schema support in progress
+- \- = Schema support in progress
 
 Want support for another agent? [Open an issue](https://github.com/rivet-dev/sandbox-agent/issues/new) to request it.
 
