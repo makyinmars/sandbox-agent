@@ -96,7 +96,7 @@ pub fn build_router_with_state(shared: Arc<AppState>) -> (Router, Arc<AppState>)
         .route("/agents/:agent/install", post(install_agent))
         .route("/agents/:agent/modes", get(get_agent_modes))
         .route("/sessions", get(list_sessions))
-        .route("/sessions/:session_id", post(create_session))
+        .route("/sessions/:session_id", post(create_session).patch(update_session))
         .route("/sessions/:session_id/messages", post(post_message))
         .route(
             "/sessions/:session_id/messages/stream",
@@ -151,6 +151,7 @@ pub async fn shutdown_servers(state: &Arc<AppState>) {
         list_agents,
         list_sessions,
         create_session,
+        update_session,
         post_message,
         post_message_stream,
         terminate_session,
@@ -174,6 +175,7 @@ pub async fn shutdown_servers(state: &Arc<AppState>) {
             SessionListResponse,
             HealthResponse,
             CreateSessionRequest,
+            UpdateSessionRequest,
             CreateSessionResponse,
             MessageRequest,
             EventsQuery,
@@ -1586,6 +1588,36 @@ impl SessionManager {
         })
     }
 
+    async fn update_session(
+        &self,
+        session_id: &str,
+        request: UpdateSessionRequest,
+    ) -> Result<SessionInfo, SandboxError> {
+        if request.model.is_none() && request.variant.is_none() {
+            return Err(SandboxError::InvalidRequest {
+                message: "update requires model or variant".to_string(),
+            });
+        }
+        let mut sessions = self.sessions.lock().await;
+        let session = Self::session_mut(&mut sessions, session_id).ok_or_else(|| {
+            SandboxError::SessionNotFound {
+                session_id: session_id.to_string(),
+            }
+        })?;
+
+        if let Some(model) = request.model {
+            session.model = Some(model);
+            if matches!(session.agent, AgentId::Claude | AgentId::Amp) {
+                session.native_session_id = None;
+            }
+        }
+        if let Some(variant) = request.variant {
+            session.variant = Some(variant);
+        }
+
+        Ok(Self::session_info(session))
+    }
+
     async fn agent_modes(&self, agent: AgentId) -> Result<Vec<AgentModeInfo>, SandboxError> {
         if agent != AgentId::Opencode {
             return Ok(agent_modes_for(agent));
@@ -1800,22 +1832,26 @@ impl SessionManager {
         Ok(EventsResponse { events, has_more })
     }
 
+    fn session_info(state: &SessionState) -> SessionInfo {
+        SessionInfo {
+            session_id: state.session_id.clone(),
+            agent: state.agent.as_str().to_string(),
+            agent_mode: state.agent_mode.clone(),
+            permission_mode: state.permission_mode.clone(),
+            model: state.model.clone(),
+            variant: state.variant.clone(),
+            native_session_id: state.native_session_id.clone(),
+            ended: state.ended,
+            event_count: state.events.len() as u64,
+        }
+    }
+
     async fn list_sessions(&self) -> Vec<SessionInfo> {
         let sessions = self.sessions.lock().await;
         sessions
             .iter()
             .rev()
-            .map(|state| SessionInfo {
-                session_id: state.session_id.clone(),
-                agent: state.agent.as_str().to_string(),
-                agent_mode: state.agent_mode.clone(),
-                permission_mode: state.permission_mode.clone(),
-                model: state.model.clone(),
-                variant: state.variant.clone(),
-                native_session_id: state.native_session_id.clone(),
-                ended: state.ended,
-                event_count: state.events.len() as u64,
-            })
+            .map(Self::session_info)
             .collect()
     }
 
@@ -3438,6 +3474,15 @@ pub struct CreateSessionRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct UpdateSessionRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateSessionResponse {
     pub healthy: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3698,6 +3743,30 @@ async fn create_session(
     let response = state
         .session_manager
         .create_session(session_id, request)
+        .await?;
+    Ok(Json(response))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/v1/sessions/{session_id}",
+    request_body = UpdateSessionRequest,
+    responses(
+        (status = 200, body = SessionInfo),
+        (status = 400, body = ProblemDetails),
+        (status = 404, body = ProblemDetails)
+    ),
+    params(("session_id" = String, Path, description = "Session id")),
+    tag = "sessions"
+)]
+async fn update_session(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Json(request): Json<UpdateSessionRequest>,
+) -> Result<Json<SessionInfo>, ApiError> {
+    let response = state
+        .session_manager
+        .update_session(&session_id, request)
         .await?;
     Ok(Json(response))
 }

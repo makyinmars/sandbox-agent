@@ -394,6 +394,46 @@ export default function App() {
     }
   };
 
+  const updateSessionSettings = useCallback(async () => {
+    if (!sessionId) return;
+    const selectedSession = sessions.find((session) => session.sessionId === sessionId);
+    if (!selectedSession) return;
+
+    const currentModel = selectedSession.model ?? "";
+    const currentVariant = selectedSession.variant ?? "";
+    const body: { model?: string; variant?: string } = {};
+
+    if (!model) {
+      if (currentModel) setModel(currentModel);
+    } else if (model !== currentModel) {
+      body.model = model;
+    }
+
+    if (!variant) {
+      if (currentVariant) setVariant(currentVariant);
+    } else if (variant !== currentVariant) {
+      body.variant = variant;
+    }
+
+    if (Object.keys(body).length === 0) return;
+
+    try {
+      const updated = await getClient().updateSession(sessionId, body);
+      setSessions((prev) =>
+        prev.map((session) =>
+          session.sessionId === updated.sessionId ? { ...session, ...updated } : session
+        )
+      );
+      if (updated.sessionId === sessionId) {
+        setModel(updated.model ?? "");
+        setVariant(updated.variant ?? "");
+      }
+      setSessionError(null);
+    } catch (error) {
+      setSessionError(getErrorMessage(error, "Unable to update session"));
+    }
+  }, [getClient, getErrorMessage, model, sessionId, sessions, variant]);
+
   const appendEvents = useCallback((incoming: UniversalEvent[]) => {
     if (!incoming.length) return;
     setEvents((prev) => [...prev, ...incoming]);
@@ -945,6 +985,7 @@ export default function App() {
           onPermissionModeChange={setPermissionMode}
           onModelChange={setModel}
           onVariantChange={setVariant}
+          onSessionUpdate={updateSessionSettings}
           onStreamModeChange={setStreamMode}
           onToggleStream={toggleStream}
           onEndSession={endSession}

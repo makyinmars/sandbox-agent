@@ -55,6 +55,7 @@ Universal schema guidance:
 - `sandbox-agent api agents modes` ↔ `GET /v1/agents/{agent}/modes`
 - `sandbox-agent api sessions list` ↔ `GET /v1/sessions`
 - `sandbox-agent api sessions create` ↔ `POST /v1/sessions/{sessionId}`
+- `sandbox-agent api sessions update` ↔ `PATCH /v1/sessions/{sessionId}`
 - `sandbox-agent api sessions send-message` ↔ `POST /v1/sessions/{sessionId}/messages`
 - `sandbox-agent api sessions send-message-stream` ↔ `POST /v1/sessions/{sessionId}/messages/stream`
 - `sandbox-agent api sessions terminate` ↔ `POST /v1/sessions/{sessionId}/terminate`

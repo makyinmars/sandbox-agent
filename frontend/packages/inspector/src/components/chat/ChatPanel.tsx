@@ -38,6 +38,7 @@ const ChatPanel = ({
   onPermissionModeChange,
   onModelChange,
   onVariantChange,
+  onSessionUpdate,
   onStreamModeChange,
   onToggleStream,
   onEndSession,
@@ -80,6 +81,7 @@ const ChatPanel = ({
   onPermissionModeChange: (value: string) => void;
   onModelChange: (value: string) => void;
   onVariantChange: (value: string) => void;
+  onSessionUpdate: () => void;
   onStreamModeChange: (value: "poll" | "sse" | "turn") => void;
   onToggleStream: () => void;
   onEndSession: () => void;
@@ -284,6 +286,7 @@ const ChatPanel = ({
         onPermissionModeChange={onPermissionModeChange}
         onModelChange={onModelChange}
         onVariantChange={onVariantChange}
+        onSessionUpdate={onSessionUpdate}
         hasSession={hasSession}
       />
     </div>

@@ -12,8 +12,10 @@ import type {
   PermissionReplyRequest,
   ProblemDetails,
   QuestionReplyRequest,
+  SessionInfo,
   SessionListResponse,
   TurnStreamQuery,
+  UpdateSessionRequest,
   UniversalEvent,
 } from "./types.ts";
 
@@ -115,6 +117,12 @@ export class SandboxAgent {
 
   async createSession(sessionId: string, request: CreateSessionRequest): Promise<CreateSessionResponse> {
     return this.requestJson("POST", `${API_PREFIX}/sessions/${encodeURIComponent(sessionId)}`, {
+      body: request,
+    });
+  }
+
+  async updateSession(sessionId: string, request: UpdateSessionRequest): Promise<SessionInfo> {
+    return this.requestJson("PATCH", `${API_PREFIX}/sessions/${encodeURIComponent(sessionId)}`, {
       body: request,
     });
   }

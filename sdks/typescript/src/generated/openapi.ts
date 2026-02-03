@@ -22,6 +22,7 @@ export interface paths {
   };
   "/v1/sessions/{session_id}": {
     post: operations["create_session"];
+    patch: operations["update_session"];
   };
   "/v1/sessions/{session_id}/events": {
     get: operations["get_events"];
@@ -326,6 +327,10 @@ export interface components {
       role?: components["schemas"]["ItemRole"] | null;
       status: components["schemas"]["ItemStatus"];
     };
+    UpdateSessionRequest: {
+      model?: string | null;
+      variant?: string | null;
+    };
   };
   responses: never;
   parameters: never;
@@ -445,6 +450,36 @@ export interface operations {
         };
       };
       409: {
+        content: {
+          "application/json": components["schemas"]["ProblemDetails"];
+        };
+      };
+    };
+  };
+  update_session: {
+    parameters: {
+      path: {
+        /** @description Session id */
+        session_id: string;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["UpdateSessionRequest"];
+      };
+    };
+    responses: {
+      200: {
+        content: {
+          "application/json": components["schemas"]["SessionInfo"];
+        };
+      };
+      400: {
+        content: {
+          "application/json": components["schemas"]["ProblemDetails"];
+        };
+      };
+      404: {
         content: {
           "application/json": components["schemas"]["ProblemDetails"];
         };

@@ -4,3 +4,4 @@ mod questions;
 mod reasoning;
 mod session_lifecycle;
 mod status;
+mod update_session;

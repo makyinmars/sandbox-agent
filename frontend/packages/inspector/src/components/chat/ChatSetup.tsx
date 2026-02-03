@@ -12,7 +12,8 @@ const ChatSetup = ({
   onAgentModeChange,
   onPermissionModeChange,
   onModelChange,
-  onVariantChange
+  onVariantChange,
+  onSessionUpdate
 }: {
   agentMode: string;
   permissionMode: string;
@@ -26,6 +27,7 @@ const ChatSetup = ({
   onPermissionModeChange: (value: string) => void;
   onModelChange: (value: string) => void;
   onVariantChange: (value: string) => void;
+  onSessionUpdate: () => void;
 }) => {
   return (
     <div className="setup-row">
@@ -75,6 +77,7 @@ const ChatSetup = ({
           className="setup-input"
           value={model}
           onChange={(e) => onModelChange(e.target.value)}
+          onBlur={onSessionUpdate}
           placeholder="Model"
           title="Model"
           disabled={!hasSession}
@@ -87,6 +90,7 @@ const ChatSetup = ({
           className="setup-input"
           value={variant}
           onChange={(e) => onVariantChange(e.target.value)}
+          onBlur={onSessionUpdate}
           placeholder="Variant"
           title="Variant"
           disabled={!hasSession}

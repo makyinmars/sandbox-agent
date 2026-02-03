@@ -170,6 +170,22 @@ sandbox-agent api sessions create my-session \
   --permission-mode default
 ```
 
+#### Update Session
+
+```bash
+sandbox-agent api sessions update <SESSION_ID> [OPTIONS]
+```
+
+| Option | Description |
+|--------|-------------|
+| `-m, --model <MODEL>` | Model override |
+| `-v, --variant <VARIANT>` | Model variant |
+
+```bash
+sandbox-agent api sessions update my-session \
+  --model claude-3-5-sonnet-20240620
+```
+
 #### Send Message
 
 ```bash
@@ -300,6 +316,7 @@ sandbox-agent api sessions reply-permission my-session perm1 --reply once
 | `api agents modes` | `GET /v1/agents/{agent}/modes` |
 | `api sessions list` | `GET /v1/sessions` |
 | `api sessions create` | `POST /v1/sessions/{sessionId}` |
+| `api sessions update` | `PATCH /v1/sessions/{sessionId}` |
 | `api sessions send-message` | `POST /v1/sessions/{sessionId}/messages` |
 | `api sessions send-message-stream` | `POST /v1/sessions/{sessionId}/messages/stream` |
 | `api sessions terminate` | `POST /v1/sessions/{sessionId}/terminate` |

@@ -44,6 +44,7 @@ export type {
   SessionStartedData,
   TerminatedBy,
   TurnStreamQuery,
+  UpdateSessionRequest,
   UniversalEvent,
   UniversalEventData,
   UniversalEventType,

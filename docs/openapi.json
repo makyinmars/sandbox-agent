@@ -242,6 +242,65 @@
             }
           }
         }
+      },
+      "patch": {
+        "tags": [
+          "sessions"
+        ],
+        "operationId": "update_session",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/v1/sessions/{session_id}/events": {
@@ -1734,6 +1793,19 @@
           },
           "status": {
             "$ref": "#/components/schemas/ItemStatus"
+          }
+        }
+      },
+      "UpdateSessionRequest": {
+        "type": "object",
+        "properties": {
+          "model": {
+            "type": "string",
+            "nullable": true
+          },
+          "variant": {
+            "type": "string",
+            "nullable": true
           }
         }
       }

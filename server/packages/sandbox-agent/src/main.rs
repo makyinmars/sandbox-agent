@@ -14,11 +14,11 @@ use reqwest::Method;
 use sandbox_agent::router::{build_router_with_state, shutdown_servers};
 use sandbox_agent::router::{
     AgentInstallRequest, AppState, AuthConfig, CreateSessionRequest, MessageRequest,
-    PermissionReply, PermissionReplyRequest, QuestionReplyRequest,
+    PermissionReply, PermissionReplyRequest, QuestionReplyRequest, UpdateSessionRequest,
 };
 use sandbox_agent::router::{
     AgentListResponse, AgentModesResponse, CreateSessionResponse, EventsResponse,
-    SessionListResponse,
+    SessionInfo, SessionListResponse,
 };
 use sandbox_agent::telemetry;
 use sandbox_agent::ui;
@@ -145,6 +145,9 @@ enum SessionsCommand {
     List(ClientArgs),
     /// Create a new session for an agent.
     Create(CreateSessionArgs),
+    /// Update session model or variant.
+    #[command(name = "update")]
+    Update(UpdateSessionArgs),
     #[command(name = "send-message")]
     /// Send a message to an existing session.
     SendMessage(SessionMessageArgs),
@@ -218,6 +221,17 @@ struct CreateSessionArgs {
     variant: Option<String>,
     #[arg(long, short = 'A')]
     agent_version: Option<String>,
+    #[command(flatten)]
+    client: ClientArgs,
+}
+
+#[derive(Args, Debug)]
+struct UpdateSessionArgs {
+    session_id: String,
+    #[arg(long, short = 'm')]
+    model: Option<String>,
+    #[arg(long, short = 'v')]
+    variant: Option<String>,
     #[command(flatten)]
     client: ClientArgs,
 }
@@ -497,6 +511,16 @@ fn run_sessions(command: &SessionsCommand, cli: &Cli) -> Result<(), CliError> {
             let path = format!("{API_PREFIX}/sessions/{}", args.session_id);
             let response = ctx.post(&path, &body)?;
             print_json_response::<CreateSessionResponse>(response)
+        }
+        SessionsCommand::Update(args) => {
+            let ctx = ClientContext::new(cli, &args.client)?;
+            let body = UpdateSessionRequest {
+                model: args.model.clone(),
+                variant: args.variant.clone(),
+            };
+            let path = format!("{API_PREFIX}/sessions/{}", args.session_id);
+            let response = ctx.patch(&path, &body)?;
+            print_json_response::<SessionInfo>(response)
         }
         SessionsCommand::SendMessage(args) => {
             let ctx = ClientContext::new(cli, &args.client)?;
@@ -964,6 +988,14 @@ impl ClientContext {
         body: &T,
     ) -> Result<reqwest::blocking::Response, CliError> {
         Ok(self.request(Method::POST, path).json(body).send()?)
+    }
+
+    fn patch<T: Serialize>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> Result<reqwest::blocking::Response, CliError> {
+        Ok(self.request(Method::PATCH, path).json(body).send()?)
     }
 
     fn post_with_query<T: Serialize>(

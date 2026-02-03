@@ -142,6 +142,31 @@ describe("SandboxAgent", () => {
     });
   });
 
+  describe("updateSession", () => {
+    it("patches session settings", async () => {
+      const response = { sessionId: "test-session", model: "gpt-4o", variant: "fast" };
+      const mockFetch = createMockFetch(response);
+      const client = await SandboxAgent.connect({
+        baseUrl: "http://localhost:8080",
+        fetch: mockFetch,
+      });
+
+      const result = await client.updateSession("test-session", {
+        model: "gpt-4o",
+        variant: "fast",
+      });
+
+      expect(result).toEqual(response);
+      expect(mockFetch).toHaveBeenCalledWith(
+        "http://localhost:8080/v1/sessions/test-session",
+        expect.objectContaining({
+          method: "PATCH",
+          body: JSON.stringify({ model: "gpt-4o", variant: "fast" }),
+        })
+      );
+    });
+  });
+
   describe("postMessage", () => {
     it("sends message to session", async () => {
       const mockFetch = vi.fn().mockResolvedValue(
