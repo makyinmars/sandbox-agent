@@ -41,7 +41,7 @@
 		"pages": [
 			{
 				"group": "Getting started",
-				"pages": ["quickstart", "building-chat-ui", "manage-sessions"]
+				"pages": ["quickstart", "building-chat-ui", "manage-sessions", "opencode-compatibility"]
 			},
 			{
 				"group": "Deploy",
@@ -61,11 +61,11 @@
 			},
 			{
 				"group": "Reference",
-				"pages": [
-					"cli",
-					"inspector",
-					"session-transcript-schema",
-					"cors",
+					"pages": [
+						"cli",
+						"inspector",
+						"session-transcript-schema",
+						"cors",
 					{
 						"group": "AI",
 						"pages": ["ai/skill", "ai/llms-txt"]
