@@ -40,7 +40,6 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     ca-certificates \
     g++ \
-    g++-multilib \
     git \
     curl && \
     rm -rf /var/lib/apt/lists/* && \
