@@ -8,23 +8,27 @@ icon: "rectangle-terminal"
   **Experimental**: OpenCode SDK & UI support is experimental and may change without notice.
 </Warning>
 
-Sandbox Agent exposes an OpenCode-compatible API at `/opencode`, allowing you to connect any OpenCode client, SDK, or web UI to control coding agents running inside sandboxes.
+Sandbox Agent exposes an OpenCode-compatible API, allowing you to connect any OpenCode client, SDK, or web UI to control coding agents running inside sandboxes.
 
 ## Why Use OpenCode Clients with Sandbox Agent?
 
 OpenCode provides a rich ecosystem of clients:
-- **OpenCode CLI** (`opencode attach`) - Terminal-based interface
-- **OpenCode SDK** (`@opencode-ai/sdk`) - Programmatic TypeScript access
-- **OpenCode Web UI** - Browser-based chat interface
 
-By connecting these to Sandbox Agent, you get:
-- Control over multiple coding agents (Claude Code, Codex, OpenCode, Amp) through familiar OpenCode tooling
-- Remote sandbox execution with local UI experience
-- Full streaming, permissions, and human-in-the-loop support
+- **OpenCode CLI** (`opencode attach`): Terminal-based interface
+- **OpenCode Web UI**: Browser-based chat interface
+- **OpenCode SDK** (`@opencode-ai/sdk`): Rich TypeScript SDK
 
 ## Quick Start
 
-### Using OpenCode CLI
+### Using OpenCode CLI & TUI
+
+Sandbox Agent provides an all-in-one command to setup Sandbox Agent and connect an OpenCode session, great for local development:
+
+```bash
+sandbox-agent opencode --port 2468 --no-token
+```
+
+Or, start the server and attach separately:
 
 ```bash
 # Start sandbox-agent
@@ -34,7 +38,7 @@ sandbox-agent server --no-token --host 127.0.0.1 --port 2468
 opencode attach http://localhost:2468/opencode
 ```
 
-With authentication:
+With authentication enabled:
 
 ```bash
 # Start with token
@@ -44,13 +48,35 @@ sandbox-agent server --token "$SANDBOX_TOKEN" --host 127.0.0.1 --port 2468
 opencode attach http://localhost:2468/opencode --password "$SANDBOX_TOKEN"
 ```
 
-### Using the All-in-One Command
+### Using the OpenCode Web UI
 
-Sandbox Agent can start the server and attach OpenCode automatically:
+The OpenCode web UI can connect to Sandbox Agent for a full browser-based experience.
 
-```bash
-sandbox-agent opencode --port 2468 --no-token
-```
+<Steps>
+  <Step title="Start Sandbox Agent with CORS">
+    ```bash
+    sandbox-agent server --no-token --host 127.0.0.1 --port 2468 --cors-allow-origin http://127.0.0.1:5173
+    ```
+  </Step>
+  <Step title="Clone and Start the OpenCode Web App">
+    ```bash
+    git clone https://github.com/opencode-ai/opencode
+    cd opencode/packages/app
+    export VITE_OPENCODE_SERVER_HOST=127.0.0.1
+    export VITE_OPENCODE_SERVER_PORT=2468
+    bun run dev -- --host 127.0.0.1 --port 5173
+    ```
+  </Step>
+  <Step title="Open the UI">
+    Navigate to `http://127.0.0.1:5173/` in your browser.
+  </Step>
+</Steps>
+
+<Note>
+  If you see `Error: Could not connect to server`, check that:
+  - The sandbox-agent server is running
+  - `--cors-allow-origin` matches the **exact** browser origin (`localhost` and `127.0.0.1` are different origins)
+</Note>
 
 ### Using OpenCode SDK
 
@@ -80,44 +106,9 @@ for await (const event of events.stream) {
 }
 ```
 
-## Running the OpenCode Web UI
-
-The OpenCode web UI can connect to Sandbox Agent for a full browser-based experience.
-
-### 1. Start Sandbox Agent with CORS
-
-```bash
-sandbox-agent server --no-token --host 127.0.0.1 --port 2468 \
-  --cors-allow-origin http://127.0.0.1:5173
-```
-
-### 2. Start the OpenCode Web App
-
-Clone and run the OpenCode web app:
-
-```bash
-cd /path/to/opencode/packages/app
-VITE_OPENCODE_SERVER_HOST=127.0.0.1 VITE_OPENCODE_SERVER_PORT=2468 \
-  bun run dev -- --host 127.0.0.1 --port 5173
-```
-
-### 3. Open the UI
-
-Navigate to `http://127.0.0.1:5173/` in your browser.
-
-## API Routing
-
-The OpenCode API is exposed at two locations:
-
-| Path | Description |
-|------|-------------|
-| `/opencode/*` | Nested under `/opencode` prefix |
-| `/*` | Also available at root level |
-
-The root-level routing exists because the OpenCode SDK uses absolute paths internally. Both work identically.
-
 ## Notes
 
+- **API Routing**: The OpenCode API is available at the `/opencode` base path
 - **Authentication**: If sandbox-agent is started with `--token`, include `Authorization: Bearer <token>` header or use `--password` flag with CLI
 - **CORS**: When using the web UI from a different origin, configure `--cors-allow-origin`
 - **Provider Selection**: Use the provider/model selector in the UI to choose which backing agent to use (claude, codex, opencode, amp)
@@ -128,22 +119,24 @@ See the full endpoint compatibility table below. Most endpoints are functional f
 
 <Accordion title="Endpoint Status Table">
 
-| Method | Path | Status | Notes |
-|---|---|---|---|
-| GET | /event | SSE | Emits events for session/message updates |
-| GET | /global/event | SSE | Wraps events in GlobalEvent format |
-| GET | /session | Stateful | In-memory session store |
-| POST | /session | Stateful | Create new sessions |
-| GET | /session/{id} | Stateful | Get session details |
-| POST | /session/{id}/message | Stateful | Send messages to session |
-| GET | /session/{id}/message | Stateful | Get session messages |
-| GET | /permission | Stateful | List pending permissions |
-| POST | /permission/{id}/reply | Stateful | Respond to permission requests |
-| GET | /question | Stateful | List pending questions |
-| POST | /question/{id}/reply | Stateful | Answer agent questions |
-| GET | /provider | Stubbed | Returns provider metadata |
-| GET | /agent | Stubbed | Returns agent list |
-| GET | /config | Stubbed | Returns config |
-| *other endpoints* | Stubbed | Return empty/stub responses |
+| Endpoint | Status | Notes |
+|---|---|---|
+| `GET /event` | ✓ | Emits events for session/message updates (SSE) |
+| `GET /global/event` | ✓ | Wraps events in GlobalEvent format (SSE) |
+| `GET /session` | ✓ | In-memory session store |
+| `POST /session` | ✓ | Create new sessions |
+| `GET /session/{id}` | ✓ | Get session details |
+| `POST /session/{id}/message` | ✓ | Send messages to session |
+| `GET /session/{id}/message` | ✓ | Get session messages |
+| `GET /permission` | ✓ | List pending permissions |
+| `POST /permission/{id}/reply` | ✓ | Respond to permission requests |
+| `GET /question` | ✓ | List pending questions |
+| `POST /question/{id}/reply` | ✓ | Answer agent questions |
+| `GET /provider` | − | Returns provider metadata |
+| `GET /agent` | − | Returns agent list |
+| `GET /config` | − | Returns config |
+| *other endpoints* | − | Return empty/stub responses |
+
+✓ Functional &nbsp;&nbsp; − Stubbed
 
 </Accordion>
