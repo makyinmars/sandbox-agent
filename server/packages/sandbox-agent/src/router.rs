@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -22,12 +22,11 @@ use reqwest::Client;
 use sandbox_agent_error::{AgentError, ErrorType, ProblemDetails, SandboxError};
 use sandbox_agent_universal_agent_schema::{
     codex as codex_schema, convert_amp, convert_claude, convert_codex, convert_opencode,
-    convert_pi, pi as pi_schema,
-    AgentUnparsedData, ContentPart, ErrorData, EventConversion, EventSource, FileAction,
-    ItemDeltaData, ItemEventData, ItemKind, ItemRole, ItemStatus, PermissionEventData,
-    PermissionStatus, QuestionEventData, QuestionStatus, ReasoningVisibility, SessionEndReason,
-    SessionEndedData, SessionStartedData, StderrOutput, TerminatedBy, UniversalEvent,
-    UniversalEventData, UniversalEventType, UniversalItem,
+    convert_pi, pi as pi_schema, turn_completed_event, AgentUnparsedData, ContentPart, ErrorData,
+    EventConversion, EventSource, FileAction, ItemDeltaData, ItemEventData, ItemKind, ItemRole,
+    ItemStatus, PermissionEventData, PermissionStatus, QuestionEventData, QuestionStatus,
+    ReasoningVisibility, SessionEndReason, SessionEndedData, SessionStartedData, StderrOutput,
+    TerminatedBy, UniversalEvent, UniversalEventData, UniversalEventType, UniversalItem,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -42,26 +41,62 @@ use utoipa::{Modify, OpenApi, ToSchema};
 use crate::agent_server_logs::AgentServerLogs;
 use crate::http_client;
 use crate::opencode_compat::{build_opencode_router, OpenCodeAppState};
+use crate::telemetry;
 use crate::ui;
 use sandbox_agent_agent_management::agents::{
     AgentError as ManagerError, AgentId, AgentManager, InstallOptions, SpawnOptions, StreamingSpawn,
 };
 use sandbox_agent_agent_management::credentials::{
-    extract_all_credentials, CredentialExtractionOptions, ExtractedCredentials,
+    extract_all_credentials, AuthType, CredentialExtractionOptions, ExtractedCredentials,
+    ProviderCredentials,
 };
 
 const MOCK_EVENT_DELAY_MS: u64 = 200;
 static USER_MESSAGE_COUNTER: AtomicU64 = AtomicU64::new(1);
+const ANTHROPIC_MODELS_URL: &str = "https://api.anthropic.com/v1/models?beta=true";
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BrandingMode {
+    #[default]
+    SandboxAgent,
+    Gigacode,
+}
+
+impl BrandingMode {
+    pub fn product_name(&self) -> &'static str {
+        match self {
+            BrandingMode::SandboxAgent => "Sandbox Agent",
+            BrandingMode::Gigacode => "Gigacode",
+        }
+    }
+
+    pub fn docs_url(&self) -> &'static str {
+        match self {
+            BrandingMode::SandboxAgent => "https://sandboxagent.dev",
+            BrandingMode::Gigacode => "https://gigacode.dev",
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct AppState {
     auth: AuthConfig,
     agent_manager: Arc<AgentManager>,
     session_manager: Arc<SessionManager>,
+    pub branding: BrandingMode,
 }
 
 impl AppState {
     pub fn new(auth: AuthConfig, agent_manager: AgentManager) -> Self {
+        Self::with_branding(auth, agent_manager, BrandingMode::default())
+    }
+
+    pub fn with_branding(
+        auth: AuthConfig,
+        agent_manager: AgentManager,
+        branding: BrandingMode,
+    ) -> Self {
         let agent_manager = Arc::new(agent_manager);
         let session_manager = Arc::new(SessionManager::new(agent_manager.clone()));
         session_manager
@@ -71,6 +106,7 @@ impl AppState {
             auth,
             agent_manager,
             session_manager,
+            branding,
         }
     }
 
@@ -104,6 +140,7 @@ pub fn build_router_with_state(shared: Arc<AppState>) -> (Router, Arc<AppState>)
         .route("/agents", get(list_agents))
         .route("/agents/:agent/install", post(install_agent))
         .route("/agents/:agent/modes", get(get_agent_modes))
+        .route("/agents/:agent/models", get(get_agent_models))
         .route("/sessions", get(list_sessions))
         .route("/sessions/:session_id", post(create_session))
         .route("/sessions/:session_id/messages", post(post_message))
@@ -149,12 +186,15 @@ pub fn build_router_with_state(shared: Arc<AppState>) -> (Router, Arc<AppState>)
         ));
     }
 
-    let mut router = Router::new()
+    let root_router = Router::new()
         .route("/", get(get_root))
+        .fallback(not_found)
+        .with_state(shared.clone());
+
+    let mut router = root_router
         .nest("/v1", v1_router)
         .nest("/opencode", opencode_router)
-        .merge(opencode_root_router)
-        .fallback(not_found);
+        .merge(opencode_root_router);
 
     if ui::is_enabled() {
         router = router.merge(ui::router());
@@ -210,7 +250,7 @@ pub fn build_router_with_state(shared: Arc<AppState>) -> (Router, Arc<AppState>)
 }
 
 pub async fn shutdown_servers(state: &Arc<AppState>) {
-    state.session_manager.server_manager.shutdown().await;
+    state.session_manager.shutdown().await;
 }
 
 #[derive(OpenApi)]
@@ -219,6 +259,7 @@ pub async fn shutdown_servers(state: &Arc<AppState>) {
         get_health,
         install_agent,
         get_agent_modes,
+        get_agent_models,
         list_agents,
         list_sessions,
         create_session,
@@ -236,6 +277,8 @@ pub async fn shutdown_servers(state: &Arc<AppState>) {
             AgentInstallRequest,
             AgentModeInfo,
             AgentModesResponse,
+            AgentModelInfo,
+            AgentModelsResponse,
             AgentCapabilities,
             AgentInfo,
             AgentListResponse,
@@ -325,6 +368,7 @@ struct SessionState {
     model: Option<String>,
     variant: Option<String>,
     native_session_id: Option<String>,
+    pi_runtime: Option<Arc<PiSessionRuntime>>,
     ended: bool,
     ended_exit_code: Option<i32>,
     ended_message: Option<String>,
@@ -383,6 +427,7 @@ impl SessionState {
             model: request.model.clone(),
             variant: request.variant.clone(),
             native_session_id: None,
+            pi_runtime: None,
             ended: false,
             ended_exit_code: None,
             ended_message: None,
@@ -786,7 +831,6 @@ impl SessionState {
 enum ManagedServerKind {
     Http { base_url: String },
     StdioCodex { server: Arc<CodexServer> },
-    StdioPi { server: Arc<PiServer> },
 }
 
 #[derive(Debug)]
@@ -919,91 +963,47 @@ impl CodexServer {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PiRpcDialect {
-    Mono,
-    CodingAgent,
-}
-
-fn detect_pi_dialect(path: &PathBuf) -> PiRpcDialect {
-    let mut file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(_) => return PiRpcDialect::Mono,
-    };
-    let mut buffer = [0u8; 256];
-    let read = match file.read(&mut buffer) {
-        Ok(read) => read,
-        Err(_) => return PiRpcDialect::Mono,
-    };
-    if read == 0 {
-        return PiRpcDialect::Mono;
-    }
-    let sample = &buffer[..read];
-    if sample.starts_with(b"#!") {
-        return PiRpcDialect::CodingAgent;
-    }
-    if sample.iter().any(|byte| *byte == 0) {
-        return PiRpcDialect::Mono;
-    }
-    let is_text = sample.iter().all(|byte| byte.is_ascii());
-    if is_text {
-        return PiRpcDialect::CodingAgent;
-    }
-    PiRpcDialect::Mono
-}
-
-/// Shared Pi RPC process that multiplexes sessions via newline-delimited JSON.
-struct PiServer {
-    /// Sender for writing to the process stdin
+/// Long-lived Pi RPC process dedicated to exactly one daemon session.
+struct PiSessionRuntime {
+    /// Sender for writing to the process stdin.
     stdin_sender: mpsc::UnboundedSender<String>,
-    /// Pending RPC requests awaiting responses, keyed by request ID
+    /// Pending RPC requests awaiting responses, keyed by request ID.
     pending_requests: std::sync::Mutex<HashMap<i64, oneshot::Sender<Value>>>,
-    /// Next request ID for RPC
+    /// Next request ID for RPC.
     next_id: AtomicI64,
-    /// Mapping from native session ID to daemon session ID
-    session_map: std::sync::Mutex<HashMap<String, String>>,
-    /// Per-session conversion state (partial tool results, reasoning buffers)
-    converters: std::sync::Mutex<HashMap<String, convert_pi::PiEventConverter>>,
-    /// RPC dialect used by the Pi binary
-    dialect: PiRpcDialect,
-    /// Current daemon session id for coding-agent (no session id in events)
-    current_session_id: std::sync::Mutex<Option<String>>,
-    /// Current native session id for coding-agent (for metadata)
-    current_native_session_id: std::sync::Mutex<Option<String>>,
+    /// Per-session conversion state (partial tool results, reasoning buffers).
+    converter: std::sync::Mutex<convert_pi::PiEventConverter>,
+    /// Child process handle for lifecycle management.
+    child: Arc<std::sync::Mutex<Option<std::process::Child>>>,
+    /// True when daemon-initiated shutdown/terminate requested.
+    shutdown_requested: AtomicBool,
 }
 
-impl std::fmt::Debug for PiServer {
+impl std::fmt::Debug for PiSessionRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PiServer")
+        f.debug_struct("PiSessionRuntime")
             .field("next_id", &self.next_id.load(Ordering::SeqCst))
+            .field(
+                "shutdown_requested",
+                &self.shutdown_requested.load(Ordering::SeqCst),
+            )
             .finish()
     }
 }
 
-impl PiServer {
-    fn new(stdin_sender: mpsc::UnboundedSender<String>, dialect: PiRpcDialect) -> Self {
+impl PiSessionRuntime {
+    fn new(
+        stdin_sender: mpsc::UnboundedSender<String>,
+        child: Arc<std::sync::Mutex<Option<std::process::Child>>>,
+    ) -> Self {
         Self {
             stdin_sender,
             pending_requests: std::sync::Mutex::new(HashMap::new()),
             next_id: AtomicI64::new(1),
-            session_map: std::sync::Mutex::new(HashMap::new()),
-            converters: std::sync::Mutex::new(HashMap::new()),
-            dialect,
-            current_session_id: std::sync::Mutex::new(None),
-            current_native_session_id: std::sync::Mutex::new(None),
+            converter: std::sync::Mutex::new(convert_pi::PiEventConverter::default()),
+            child,
+            shutdown_requested: AtomicBool::new(false),
         }
-    }
-
-    fn dialect(&self) -> PiRpcDialect {
-        self.dialect
-    }
-
-    fn current_session_id(&self) -> Option<String> {
-        self.current_session_id.lock().unwrap().clone()
-    }
-
-    fn current_native_session_id(&self) -> Option<String> {
-        self.current_native_session_id.lock().unwrap().clone()
     }
 
     fn next_request_id(&self) -> i64 {
@@ -1031,51 +1031,39 @@ impl PiServer {
         }
     }
 
-    fn register_session(&self, native_session_id: String, session_id: String) {
-        let mut sessions = self.session_map.lock().unwrap();
-        sessions.insert(native_session_id.clone(), session_id.clone());
-        let mut converters = self.converters.lock().unwrap();
-        converters
-            .entry(native_session_id.clone())
-            .or_insert_with(convert_pi::PiEventConverter::default);
-        if self.dialect == PiRpcDialect::CodingAgent {
-            *self.current_session_id.lock().unwrap() = Some(session_id);
-            *self.current_native_session_id.lock().unwrap() = Some(native_session_id);
-        }
-    }
-
-    fn unregister_session(&self, native_session_id: &str) {
-        let mut sessions = self.session_map.lock().unwrap();
-        sessions.remove(native_session_id);
-        let mut converters = self.converters.lock().unwrap();
-        converters.remove(native_session_id);
-        if self.dialect == PiRpcDialect::CodingAgent {
-            let current_native = self.current_native_session_id.lock().unwrap().clone();
-            if current_native.as_deref() == Some(native_session_id) {
-                *self.current_session_id.lock().unwrap() = None;
-                *self.current_native_session_id.lock().unwrap() = None;
-            }
-        }
-    }
-
-    fn session_for_native(&self, native_session_id: &str) -> Option<String> {
-        let sessions = self.session_map.lock().unwrap();
-        sessions.get(native_session_id).cloned()
-    }
-
     fn clear_pending(&self) {
         let mut pending = self.pending_requests.lock().unwrap();
         pending.clear();
     }
 
-    fn clear_sessions(&self) {
-        let mut sessions = self.session_map.lock().unwrap();
-        sessions.clear();
-        let mut converters = self.converters.lock().unwrap();
-        converters.clear();
-        *self.current_session_id.lock().unwrap() = None;
-        *self.current_native_session_id.lock().unwrap() = None;
+    fn mark_shutdown_requested(&self) {
+        self.shutdown_requested.store(true, Ordering::SeqCst);
     }
+
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::SeqCst)
+    }
+
+    fn kill_process(&self) {
+        if let Ok(mut guard) = self.child.lock() {
+            if let Some(child) = guard.as_mut() {
+                let _ = child.kill();
+            }
+        }
+    }
+
+    fn shutdown(&self) {
+        self.mark_shutdown_requested();
+        self.clear_pending();
+        self.kill_process();
+    }
+}
+
+#[derive(Debug)]
+struct PiSessionBootstrap {
+    runtime: Arc<PiSessionRuntime>,
+    native_session_id: String,
+    _session_file: Option<String>,
 }
 
 pub(crate) struct SessionSubscription {
@@ -1103,7 +1091,7 @@ impl ManagedServer {
     fn base_url(&self) -> Option<String> {
         match &self.kind {
             ManagedServerKind::Http { base_url } => Some(base_url.clone()),
-            ManagedServerKind::StdioCodex { .. } | ManagedServerKind::StdioPi { .. } => None,
+            ManagedServerKind::StdioCodex { .. } => None,
         }
     }
 
@@ -1202,24 +1190,6 @@ impl AgentServerManager {
         if clear_agent {
             let mut natives = self.native_sessions.lock().await;
             natives.remove(&agent);
-        }
-
-        if agent == AgentId::Pi {
-            if let Some(native_session_id) = native_session_id {
-                let server = {
-                    let servers = self.servers.lock().await;
-                    servers.get(&AgentId::Pi).and_then(|server| {
-                        if let ManagedServerKind::StdioPi { server } = &server.kind {
-                            Some(server.clone())
-                        } else {
-                            None
-                        }
-                    })
-                };
-                if let Some(server) = server {
-                    server.unregister_session(native_session_id);
-                }
-            }
         }
     }
 
@@ -1367,65 +1337,6 @@ impl AgentServerManager {
         Ok((server, Some(stdout_rx)))
     }
 
-    async fn ensure_pi_server(
-        self: &Arc<Self>,
-    ) -> Result<(Arc<PiServer>, Option<mpsc::UnboundedReceiver<String>>), SandboxError> {
-        {
-            let servers = self.servers.lock().await;
-            if let Some(server) = servers.get(&AgentId::Pi) {
-                if matches!(server.status, ServerStatus::Running) {
-                    if let ManagedServerKind::StdioPi { server } = &server.kind {
-                        return Ok((server.clone(), None));
-                    }
-                }
-            }
-        }
-
-        let (server, stdout_rx, child) = self.spawn_pi_server().await?;
-        let restart_count = {
-            let servers = self.servers.lock().await;
-            servers
-                .get(&AgentId::Pi)
-                .map(|server| server.restart_count + 1)
-                .unwrap_or(0)
-        };
-
-        {
-            let mut servers = self.servers.lock().await;
-            if let Some(existing) = servers.get(&AgentId::Pi) {
-                if matches!(existing.status, ServerStatus::Running) {
-                    if let Ok(mut guard) = child.lock() {
-                        if let Some(child) = guard.as_mut() {
-                            let _ = child.kill();
-                        }
-                    }
-                    if let ManagedServerKind::StdioPi { server } = &existing.kind {
-                        return Ok((server.clone(), None));
-                    }
-                }
-            }
-            servers.insert(
-                AgentId::Pi,
-                ManagedServer {
-                    kind: ManagedServerKind::StdioPi {
-                        server: server.clone(),
-                    },
-                    child: child.clone(),
-                    status: ServerStatus::Running,
-                    start_time: Some(Instant::now()),
-                    restart_count,
-                    last_error: None,
-                    shutdown_requested: false,
-                    instance_id: restart_count,
-                },
-            );
-        }
-
-        self.spawn_monitor_task(AgentId::Pi, restart_count, child);
-
-        Ok((server, Some(stdout_rx)))
-    }
-
     async fn shutdown(&self) {
         let mut servers = self.servers.lock().await;
         for server in servers.values_mut() {
@@ -1440,10 +1351,6 @@ impl AgentServerManager {
             if let ManagedServerKind::StdioCodex { server } = &server.kind {
                 server.clear_pending();
                 server.clear_threads();
-            }
-            if let ManagedServerKind::StdioPi { server } = &server.kind {
-                server.clear_pending();
-                server.clear_sessions();
             }
         }
     }
@@ -1586,95 +1493,6 @@ impl AgentServerManager {
         ))
     }
 
-    async fn spawn_pi_server(
-        self: &Arc<Self>,
-    ) -> Result<
-        (
-            Arc<PiServer>,
-            mpsc::UnboundedReceiver<String>,
-            Arc<std::sync::Mutex<Option<std::process::Child>>>,
-        ),
-        SandboxError,
-    > {
-        let manager = self.agent_manager.clone();
-        let log_dir = self.log_base_dir.clone();
-        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<String>();
-        let (stdout_tx, stdout_rx) = mpsc::unbounded_channel::<String>();
-
-        let child = tokio::task::spawn_blocking(
-            move || -> Result<(std::process::Child, PiRpcDialect), SandboxError> {
-                let path = manager
-                    .resolve_binary(AgentId::Pi)
-                    .map_err(|err| map_spawn_error(AgentId::Pi, err))?;
-                let dialect = detect_pi_dialect(&path);
-                let mut command = std::process::Command::new(path);
-                let stderr = AgentServerLogs::new(log_dir, AgentId::Pi.as_str()).open()?;
-                command
-                    .arg("--mode")
-                    .arg("rpc")
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(stderr);
-
-                let mut child = command.spawn().map_err(|err| SandboxError::StreamError {
-                    message: err.to_string(),
-                })?;
-
-                let stdin = child
-                    .stdin
-                    .take()
-                    .ok_or_else(|| SandboxError::StreamError {
-                        message: "pi stdin unavailable".to_string(),
-                    })?;
-                let stdout = child
-                    .stdout
-                    .take()
-                    .ok_or_else(|| SandboxError::StreamError {
-                        message: "pi stdout unavailable".to_string(),
-                    })?;
-
-                let stdin_rx_mut = std::sync::Mutex::new(stdin_rx);
-                std::thread::spawn(move || {
-                    let mut stdin = stdin;
-                    let mut rx = stdin_rx_mut.lock().unwrap();
-                    while let Some(line) = rx.blocking_recv() {
-                        if writeln!(stdin, "{line}").is_err() {
-                            break;
-                        }
-                        if stdin.flush().is_err() {
-                            break;
-                        }
-                    }
-                });
-
-                std::thread::spawn(move || {
-                    let reader = BufReader::new(stdout);
-                    for line in reader.lines() {
-                        let Ok(line) = line else { break };
-                        if stdout_tx.send(line).is_err() {
-                            break;
-                        }
-                    }
-                });
-
-                Ok((child, dialect))
-            },
-        )
-        .await
-            .map_err(|err| SandboxError::StreamError {
-                message: err.to_string(),
-            })??;
-
-        let (child, dialect) = child;
-        let server = Arc::new(PiServer::new(stdin_tx, dialect));
-
-        Ok((
-            server,
-            stdout_rx,
-            Arc::new(std::sync::Mutex::new(Some(child))),
-        ))
-    }
-
     fn spawn_monitor_task(
         self: &Arc<Self>,
         agent: AgentId,
@@ -1719,7 +1537,6 @@ impl AgentServerManager {
         let exit_code = status.code();
         let message = format!("agent server exited with status {:?}", status);
         let mut codex_server = None;
-        let mut pi_server = None;
         let mut shutdown_requested = false;
         {
             let mut servers = self.servers.lock().await;
@@ -1743,19 +1560,12 @@ impl AgentServerManager {
                 if let ManagedServerKind::StdioCodex { server } = &server.kind {
                     codex_server = Some(server.clone());
                 }
-                if let ManagedServerKind::StdioPi { server } = &server.kind {
-                    pi_server = Some(server.clone());
-                }
             }
         }
 
         if let Some(server) = codex_server {
             server.clear_pending();
             server.clear_threads();
-        }
-        if let Some(server) = pi_server {
-            server.clear_pending();
-            server.clear_sessions();
         }
 
         if shutdown_requested {
@@ -1802,21 +1612,6 @@ impl AgentServerManager {
                                 .await;
                         });
                         let _ = owner.codex_server_initialize(&server).await;
-                    }
-                }
-            }
-            AgentId::Pi => {
-                let (server, receiver) = self.ensure_pi_server().await?;
-                if let Some(stdout_rx) = receiver {
-                    let owner = self.owner.lock().expect("owner lock").clone();
-                    if let Some(owner) = owner.as_ref().and_then(|weak| weak.upgrade()) {
-                        let owner_clone = owner.clone();
-                        let server_clone = server.clone();
-                        tokio::spawn(async move {
-                            owner_clone
-                                .handle_pi_server_output(server_clone, stdout_rx)
-                                .await;
-                        });
                     }
                 }
             }
@@ -1920,6 +1715,20 @@ impl SessionManager {
         logs.read_stderr()
     }
 
+    async fn shutdown(&self) {
+        let runtimes = {
+            let mut sessions = self.sessions.lock().await;
+            sessions
+                .iter_mut()
+                .filter_map(|session| session.pi_runtime.take())
+                .collect::<Vec<_>>()
+        };
+        for runtime in runtimes {
+            runtime.shutdown();
+        }
+        self.server_manager.shutdown().await;
+    }
+
     pub(crate) async fn create_session(
         self: &Arc<Self>,
         session_id: String,
@@ -1977,22 +1786,19 @@ impl SessionManager {
             session.native_session_id = Some(thread_id);
         }
         if agent_id == AgentId::Pi {
-            let snapshot = SessionSnapshot {
-                session_id: session_id.clone(),
-                agent: agent_id,
-                agent_mode: session.agent_mode.clone(),
-                permission_mode: session.permission_mode.clone(),
-                model: session.model.clone(),
-                variant: session.variant.clone(),
-                native_session_id: None,
-            };
-            let native_id = self.create_pi_session(&session_id, &snapshot).await?;
-            session.native_session_id = Some(native_id);
+            let pi = self
+                .create_pi_session(&session_id, session.model.as_deref())
+                .await?;
+            session.native_session_id = Some(pi.native_session_id);
+            session.pi_runtime = Some(pi.runtime);
         }
         if agent_id == AgentId::Mock {
             session.native_session_id = Some(format!("mock-{session_id}"));
         }
 
+        let telemetry_agent = request.agent.clone();
+        let telemetry_model = request.model.clone();
+        let telemetry_variant = request.variant.clone();
         let metadata = json!({
             "agent": request.agent,
             "agentMode": session.agent_mode,
@@ -2022,10 +1828,12 @@ impl SessionManager {
         }
 
         let native_session_id = session.native_session_id.clone();
+        let telemetry_agent_mode = session.agent_mode.clone();
+        let telemetry_permission_mode = session.permission_mode.clone();
         let mut sessions = self.sessions.lock().await;
         sessions.push(session);
         drop(sessions);
-        if agent_id == AgentId::Opencode || agent_id == AgentId::Codex || agent_id == AgentId::Pi {
+        if agent_id == AgentId::Opencode || agent_id == AgentId::Codex {
             self.server_manager
                 .register_session(agent_id, &session_id, native_session_id.as_deref())
                 .await;
@@ -2035,11 +1843,40 @@ impl SessionManager {
             self.ensure_opencode_stream(session_id).await?;
         }
 
+        telemetry::log_session_created(telemetry::SessionConfig {
+            agent: telemetry_agent,
+            agent_mode: Some(telemetry_agent_mode),
+            permission_mode: Some(telemetry_permission_mode),
+            model: telemetry_model,
+            variant: telemetry_variant,
+        });
+
         Ok(CreateSessionResponse {
             healthy: true,
             error: None,
             native_session_id,
         })
+    }
+
+    pub(crate) async fn set_session_overrides(
+        &self,
+        session_id: &str,
+        model: Option<String>,
+        variant: Option<String>,
+    ) -> Result<(), SandboxError> {
+        let mut sessions = self.sessions.lock().await;
+        let Some(session) = SessionManager::session_mut(&mut sessions, session_id) else {
+            return Err(SandboxError::SessionNotFound {
+                session_id: session_id.to_string(),
+            });
+        };
+        if let Some(model) = model {
+            session.model = Some(model);
+        }
+        if let Some(variant) = variant {
+            session.variant = Some(variant);
+        }
+        Ok(())
     }
 
     async fn agent_modes(&self, agent: AgentId) -> Result<Vec<AgentModeInfo>, SandboxError> {
@@ -2057,6 +1894,32 @@ impl SessionManager {
                 }
             }
             Err(_) => Ok(agent_modes_for(agent)),
+        }
+    }
+
+    pub(crate) async fn agent_models(
+        self: &Arc<Self>,
+        agent: AgentId,
+    ) -> Result<AgentModelsResponse, SandboxError> {
+        match agent {
+            AgentId::Claude => self.fetch_claude_models().await,
+            AgentId::Codex => self.fetch_codex_models().await,
+            AgentId::Opencode => match self.fetch_opencode_models().await {
+                Ok(models) => Ok(models),
+                Err(_) => Ok(AgentModelsResponse {
+                    models: Vec::new(),
+                    default_model: None,
+                }),
+            },
+            AgentId::Amp => Ok(amp_models_response()),
+            AgentId::Pi => match self.fetch_pi_models().await {
+                Ok(models) => Ok(models),
+                Err(_) => Ok(AgentModelsResponse {
+                    models: Vec::new(),
+                    default_model: None,
+                }),
+            },
+            AgentId::Mock => Ok(mock_models_response()),
         }
     }
 
@@ -2217,8 +2080,12 @@ impl SessionManager {
         session.record_conversions(vec![ended]);
         let agent = session.agent;
         let native_session_id = session.native_session_id.clone();
+        let pi_runtime = session.pi_runtime.take();
         drop(sessions);
-        if agent == AgentId::Opencode || agent == AgentId::Codex || agent == AgentId::Pi {
+        if let Some(runtime) = pi_runtime {
+            runtime.shutdown();
+        }
+        if agent == AgentId::Opencode || agent == AgentId::Codex {
             self.server_manager
                 .unregister_session(agent, &session_id, native_session_id.as_deref())
                 .await;
@@ -3524,7 +3391,7 @@ impl SessionManager {
             approval_policy: codex_approval_policy(Some(&session.permission_mode)),
             collaboration_mode: None,
             cwd: None,
-            effort: None,
+            effort: codex_effort_from_variant(session.variant.as_deref()),
             input: vec![codex_schema::UserInput::Text {
                 text: prompt_text,
                 text_elements: Vec::new(),
@@ -3551,27 +3418,171 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Ensures a shared Pi RPC process is running.
-    async fn ensure_pi_server(self: &Arc<Self>) -> Result<Arc<PiServer>, SandboxError> {
-        let (server, receiver) = self.server_manager.ensure_pi_server().await?;
-
-        if let Some(stdout_rx) = receiver {
-            let server_for_task = server.clone();
-            let self_for_task = Arc::clone(self);
-            tokio::spawn(async move {
-                self_for_task
-                    .handle_pi_server_output(server_for_task, stdout_rx)
-                    .await;
-            });
+    fn apply_pi_model_args(command: &mut std::process::Command, model: Option<&str>) {
+        let Some(model) = model else {
+            return;
+        };
+        if let Some((provider, model_id)) = model.split_once('/') {
+            command
+                .arg("--provider")
+                .arg(provider)
+                .arg("--model")
+                .arg(model_id);
+            return;
         }
-
-        Ok(server)
+        command.arg("--model").arg(model);
     }
 
-    /// Handles output from the Pi RPC server, routing responses and events.
-    async fn handle_pi_server_output(
+    async fn spawn_pi_runtime(
+        self: &Arc<Self>,
+        model: Option<&str>,
+    ) -> Result<(Arc<PiSessionRuntime>, mpsc::UnboundedReceiver<String>), SandboxError> {
+        let manager = self.agent_manager.clone();
+        let log_dir = self.server_manager.log_base_dir.clone();
+        let model = model.map(str::to_string);
+        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<String>();
+        let (stdout_tx, stdout_rx) = mpsc::unbounded_channel::<String>();
+
+        let child =
+            tokio::task::spawn_blocking(move || -> Result<std::process::Child, SandboxError> {
+                let path = manager
+                    .resolve_binary(AgentId::Pi)
+                    .map_err(|err| map_spawn_error(AgentId::Pi, err))?;
+                let mut command = std::process::Command::new(path);
+                let stderr = AgentServerLogs::new(log_dir, AgentId::Pi.as_str()).open()?;
+                command.arg("--mode").arg("rpc");
+                Self::apply_pi_model_args(&mut command, model.as_deref());
+                command
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(stderr);
+
+                let mut child = command.spawn().map_err(|err| SandboxError::StreamError {
+                    message: err.to_string(),
+                })?;
+
+                let stdin = child
+                    .stdin
+                    .take()
+                    .ok_or_else(|| SandboxError::StreamError {
+                        message: "pi stdin unavailable".to_string(),
+                    })?;
+                let stdout = child
+                    .stdout
+                    .take()
+                    .ok_or_else(|| SandboxError::StreamError {
+                        message: "pi stdout unavailable".to_string(),
+                    })?;
+
+                let stdin_rx_mut = std::sync::Mutex::new(stdin_rx);
+                std::thread::spawn(move || {
+                    let mut stdin = stdin;
+                    let mut rx = stdin_rx_mut.lock().unwrap();
+                    while let Some(line) = rx.blocking_recv() {
+                        if writeln!(stdin, "{line}").is_err() {
+                            break;
+                        }
+                        if stdin.flush().is_err() {
+                            break;
+                        }
+                    }
+                });
+
+                std::thread::spawn(move || {
+                    let reader = BufReader::new(stdout);
+                    for line in reader.lines() {
+                        let Ok(line) = line else { break };
+                        if stdout_tx.send(line).is_err() {
+                            break;
+                        }
+                    }
+                });
+
+                Ok(child)
+            })
+            .await
+            .map_err(|err| SandboxError::StreamError {
+                message: err.to_string(),
+            })??;
+
+        let child = Arc::new(std::sync::Mutex::new(Some(child)));
+        let runtime = Arc::new(PiSessionRuntime::new(stdin_tx, child));
+        Ok((runtime, stdout_rx))
+    }
+
+    fn spawn_pi_runtime_tasks(
+        self: &Arc<Self>,
+        session_id: String,
+        runtime: Arc<PiSessionRuntime>,
+        stdout_rx: mpsc::UnboundedReceiver<String>,
+    ) {
+        let output_manager = Arc::clone(self);
+        let output_session_id = session_id.clone();
+        let output_runtime = runtime.clone();
+        tokio::spawn(async move {
+            output_manager
+                .handle_pi_runtime_output(output_session_id, output_runtime, stdout_rx)
+                .await;
+        });
+
+        let exit_manager = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                let status = {
+                    let mut guard = match runtime.child.lock() {
+                        Ok(guard) => guard,
+                        Err(_) => return,
+                    };
+                    match guard.as_mut() {
+                        Some(child) => match child.try_wait() {
+                            Ok(status) => status,
+                            Err(_) => None,
+                        },
+                        None => return,
+                    }
+                };
+
+                if let Some(status) = status {
+                    if let Ok(mut guard) = runtime.child.lock() {
+                        *guard = None;
+                    }
+                    exit_manager
+                        .handle_pi_runtime_exit(&session_id, runtime.clone(), status)
+                        .await;
+                    break;
+                }
+
+                sleep(Duration::from_millis(250)).await;
+            }
+        });
+    }
+
+    async fn is_active_pi_runtime(
+        &self,
+        session_id: &str,
+        runtime: &Arc<PiSessionRuntime>,
+    ) -> bool {
+        let sessions = self.sessions.lock().await;
+        let Some(session) = Self::session_ref(&sessions, session_id) else {
+            return false;
+        };
+        session
+            .pi_runtime
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, runtime))
+    }
+
+    async fn session_native_session_id(&self, session_id: &str) -> Option<String> {
+        let sessions = self.sessions.lock().await;
+        Self::session_ref(&sessions, session_id)
+            .and_then(|session| session.native_session_id.clone())
+    }
+
+    /// Handles output from one Pi runtime process and routes events to exactly one daemon session.
+    async fn handle_pi_runtime_output(
         self: Arc<Self>,
-        server: Arc<PiServer>,
+        session_id: String,
+        runtime: Arc<PiSessionRuntime>,
         mut stdout_rx: mpsc::UnboundedReceiver<String>,
     ) {
         while let Some(line) = stdout_rx.recv().await {
@@ -3583,8 +3594,14 @@ impl SessionManager {
             let value: Value = match serde_json::from_str(trimmed) {
                 Ok(v) => v,
                 Err(err) => {
-                    self.record_pi_unparsed(None, &err.to_string(), Value::String(trimmed.to_string()))
+                    if self.is_active_pi_runtime(&session_id, &runtime).await {
+                        self.record_pi_unparsed(
+                            &session_id,
+                            &err.to_string(),
+                            Value::String(trimmed.to_string()),
+                        )
                         .await;
+                    }
                     continue;
                 }
             };
@@ -3596,67 +3613,39 @@ impl SessionManager {
                     .and_then(Value::as_i64)
                     .or_else(|| value.get("id").and_then(Value::as_str)?.parse::<i64>().ok());
                 if let Some(id) = id {
-                    server.complete_request(id, value.clone());
+                    runtime.complete_request(id, value.clone());
                 }
                 continue;
             }
 
-            let native_session_id = extract_pi_session_id(&value).or_else(|| {
-                if server.dialect() == PiRpcDialect::CodingAgent {
-                    server.current_native_session_id()
-                } else {
-                    None
-                }
-            });
-            let session_id = native_session_id
-                .as_ref()
-                .and_then(|id| server.session_for_native(id))
-                .or_else(|| {
-                    if server.dialect() == PiRpcDialect::CodingAgent {
-                        server.current_session_id()
-                    } else {
-                        None
-                    }
-                });
-            let Some(session_id) = session_id else {
-                self.record_pi_unparsed(
-                    None,
-                    "pi event missing session id",
-                    value.clone(),
-                )
-                .await;
+            if !self.is_active_pi_runtime(&session_id, &runtime).await {
                 continue;
-            };
+            }
 
             let event: pi_schema::RpcEvent = match serde_json::from_value(value.clone()) {
                 Ok(event) => event,
                 Err(err) => {
-                    self.record_pi_unparsed(Some(session_id.clone()), &err.to_string(), value.clone())
+                    self.record_pi_unparsed(&session_id, &err.to_string(), value.clone())
                         .await;
                     continue;
                 }
             };
 
             let conversions = {
-                let mut converters = server.converters.lock().unwrap();
-                let key = native_session_id
-                    .clone()
-                    .unwrap_or_else(|| session_id.clone());
-                let converter = converters
-                    .entry(key)
-                    .or_insert_with(convert_pi::PiEventConverter::default);
+                let mut converter = runtime.converter.lock().unwrap();
                 converter.event_to_universal(&event)
             };
 
             let mut conversions = match conversions {
                 Ok(conversions) => conversions,
                 Err(err) => {
-                    self.record_pi_unparsed(Some(session_id.clone()), &err, value.clone())
+                    self.record_pi_unparsed(&session_id, &err, value.clone())
                         .await;
                     continue;
                 }
             };
 
+            let native_session_id = self.session_native_session_id(&session_id).await;
             for conversion in &mut conversions {
                 if conversion.native_session_id.is_none() {
                     conversion.native_session_id = native_session_id.clone();
@@ -3668,129 +3657,168 @@ impl SessionManager {
         }
     }
 
+    async fn handle_pi_runtime_exit(
+        &self,
+        session_id: &str,
+        runtime: Arc<PiSessionRuntime>,
+        status: std::process::ExitStatus,
+    ) {
+        runtime.clear_pending();
+
+        let should_emit_error = {
+            let mut sessions = self.sessions.lock().await;
+            let Some(session) = Self::session_mut(&mut sessions, session_id) else {
+                return;
+            };
+            let Some(active_runtime) = session.pi_runtime.as_ref() else {
+                return;
+            };
+            if !Arc::ptr_eq(active_runtime, &runtime) {
+                return;
+            }
+            session.pi_runtime = None;
+            !runtime.shutdown_requested() && !session.ended
+        };
+
+        if !should_emit_error {
+            return;
+        }
+
+        let message = format!("pi rpc process exited with status {:?}", status);
+        self.record_error(
+            session_id,
+            message.clone(),
+            Some("server_exit".to_string()),
+            None,
+        )
+        .await;
+        let logs = self.read_agent_stderr(AgentId::Pi);
+        self.mark_session_ended(
+            session_id,
+            status.code(),
+            &message,
+            SessionEndReason::Error,
+            TerminatedBy::Daemon,
+            logs,
+        )
+        .await;
+    }
+
     async fn create_pi_session(
         self: &Arc<Self>,
         session_id: &str,
-        _session: &SessionSnapshot,
-    ) -> Result<String, SandboxError> {
-        let server = self.ensure_pi_server().await?;
-        if server.dialect() == PiRpcDialect::CodingAgent && server.current_session_id().is_some() {
-            return Err(SandboxError::InvalidRequest {
-                message:
-                    "pi-coding-agent supports a single active session; terminate it before creating a new session"
-                        .to_string(),
-            });
-        }
+        model: Option<&str>,
+    ) -> Result<PiSessionBootstrap, SandboxError> {
+        let (runtime, stdout_rx) = self.spawn_pi_runtime(model).await?;
+        self.spawn_pi_runtime_tasks(session_id.to_string(), runtime.clone(), stdout_rx);
 
-        let id = server.next_request_id();
-        let request = match server.dialect() {
-            PiRpcDialect::Mono => json!({
-                "type": "command",
-                "id": id,
-                "command": "new_session",
-                "params": { "sessionName": session_id }
-            }),
-            PiRpcDialect::CodingAgent => json!({
+        let result: Result<PiSessionBootstrap, SandboxError> = async {
+            let new_id = runtime.next_request_id();
+            let new_request = json!({
                 "type": "new_session",
-                "id": id
-            }),
-        };
-
-        let rx = server
-            .send_request(id, &request)
-            .ok_or_else(|| SandboxError::StreamError {
-                message: "failed to send pi new_session request".to_string(),
-            })?;
-
-        let result = tokio::time::timeout(Duration::from_secs(30), rx).await;
-        match result {
-            Ok(Ok(response)) => {
-                if response
-                    .get("success")
-                    .and_then(Value::as_bool)
-                    .is_some_and(|success| !success)
-                {
-                    return Err(SandboxError::StreamError {
-                        message: format!("pi new_session failed: {response}"),
-                    });
+                "id": new_id
+            });
+            let new_rx = runtime.send_request(new_id, &new_request).ok_or_else(|| {
+                SandboxError::StreamError {
+                    message: "failed to send pi new_session request".to_string(),
                 }
-                if response
-                    .get("data")
-                    .and_then(|value| value.get("cancelled"))
-                    .and_then(Value::as_bool)
-                    .is_some_and(|cancelled| cancelled)
-                {
+            })?;
+            let new_response = tokio::time::timeout(Duration::from_secs(30), new_rx).await;
+            let new_response = match new_response {
+                Ok(Ok(response)) => response,
+                Ok(Err(_)) => {
                     return Err(SandboxError::StreamError {
                         message: "pi new_session request cancelled".to_string(),
-                    });
+                    })
                 }
-
-                let native_session_id = if server.dialect() == PiRpcDialect::CodingAgent {
-                    let state_id = server.next_request_id();
-                    let request = json!({
-                        "type": "get_state",
-                        "id": state_id
-                    });
-                    let rx = server
-                        .send_request(state_id, &request)
-                        .ok_or_else(|| SandboxError::StreamError {
-                            message: "failed to send pi get_state request".to_string(),
-                        })?;
-                    let result = tokio::time::timeout(Duration::from_secs(30), rx).await;
-                    let response = match result {
-                        Ok(Ok(response)) => response,
-                        Ok(Err(_)) => {
-                            return Err(SandboxError::StreamError {
-                                message: "pi get_state request cancelled".to_string(),
-                            })
-                        }
-                        Err(_) => {
-                            return Err(SandboxError::StreamError {
-                                message: "pi get_state request timed out".to_string(),
-                            })
-                        }
-                    };
-                    if response
-                        .get("success")
-                        .and_then(Value::as_bool)
-                        .is_some_and(|success| !success)
-                    {
-                        return Err(SandboxError::StreamError {
-                            message: format!("pi get_state failed: {response}"),
-                        });
-                    }
-                    let session_value = response.get("data").unwrap_or(&response);
-                    session_value
-                        .get("sessionId")
-                        .or_else(|| session_value.get("session_id"))
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| SandboxError::StreamError {
-                            message: "pi get_state response missing session id".to_string(),
-                        })?
-                        .to_string()
-                } else {
-                    let session_value = response.get("data").unwrap_or(&response);
-                    session_value
-                        .get("sessionId")
-                        .or_else(|| session_value.get("session_id"))
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| SandboxError::StreamError {
-                            message: "pi new_session response missing session id".to_string(),
-                        })?
-                        .to_string()
-                };
-
-                server.register_session(native_session_id.clone(), session_id.to_string());
-
-                Ok(native_session_id)
+                Err(_) => {
+                    return Err(SandboxError::StreamError {
+                        message: "pi new_session request timed out".to_string(),
+                    })
+                }
+            };
+            if new_response
+                .get("success")
+                .and_then(Value::as_bool)
+                .is_some_and(|success| !success)
+            {
+                return Err(SandboxError::StreamError {
+                    message: format!("pi new_session failed: {new_response}"),
+                });
             }
-            Ok(Err(_)) => Err(SandboxError::StreamError {
-                message: "pi new_session request cancelled".to_string(),
-            }),
-            Err(_) => Err(SandboxError::StreamError {
-                message: "pi new_session request timed out".to_string(),
-            }),
+            if new_response
+                .get("data")
+                .and_then(|value| value.get("cancelled"))
+                .and_then(Value::as_bool)
+                .is_some_and(|cancelled| cancelled)
+            {
+                return Err(SandboxError::StreamError {
+                    message: "pi new_session request cancelled".to_string(),
+                });
+            }
+
+            let state_id = runtime.next_request_id();
+            let state_request = json!({
+                "type": "get_state",
+                "id": state_id
+            });
+            let state_rx = runtime
+                .send_request(state_id, &state_request)
+                .ok_or_else(|| SandboxError::StreamError {
+                    message: "failed to send pi get_state request".to_string(),
+                })?;
+            let state_response = tokio::time::timeout(Duration::from_secs(30), state_rx).await;
+            let state_response = match state_response {
+                Ok(Ok(response)) => response,
+                Ok(Err(_)) => {
+                    return Err(SandboxError::StreamError {
+                        message: "pi get_state request cancelled".to_string(),
+                    })
+                }
+                Err(_) => {
+                    return Err(SandboxError::StreamError {
+                        message: "pi get_state request timed out".to_string(),
+                    })
+                }
+            };
+            if state_response
+                .get("success")
+                .and_then(Value::as_bool)
+                .is_some_and(|success| !success)
+            {
+                return Err(SandboxError::StreamError {
+                    message: format!("pi get_state failed: {state_response}"),
+                });
+            }
+
+            let state = state_response.get("data").unwrap_or(&state_response);
+            let native_session_id = state
+                .get("sessionId")
+                .or_else(|| state.get("session_id"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| SandboxError::StreamError {
+                    message: "pi get_state response missing session id".to_string(),
+                })?
+                .to_string();
+            let session_file = state
+                .get("sessionFile")
+                .or_else(|| state.get("session_file"))
+                .and_then(Value::as_str)
+                .map(|value| value.to_string());
+
+            Ok(PiSessionBootstrap {
+                runtime: runtime.clone(),
+                native_session_id,
+                _session_file: session_file,
+            })
         }
+        .await;
+
+        if result.is_err() {
+            runtime.shutdown();
+        }
+
+        result
     }
 
     async fn send_pi_prompt(
@@ -3798,47 +3826,30 @@ impl SessionManager {
         session: &SessionSnapshot,
         prompt: &str,
     ) -> Result<(), SandboxError> {
-        let server = self.ensure_pi_server().await?;
-        let native_session_id =
-            session
-                .native_session_id
-                .as_ref()
-                .ok_or_else(|| SandboxError::InvalidRequest {
-                    message: "missing Pi session id".to_string(),
-                })?;
-        if server.dialect() == PiRpcDialect::CodingAgent {
-            if let Some(current) = server.current_session_id() {
-                if current != session.session_id {
-                    return Err(SandboxError::InvalidRequest {
-                        message: "pi-coding-agent supports a single active session; prompt must target the current session"
-                            .to_string(),
-                    });
-                }
-            }
-        }
-
-        let id = server.next_request_id();
-        let request = match server.dialect() {
-            PiRpcDialect::Mono => json!({
-                "type": "command",
-                "id": id,
-                "command": "prompt",
-                "params": {
-                    "sessionId": native_session_id,
-                    "message": {
-                        "role": "user",
-                        "content": [{ "type": "text", "text": prompt }]
+        let runtime = {
+            let sessions = self.sessions.lock().await;
+            let session_state =
+                Self::session_ref(&sessions, &session.session_id).ok_or_else(|| {
+                    SandboxError::SessionNotFound {
+                        session_id: session.session_id.clone(),
                     }
-                }
-            }),
-            PiRpcDialect::CodingAgent => json!({
-                "type": "prompt",
-                "id": id,
-                "message": prompt
-            }),
+                })?;
+            session_state
+                .pi_runtime
+                .clone()
+                .ok_or_else(|| SandboxError::InvalidRequest {
+                    message: "Pi session runtime is not active".to_string(),
+                })?
         };
 
-        server
+        let id = runtime.next_request_id();
+        let request = json!({
+            "type": "prompt",
+            "id": id,
+            "message": prompt
+        });
+
+        runtime
             .send_request(id, &request)
             .ok_or_else(|| SandboxError::StreamError {
                 message: "failed to send pi prompt request".to_string(),
@@ -3847,27 +3858,10 @@ impl SessionManager {
         Ok(())
     }
 
-    async fn record_pi_unparsed(&self, session_id: Option<String>, error: &str, raw: Value) {
-        if let Some(session_id) = session_id {
-            let _ = self
-                .record_conversions(&session_id, vec![agent_unparsed("pi", error, raw)])
-                .await;
-            return;
-        }
-        let session_ids = {
-            let sessions = self.server_manager.sessions.lock().await;
-            sessions
-                .get(&AgentId::Pi)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .collect::<Vec<_>>()
-        };
-        for session_id in session_ids {
-            let _ = self
-                .record_conversions(&session_id, vec![agent_unparsed("pi", error, raw.clone())])
-                .await;
-        }
+    async fn record_pi_unparsed(&self, session_id: &str, error: &str, raw: Value) {
+        let _ = self
+            .record_conversions(session_id, vec![agent_unparsed("pi", error, raw)])
+            .await;
     }
 
     async fn fetch_opencode_modes(&self) -> Result<Vec<AgentModeInfo>, SandboxError> {
@@ -3898,6 +3892,296 @@ impl SessionManager {
         }
         Err(SandboxError::StreamError {
             message: "OpenCode agent modes unavailable".to_string(),
+        })
+    }
+
+    async fn fetch_claude_models(&self) -> Result<AgentModelsResponse, SandboxError> {
+        let credentials = self.extract_credentials().await?;
+        let Some(cred) = credentials.anthropic else {
+            return Ok(AgentModelsResponse {
+                models: Vec::new(),
+                default_model: None,
+            });
+        };
+
+        let headers = build_anthropic_headers(&cred)?;
+        let response = self
+            .http_client
+            .get(ANTHROPIC_MODELS_URL)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|err| SandboxError::StreamError {
+                message: err.to_string(),
+            })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(SandboxError::StreamError {
+                message: format!("Anthropic models request failed {status}: {body}"),
+            });
+        }
+
+        let value: Value = response
+            .json()
+            .await
+            .map_err(|err| SandboxError::StreamError {
+                message: err.to_string(),
+            })?;
+        let data = value
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut models = Vec::new();
+        let mut default_model: Option<String> = None;
+        let mut default_created: Option<String> = None;
+        for item in data {
+            let Some(id) = item.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let name = item
+                .get("display_name")
+                .and_then(Value::as_str)
+                .map(|value| value.to_string());
+            let created = item
+                .get("created_at")
+                .and_then(Value::as_str)
+                .map(|value| value.to_string());
+            if let Some(created) = created.as_ref() {
+                let should_update = match default_created.as_deref() {
+                    Some(current) => created.as_str() > current,
+                    None => true,
+                };
+                if should_update {
+                    default_created = Some(created.clone());
+                    default_model = Some(id.to_string());
+                }
+            }
+            models.push(AgentModelInfo {
+                id: id.to_string(),
+                name,
+                variants: None,
+                default_variant: None,
+            });
+        }
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        if default_model.is_none() {
+            default_model = models.first().map(|model| model.id.clone());
+        }
+
+        Ok(AgentModelsResponse {
+            models,
+            default_model,
+        })
+    }
+
+    async fn fetch_codex_models(self: &Arc<Self>) -> Result<AgentModelsResponse, SandboxError> {
+        let server = self.ensure_codex_server().await?;
+        let mut models: Vec<AgentModelInfo> = Vec::new();
+        let mut default_model: Option<String> = None;
+        let mut seen = HashSet::new();
+        let mut cursor: Option<String> = None;
+
+        loop {
+            let id = server.next_request_id();
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "model/list",
+                "params": {
+                    "cursor": cursor,
+                    "limit": null
+                }
+            });
+            let rx =
+                server
+                    .send_request(id, &request)
+                    .ok_or_else(|| SandboxError::StreamError {
+                        message: "failed to send model/list request".to_string(),
+                    })?;
+
+            let result = tokio::time::timeout(Duration::from_secs(30), rx).await;
+            let value = match result {
+                Ok(Ok(value)) => value,
+                Ok(Err(_)) => {
+                    return Err(SandboxError::StreamError {
+                        message: "model/list request cancelled".to_string(),
+                    })
+                }
+                Err(_) => {
+                    return Err(SandboxError::StreamError {
+                        message: "model/list request timed out".to_string(),
+                    })
+                }
+            };
+
+            let data = value
+                .get("data")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+
+            for item in data {
+                let model_id = item
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.get("id").and_then(Value::as_str));
+                let Some(model_id) = model_id else {
+                    continue;
+                };
+                if !seen.insert(model_id.to_string()) {
+                    continue;
+                }
+
+                let name = item
+                    .get("displayName")
+                    .and_then(Value::as_str)
+                    .map(|value| value.to_string());
+                let default_variant = item
+                    .get("defaultReasoningEffort")
+                    .and_then(Value::as_str)
+                    .map(|value| value.to_string());
+                let mut variants: Vec<String> = item
+                    .get("supportedReasoningEfforts")
+                    .and_then(Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| {
+                                value
+                                    .get("reasoningEffort")
+                                    .and_then(Value::as_str)
+                                    .or_else(|| value.as_str())
+                                    .map(|entry| entry.to_string())
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if variants.is_empty() {
+                    variants = codex_variants();
+                }
+                variants.sort();
+                variants.dedup();
+
+                if default_model.is_none()
+                    && item
+                        .get("isDefault")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                {
+                    default_model = Some(model_id.to_string());
+                }
+
+                models.push(AgentModelInfo {
+                    id: model_id.to_string(),
+                    name,
+                    variants: Some(variants),
+                    default_variant,
+                });
+            }
+
+            let next_cursor = value
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(|value| value.to_string());
+            if next_cursor.is_none() {
+                break;
+            }
+            cursor = next_cursor;
+        }
+
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        if default_model.is_none() {
+            default_model = models.first().map(|model| model.id.clone());
+        }
+
+        Ok(AgentModelsResponse {
+            models,
+            default_model,
+        })
+    }
+
+    async fn fetch_opencode_models(&self) -> Result<AgentModelsResponse, SandboxError> {
+        let base_url = self.ensure_opencode_server().await?;
+        let endpoints = [
+            format!("{base_url}/config/providers"),
+            format!("{base_url}/provider"),
+        ];
+        for url in endpoints {
+            let response = self.http_client.get(&url).send().await;
+            let response = match response {
+                Ok(response) => response,
+                Err(_) => continue,
+            };
+            if !response.status().is_success() {
+                continue;
+            }
+            let value: Value = response
+                .json()
+                .await
+                .map_err(|err| SandboxError::StreamError {
+                    message: err.to_string(),
+                })?;
+            if let Some(models) = parse_opencode_models(&value) {
+                return Ok(models);
+            }
+        }
+        Err(SandboxError::StreamError {
+            message: "OpenCode models unavailable".to_string(),
+        })
+    }
+
+    async fn fetch_pi_models(&self) -> Result<AgentModelsResponse, SandboxError> {
+        let binary = self
+            .agent_manager
+            .resolve_binary(AgentId::Pi)
+            .map_err(|err| map_spawn_error(AgentId::Pi, err))?;
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || {
+                std::process::Command::new(binary)
+                    .arg("--list-models")
+                    .output()
+            }),
+        )
+        .await
+        .map_err(|_| SandboxError::StreamError {
+            message: "pi --list-models timed out".to_string(),
+        })?
+        .map_err(|err| SandboxError::StreamError {
+            message: err.to_string(),
+        })?
+        .map_err(|err| SandboxError::StreamError {
+            message: err.to_string(),
+        })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let message = if stderr.is_empty() {
+                format!("pi --list-models failed with status {}", output.status)
+            } else {
+                format!(
+                    "pi --list-models failed with status {}: {stderr}",
+                    output.status
+                )
+            };
+            return Err(SandboxError::StreamError { message });
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(parse_pi_models_output(&stdout))
+    }
+
+    async fn extract_credentials(&self) -> Result<ExtractedCredentials, SandboxError> {
+        tokio::task::spawn_blocking(move || {
+            let options = CredentialExtractionOptions::new();
+            extract_all_credentials(&options)
+        })
+        .await
+        .map_err(|err| SandboxError::StreamError {
+            message: err.to_string(),
         })
     }
 
@@ -4169,6 +4453,26 @@ pub struct AgentModesResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct AgentModelInfo {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variants: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_variant: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelsResponse {
+    pub models: Vec<AgentModelInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentCapabilities {
     // TODO: add agent-agnostic tests that cover every capability flag here.
     pub plan_mode: bool,
@@ -4188,6 +4492,7 @@ pub struct AgentCapabilities {
     pub mcp_tools: bool,
     pub streaming_deltas: bool,
     pub item_started: bool,
+    pub variants: bool,
     /// Whether this agent uses a shared long-running server process (vs per-turn subprocess)
     pub shared_process: bool,
 }
@@ -4421,21 +4726,45 @@ async fn get_agent_modes(
     Ok(Json(AgentModesResponse { modes }))
 }
 
-const SERVER_INFO: &str = "\
-This is a Sandbox Agent server. Available endpoints:\n\
-  - GET  /           - Server info\n\
-  - GET  /v1/health  - Health check\n\
-  - GET  /ui/        - Inspector UI\n\n\
-See https://sandboxagent.dev for API documentation.";
-
-async fn get_root() -> &'static str {
-    SERVER_INFO
+#[utoipa::path(
+    get,
+    path = "/v1/agents/{agent}/models",
+    responses(
+        (status = 200, body = AgentModelsResponse),
+        (status = 400, body = ProblemDetails)
+    ),
+    params(("agent" = String, Path, description = "Agent id")),
+    tag = "agents"
+)]
+async fn get_agent_models(
+    State(state): State<Arc<AppState>>,
+    Path(agent): Path<String>,
+) -> Result<Json<AgentModelsResponse>, ApiError> {
+    let agent_id = parse_agent_id(&agent)?;
+    let models = state.session_manager.agent_models(agent_id).await?;
+    Ok(Json(models))
 }
 
-async fn not_found() -> (StatusCode, String) {
+fn server_info(branding: BrandingMode) -> String {
+    format!(
+        "This is a {} server. Available endpoints:\n\
+         \x20 - GET  /           - Server info\n\
+         \x20 - GET  /v1/health  - Health check\n\
+         \x20 - GET  /ui/        - Inspector UI\n\n\
+         See {} for API documentation.",
+        branding.product_name(),
+        branding.docs_url(),
+    )
+}
+
+async fn get_root(State(state): State<Arc<AppState>>) -> String {
+    server_info(state.branding)
+}
+
+async fn not_found(State(state): State<Arc<AppState>>) -> (StatusCode, String) {
     (
         StatusCode::NOT_FOUND,
-        format!("404 Not Found\n\n{SERVER_INFO}"),
+        format!("404 Not Found\n\n{}", server_info(state.branding)),
     )
 }
 
@@ -4822,6 +5151,7 @@ fn agent_capabilities_for(agent: AgentId) -> AgentCapabilities {
             mcp_tools: false,
             streaming_deltas: true,
             item_started: false,
+            variants: false,
             shared_process: false, // per-turn subprocess with --resume
         },
         AgentId::Codex => AgentCapabilities {
@@ -4842,6 +5172,7 @@ fn agent_capabilities_for(agent: AgentId) -> AgentCapabilities {
             mcp_tools: true,
             streaming_deltas: true,
             item_started: true,
+            variants: true,
             shared_process: true, // shared app-server via JSON-RPC
         },
         AgentId::Opencode => AgentCapabilities {
@@ -4862,6 +5193,7 @@ fn agent_capabilities_for(agent: AgentId) -> AgentCapabilities {
             mcp_tools: false,
             streaming_deltas: true,
             item_started: true,
+            variants: true,
             shared_process: true, // shared HTTP server
         },
         AgentId::Amp => AgentCapabilities {
@@ -4882,6 +5214,7 @@ fn agent_capabilities_for(agent: AgentId) -> AgentCapabilities {
             mcp_tools: false,
             streaming_deltas: false,
             item_started: false,
+            variants: true,
             shared_process: false, // per-turn subprocess with --continue
         },
         AgentId::Pi => AgentCapabilities {
@@ -4902,7 +5235,8 @@ fn agent_capabilities_for(agent: AgentId) -> AgentCapabilities {
             mcp_tools: false,
             streaming_deltas: true,
             item_started: true,
-            shared_process: true, // shared stdio RPC
+            variants: false,
+            shared_process: false, // one dedicated rpc process per session
         },
         AgentId::Mock => AgentCapabilities {
             plan_mode: true,
@@ -4922,6 +5256,7 @@ fn agent_capabilities_for(agent: AgentId) -> AgentCapabilities {
             mcp_tools: true,
             streaming_deltas: true,
             item_started: true,
+            variants: false,
             shared_process: false, // in-memory mock (no subprocess)
         },
     }
@@ -4999,6 +5334,163 @@ fn agent_modes_for(agent: AgentId) -> Vec<AgentModeInfo> {
             },
         ],
     }
+}
+
+fn amp_models_response() -> AgentModelsResponse {
+    // NOTE: Amp models are hardcoded based on ampcode.com manual:
+    // - smart
+    // - rush
+    // - deep
+    // - free
+    let models = ["smart", "rush", "deep", "free"]
+        .into_iter()
+        .map(|id| AgentModelInfo {
+            id: id.to_string(),
+            name: None,
+            variants: Some(amp_variants()),
+            default_variant: Some("medium".to_string()),
+        })
+        .collect();
+    AgentModelsResponse {
+        models,
+        default_model: Some("smart".to_string()),
+    }
+}
+
+fn mock_models_response() -> AgentModelsResponse {
+    AgentModelsResponse {
+        models: vec![AgentModelInfo {
+            id: "mock".to_string(),
+            name: Some("Mock".to_string()),
+            variants: None,
+            default_variant: None,
+        }],
+        default_model: Some("mock".to_string()),
+    }
+}
+
+fn amp_variants() -> Vec<String> {
+    vec!["medium", "high", "xhigh"]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect()
+}
+
+fn codex_variants() -> Vec<String> {
+    vec!["none", "minimal", "low", "medium", "high", "xhigh"]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect()
+}
+
+fn parse_pi_models_output(output: &str) -> AgentModelsResponse {
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let mut parts = trimmed.split_whitespace();
+        let Some(provider) = parts.next() else {
+            continue;
+        };
+        let Some(model) = parts.next() else {
+            continue;
+        };
+
+        if provider.eq_ignore_ascii_case("provider") && model.eq_ignore_ascii_case("model") {
+            continue;
+        }
+        if provider.chars().all(|ch| ch == '-' || ch == '=')
+            && model.chars().all(|ch| ch == '-' || ch == '=')
+        {
+            continue;
+        }
+
+        let id = format!("{provider}/{model}");
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+
+        models.push(AgentModelInfo {
+            id,
+            name: None,
+            variants: None,
+            default_variant: None,
+        });
+    }
+
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+
+    AgentModelsResponse {
+        models,
+        default_model: None,
+    }
+}
+
+fn parse_opencode_models(value: &Value) -> Option<AgentModelsResponse> {
+    let providers = value
+        .get("providers")
+        .and_then(Value::as_array)
+        .or_else(|| value.get("all").and_then(Value::as_array))?;
+    let default_map = value
+        .get("default")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut models = Vec::new();
+    let mut provider_order = Vec::new();
+    for provider in providers {
+        let provider_id = provider.get("id").and_then(Value::as_str)?;
+        provider_order.push(provider_id.to_string());
+        let Some(model_map) = provider.get("models").and_then(Value::as_object) else {
+            continue;
+        };
+        for (key, model) in model_map {
+            let model_id = model
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or(key.as_str());
+            let name = model
+                .get("name")
+                .and_then(Value::as_str)
+                .map(|value| value.to_string());
+            let mut variants = model
+                .get("variants")
+                .and_then(Value::as_object)
+                .map(|map| map.keys().cloned().collect::<Vec<_>>());
+            if let Some(variants) = variants.as_mut() {
+                variants.sort();
+            }
+            models.push(AgentModelInfo {
+                id: format!("{provider_id}/{model_id}"),
+                name,
+                variants,
+                default_variant: None,
+            });
+        }
+    }
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let mut default_model = None;
+    for provider_id in provider_order {
+        if let Some(model_id) = default_map.get(&provider_id).and_then(Value::as_str) {
+            default_model = Some(format!("{provider_id}/{model_id}"));
+            break;
+        }
+    }
+    if default_model.is_none() {
+        default_model = models.first().map(|model| model.id.clone());
+    }
+
+    Some(AgentModelsResponse {
+        models,
+        default_model,
+    })
 }
 
 fn normalize_agent_mode(agent: AgentId, agent_mode: Option<&str>) -> Result<String, SandboxError> {
@@ -5313,6 +5805,7 @@ struct CodexAppServerState {
     next_id: i64,
     prompt: String,
     model: Option<String>,
+    effort: Option<codex_schema::ReasoningEffort>,
     cwd: Option<String>,
     approval_policy: Option<codex_schema::AskForApproval>,
     sandbox_mode: Option<codex_schema::SandboxMode>,
@@ -5337,6 +5830,7 @@ impl CodexAppServerState {
             next_id: 1,
             prompt,
             model: options.model.clone(),
+            effort: codex_effort_from_variant(options.variant.as_deref()),
             cwd,
             approval_policy: codex_approval_policy(options.permission_mode.as_deref()),
             sandbox_mode: codex_sandbox_mode(options.permission_mode.as_deref()),
@@ -5582,7 +6076,7 @@ impl CodexAppServerState {
             approval_policy: self.approval_policy,
             collaboration_mode: None,
             cwd: self.cwd.clone(),
-            effort: None,
+            effort: self.effort.clone(),
             input: vec![codex_schema::UserInput::Text {
                 text: self.prompt.clone(),
                 text_elements: Vec::new(),
@@ -5623,6 +6117,15 @@ fn codex_prompt_for_mode(prompt: &str, mode: Option<&str>) -> String {
         Some("plan") => format!("Make a plan before acting.\n\n{prompt}"),
         _ => prompt.to_string(),
     }
+}
+
+fn codex_effort_from_variant(variant: Option<&str>) -> Option<codex_schema::ReasoningEffort> {
+    let variant = variant?.trim();
+    if variant.is_empty() {
+        return None;
+    }
+    let normalized = variant.to_lowercase();
+    serde_json::from_value(Value::String(normalized)).ok()
 }
 
 fn codex_approval_policy(mode: Option<&str>) -> Option<codex_schema::AskForApproval> {
@@ -5925,28 +6428,6 @@ fn extract_opencode_session_id(value: &Value) -> Option<String> {
     None
 }
 
-fn extract_pi_session_id(value: &Value) -> Option<String> {
-    if let Some(id) = value.get("sessionId").and_then(Value::as_str) {
-        return Some(id.to_string());
-    }
-    if let Some(id) = value.get("session_id").and_then(Value::as_str) {
-        return Some(id.to_string());
-    }
-    if let Some(id) = extract_nested_string(value, &["session", "id"]) {
-        return Some(id);
-    }
-    if let Some(id) = extract_nested_string(value, &["message", "sessionId"]) {
-        return Some(id);
-    }
-    if let Some(id) = extract_nested_string(value, &["message", "session_id"]) {
-        return Some(id);
-    }
-    if let Some(id) = extract_nested_string(value, &["params", "sessionId"]) {
-        return Some(id);
-    }
-    None
-}
-
 fn extract_nested_string(value: &Value, path: &[&str]) -> Option<String> {
     let mut current = value;
     for key in path {
@@ -5957,6 +6438,314 @@ fn extract_nested_string(value: &Value, path: &[&str]) -> Option<String> {
         }
     }
     current.as_str().map(|s| s.to_string())
+}
+
+#[cfg(test)]
+mod pi_model_parser_tests {
+    use super::*;
+
+    #[test]
+    fn parse_pi_models_output_parses_rows_from_table() {
+        let output = r#"
+provider    model                          aliases
+openai      gpt-4.1                        gpt-4.1-latest
+anthropic   claude-sonnet-4-5-20250929    sonnet
+"#;
+
+        let parsed = parse_pi_models_output(output);
+        let ids = parsed
+            .models
+            .iter()
+            .map(|model| model.id.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ids,
+            vec!["anthropic/claude-sonnet-4-5-20250929", "openai/gpt-4.1"]
+        );
+        assert_eq!(parsed.default_model, None);
+    }
+
+    #[test]
+    fn parse_pi_models_output_skips_blank_header_separator_and_malformed_rows() {
+        let output = r#"
+provider model aliases
+-------- ----- -------
+
+openai
+malformed-row
+groq llama-3.3-70b-versatile alias
+"#;
+
+        let parsed = parse_pi_models_output(output);
+        let ids = parsed
+            .models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["groq/llama-3.3-70b-versatile"]);
+    }
+
+    #[test]
+    fn parse_pi_models_output_handles_model_ids_with_slashes() {
+        let output = "openrouter qwen/qwen3-32b";
+
+        let parsed = parse_pi_models_output(output);
+        let ids = parsed
+            .models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["openrouter/qwen/qwen3-32b"]);
+    }
+
+    #[test]
+    fn parse_pi_models_output_deduplicates_and_sorts_stably() {
+        let output = r#"
+zeta z-model
+alpha a-model
+zeta z-model
+beta b-model
+alpha a-model
+"#;
+
+        let parsed = parse_pi_models_output(output);
+        let ids = parsed
+            .models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["alpha/a-model", "beta/b-model", "zeta/z-model"]);
+        assert_eq!(parsed.default_model, None);
+    }
+}
+
+#[cfg(test)]
+mod pi_runtime_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn test_request(agent: AgentId) -> CreateSessionRequest {
+        CreateSessionRequest {
+            agent: agent.as_str().to_string(),
+            agent_mode: None,
+            permission_mode: Some("default".to_string()),
+            model: None,
+            variant: None,
+            agent_version: None,
+        }
+    }
+
+    #[test]
+    fn pi_model_args_with_provider_and_model() {
+        let mut command = std::process::Command::new("pi");
+        SessionManager::apply_pi_model_args(&mut command, Some("openai/gpt-5.2-codex"));
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            vec!["--provider", "openai", "--model", "gpt-5.2-codex"]
+        );
+    }
+
+    #[test]
+    fn pi_model_args_with_slashes_in_model_id() {
+        let mut command = std::process::Command::new("pi");
+        SessionManager::apply_pi_model_args(
+            &mut command,
+            Some("openrouter/meta-llama/llama-3.1-8b-instruct"),
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            vec![
+                "--provider",
+                "openrouter",
+                "--model",
+                "meta-llama/llama-3.1-8b-instruct"
+            ]
+        );
+    }
+
+    #[test]
+    fn pi_model_args_with_model_only() {
+        let mut command = std::process::Command::new("pi");
+        SessionManager::apply_pi_model_args(&mut command, Some("gpt-5.2-codex"));
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(args, vec!["--model", "gpt-5.2-codex"]);
+    }
+
+    async fn setup_pi_session(
+        session_id: &str,
+    ) -> (Arc<SessionManager>, Arc<PiSessionRuntime>, TempDir) {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let agent_manager = Arc::new(AgentManager::new(temp_dir.path()).expect("agent manager"));
+        let http_client = Client::builder().no_proxy().build().expect("http client");
+        let server_manager = Arc::new(AgentServerManager::new(
+            agent_manager.clone(),
+            http_client.clone(),
+            temp_dir.path().join("logs"),
+            false,
+        ));
+        let session_manager = Arc::new(SessionManager {
+            agent_manager,
+            sessions: Mutex::new(Vec::new()),
+            server_manager,
+            http_client,
+        });
+        session_manager
+            .server_manager
+            .set_owner(Arc::downgrade(&session_manager));
+
+        let (stdin_tx, _stdin_rx) = mpsc::unbounded_channel::<String>();
+        let runtime = Arc::new(PiSessionRuntime::new(
+            stdin_tx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+
+        let mut session = SessionState::new(
+            session_id.to_string(),
+            AgentId::Pi,
+            &test_request(AgentId::Pi),
+        )
+        .expect("session");
+        session.native_session_id = Some(format!("native-{session_id}"));
+        session.pi_runtime = Some(runtime.clone());
+        session_manager.sessions.lock().await.push(session);
+
+        (session_manager, runtime, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn pi_runtime_correlates_multiple_inflight_requests() {
+        let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
+        let runtime = PiSessionRuntime::new(stdin_tx, Arc::new(std::sync::Mutex::new(None)));
+
+        let id1 = runtime.next_request_id();
+        let id2 = runtime.next_request_id();
+        let rx1 = runtime
+            .send_request(id1, &json!({ "type": "one", "id": id1 }))
+            .expect("request 1");
+        let rx2 = runtime
+            .send_request(id2, &json!({ "type": "two", "id": id2 }))
+            .expect("request 2");
+
+        let line1 = stdin_rx.recv().await.expect("line1");
+        let line2 = stdin_rx.recv().await.expect("line2");
+        assert!(line1.contains("\"id\":1") || line2.contains("\"id\":1"));
+        assert!(line1.contains("\"id\":2") || line2.contains("\"id\":2"));
+
+        runtime.complete_request(id2, json!({ "type": "response", "id": id2, "ok": true }));
+        runtime.complete_request(id1, json!({ "type": "response", "id": id1, "ok": true }));
+
+        let result2 = rx2.await.expect("response 2");
+        let result1 = rx1.await.expect("response 1");
+        assert_eq!(result2.get("id").and_then(Value::as_i64), Some(id2));
+        assert_eq!(result1.get("id").and_then(Value::as_i64), Some(id1));
+    }
+
+    #[tokio::test]
+    async fn pi_runtime_output_non_json_emits_agent_unparsed() {
+        let (session_manager, runtime, _temp_dir) = setup_pi_session("pi-unparsed").await;
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        tx.send("not-json".to_string()).expect("send malformed");
+        drop(tx);
+
+        session_manager
+            .clone()
+            .handle_pi_runtime_output("pi-unparsed".to_string(), runtime, rx)
+            .await;
+
+        let events = session_manager
+            .events("pi-unparsed", 0, None, true)
+            .await
+            .expect("events")
+            .events;
+        assert!(events.iter().any(|event| {
+            event.event_type == UniversalEventType::AgentUnparsed
+                && matches!(event.source, EventSource::Daemon)
+                && event.synthetic
+        }));
+    }
+
+    #[tokio::test]
+    async fn pi_runtime_converter_continuity_for_incremental_deltas() {
+        let (session_manager, runtime, _temp_dir) = setup_pi_session("pi-delta").await;
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        let lines = [
+            json!({
+                "type": "message_update",
+                "assistantMessageEvent": { "type": "text_delta", "delta": "Hel" }
+            }),
+            json!({
+                "type": "message_update",
+                "assistantMessageEvent": { "type": "text_delta", "delta": "lo" }
+            }),
+            json!({
+                "type": "message_update",
+                "assistantMessageEvent": { "type": "done" }
+            }),
+        ];
+        for line in lines {
+            tx.send(line.to_string()).expect("send line");
+        }
+        drop(tx);
+
+        session_manager
+            .clone()
+            .handle_pi_runtime_output("pi-delta".to_string(), runtime, rx)
+            .await;
+
+        let events = session_manager
+            .events("pi-delta", 0, None, true)
+            .await
+            .expect("events")
+            .events;
+        let deltas = events
+            .iter()
+            .filter_map(|event| match &event.data {
+                UniversalEventData::ItemDelta(delta) => {
+                    Some((delta.item_id.clone(), delta.delta.clone()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[0].0, deltas[1].0, "deltas should share one item");
+        assert_eq!(deltas[0].1, "Hel");
+        assert_eq!(deltas[1].1, "lo");
+
+        let completed = events.iter().find_map(|event| match &event.data {
+            UniversalEventData::Item(item)
+                if event.event_type == UniversalEventType::ItemCompleted =>
+            {
+                Some(item.item.clone())
+            }
+            _ => None,
+        });
+        let completed = completed.expect("completed item");
+        assert_eq!(completed.kind, ItemKind::Message);
+        let text = completed
+            .content
+            .iter()
+            .find_map(|part| match part {
+                ContentPart::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert_eq!(text, "Hello");
+    }
 }
 
 #[cfg(feature = "test-utils")]
@@ -6121,7 +6910,7 @@ pub mod test_utils {
         }
 
         pub async fn shutdown(&self) {
-            self.session_manager.server_manager.shutdown().await;
+            self.session_manager.shutdown().await;
         }
 
         pub async fn server_status(&self, agent: AgentId) -> Option<ServerStatus> {
@@ -6337,7 +7126,26 @@ fn mock_command_conversions(prefix: &str, input: &str) -> Vec<EventConversion> {
     if trimmed.is_empty() {
         return vec![];
     }
+    let mut events = mock_command_events(prefix, trimmed);
+    if should_append_turn_completed(&events) {
+        events.push(turn_completed_event());
+    }
+    events
+}
 
+fn should_append_turn_completed(events: &[EventConversion]) -> bool {
+    let Some(last) = events.last() else {
+        return false;
+    };
+    !matches!(
+        last.event_type,
+        UniversalEventType::SessionEnded
+            | UniversalEventType::PermissionRequested
+            | UniversalEventType::QuestionRequested
+    )
+}
+
+fn mock_command_events(prefix: &str, trimmed: &str) -> Vec<EventConversion> {
     if trimmed.eq_ignore_ascii_case(MOCK_OK_PROMPT) {
         return mock_assistant_message(format!("{prefix}_ok"), "OK".to_string());
     }
@@ -7172,7 +7980,7 @@ fn stream_turn_events(
     })
 }
 
-fn is_turn_terminal(event: &UniversalEvent, agent: AgentId) -> bool {
+fn is_turn_terminal(event: &UniversalEvent, _agent: AgentId) -> bool {
     match event.event_type {
         UniversalEventType::SessionEnded
         | UniversalEventType::Error
@@ -7183,15 +7991,7 @@ fn is_turn_terminal(event: &UniversalEvent, agent: AgentId) -> bool {
             let UniversalEventData::Item(ItemEventData { item }) = &event.data else {
                 return false;
             };
-            if let Some(label) = status_label(item) {
-                if label == "turn.completed" || label == "session.idle" {
-                    return true;
-                }
-            }
-            if matches!(item.role, Some(ItemRole::Assistant)) && item.kind == ItemKind::Message {
-                return agent != AgentId::Codex;
-            }
-            false
+            matches!(status_label(item), Some("turn.completed" | "session.idle"))
         }
         _ => false,
     }
@@ -7246,4 +8046,35 @@ pub fn add_token_header(headers: &mut HeaderMap, token: &str) {
     if let Ok(header) = HeaderValue::from_str(&value) {
         headers.insert(axum::http::header::AUTHORIZATION, header);
     }
+}
+
+fn build_anthropic_headers(
+    credentials: &ProviderCredentials,
+) -> Result<reqwest::header::HeaderMap, SandboxError> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    match credentials.auth_type {
+        AuthType::ApiKey => {
+            let value =
+                reqwest::header::HeaderValue::from_str(&credentials.api_key).map_err(|_| {
+                    SandboxError::StreamError {
+                        message: "invalid anthropic api key header".to_string(),
+                    }
+                })?;
+            headers.insert("x-api-key", value);
+        }
+        AuthType::Oauth => {
+            let value = format!("Bearer {}", credentials.api_key);
+            let header = reqwest::header::HeaderValue::from_str(&value).map_err(|_| {
+                SandboxError::StreamError {
+                    message: "invalid anthropic oauth header".to_string(),
+                }
+            })?;
+            headers.insert(reqwest::header::AUTHORIZATION, header);
+        }
+    }
+    headers.insert(
+        "anthropic-version",
+        reqwest::header::HeaderValue::from_static(ANTHROPIC_VERSION),
+    );
+    Ok(headers)
 }

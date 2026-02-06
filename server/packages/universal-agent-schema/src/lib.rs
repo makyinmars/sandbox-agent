@@ -8,8 +8,8 @@ pub use sandbox_agent_extracted_agent_schemas::{amp, claude, codex, opencode, pi
 pub mod agents;
 
 pub use agents::{
-    amp as convert_amp, claude as convert_claude, codex as convert_codex, opencode as convert_opencode,
-    pi as convert_pi,
+    amp as convert_amp, claude as convert_claude, codex as convert_codex,
+    opencode as convert_opencode, pi as convert_pi,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ToSchema)]
@@ -315,6 +315,27 @@ impl EventConversion {
         self.source = source;
         self
     }
+}
+
+pub fn turn_completed_event() -> EventConversion {
+    EventConversion::new(
+        UniversalEventType::ItemCompleted,
+        UniversalEventData::Item(ItemEventData {
+            item: UniversalItem {
+                item_id: String::new(),
+                native_item_id: None,
+                parent_id: None,
+                kind: ItemKind::Status,
+                role: Some(ItemRole::System),
+                content: vec![ContentPart::Status {
+                    label: "turn.completed".to_string(),
+                    detail: None,
+                }],
+                status: ItemStatus::Completed,
+            },
+        }),
+    )
+    .synthetic()
 }
 
 pub fn item_from_text(role: ItemRole, text: String) -> UniversalItem {

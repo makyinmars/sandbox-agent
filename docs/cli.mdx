@@ -24,12 +24,13 @@ sandbox-agent server [OPTIONS]
 | `-A, --cors-allow-header <HEADER>` | all | CORS allowed header (repeatable) |
 | `-C, --cors-allow-credentials` | - | Enable CORS credentials |
 | `--no-telemetry` | - | Disable anonymous telemetry |
+| `--log-to-file` | - | Redirect server logs to a daily log file |
 
 ```bash
 sandbox-agent server --token "$TOKEN" --port 3000
 ```
 
-Server logs are redirected to a daily log file under the sandbox-agent data directory (for example, `~/.local/share/sandbox-agent/logs`). Override with `SANDBOX_AGENT_LOG_DIR`, or set `SANDBOX_AGENT_LOG_STDOUT=1` to keep logs on stdout/stderr.
+Server logs print to stdout/stderr by default. Use `--log-to-file` or `SANDBOX_AGENT_LOG_TO_FILE=1` to redirect logs to a daily log file under the sandbox-agent data directory (for example, `~/.local/share/sandbox-agent/logs`). Override the directory with `SANDBOX_AGENT_LOG_DIR`, or set `SANDBOX_AGENT_LOG_STDOUT=1` to force stdout/stderr.
 
 HTTP request logging is enabled by default. Control it with:
 - `SANDBOX_AGENT_LOG_HTTP=0` to disable request logs
@@ -57,7 +58,7 @@ sandbox-agent install-agent claude --reinstall
 
 ## OpenCode (Experimental)
 
-Start a sandbox-agent server and attach an OpenCode session (uses `opencode attach`):
+Start (or reuse) a sandbox-agent daemon and attach an OpenCode session (uses `opencode attach`):
 
 ```bash
 sandbox-agent opencode [OPTIONS]
@@ -76,7 +77,54 @@ sandbox-agent opencode [OPTIONS]
 sandbox-agent opencode --token "$TOKEN"
 ```
 
-Requires the `opencode` binary to be installed (or set `OPENCODE_BIN` / `--opencode-bin`).
+The daemon logs to a per-host log file under the sandbox-agent data directory (for example, `~/.local/share/sandbox-agent/daemon/daemon-127-0-0-1-2468.log`).
+
+Requires the `opencode` binary to be installed (or set `OPENCODE_BIN` / `--opencode-bin`). If it is not found on `PATH`, sandbox-agent installs it automatically.
+
+---
+
+## Daemon
+
+Manage the background daemon. See the [Daemon](/daemon) docs for details on lifecycle and auto-upgrade.
+
+### Start
+
+```bash
+sandbox-agent daemon start [OPTIONS]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-H, --host <HOST>` | `127.0.0.1` | Host to bind to |
+| `-p, --port <PORT>` | `2468` | Port to bind to |
+| `-t, --token <TOKEN>` | - | Authentication token |
+| `-n, --no-token` | - | Disable authentication |
+
+```bash
+sandbox-agent daemon start --no-token
+```
+
+### Stop
+
+```bash
+sandbox-agent daemon stop [OPTIONS]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-H, --host <HOST>` | `127.0.0.1` | Host of the daemon |
+| `-p, --port <PORT>` | `2468` | Port of the daemon |
+
+### Status
+
+```bash
+sandbox-agent daemon status [OPTIONS]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-H, --host <HOST>` | `127.0.0.1` | Host of the daemon |
+| `-p, --port <PORT>` | `2468` | Port of the daemon |
 
 ---
 
@@ -167,6 +215,16 @@ sandbox-agent api agents modes <AGENT>
 
 ```bash
 sandbox-agent api agents modes claude
+```
+
+#### Get Agent Models
+
+```bash
+sandbox-agent api agents models <AGENT>
+```
+
+```bash
+sandbox-agent api agents models claude
 ```
 
 ---
@@ -329,6 +387,7 @@ sandbox-agent api sessions reply-permission my-session perm1 --reply once
 | `api agents list` | `GET /v1/agents` |
 | `api agents install` | `POST /v1/agents/{agent}/install` |
 | `api agents modes` | `GET /v1/agents/{agent}/modes` |
+| `api agents models` | `GET /v1/agents/{agent}/models` |
 | `api sessions list` | `GET /v1/sessions` |
 | `api sessions create` | `POST /v1/sessions/{sessionId}` |
 | `api sessions send-message` | `POST /v1/sessions/{sessionId}/messages` |

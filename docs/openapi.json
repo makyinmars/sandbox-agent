@@ -10,7 +10,7 @@
     "license": {
       "name": "Apache-2.0"
     },
-    "version": "0.1.6-rc.1"
+    "version": "0.1.7"
   },
   "servers": [
     {
@@ -90,6 +90,47 @@
             }
           },
           "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/agents/{agent}/models": {
+      "get": {
+        "tags": [
+          "agents"
+        ],
+        "operationId": "get_agent_models",
+        "parameters": [
+          {
+            "name": "agent",
+            "in": "path",
+            "description": "Agent id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentModelsResponse"
+                }
+              }
+            }
+          },
+          "400": {
             "description": "",
             "content": {
               "application/json": {
@@ -669,6 +710,7 @@
           "mcpTools",
           "streamingDeltas",
           "itemStarted",
+          "variants",
           "sharedProcess"
         ],
         "properties": {
@@ -725,6 +767,9 @@
             "type": "boolean"
           },
           "toolResults": {
+            "type": "boolean"
+          },
+          "variants": {
             "type": "boolean"
           }
         }
@@ -829,6 +874,50 @@
           },
           "name": {
             "type": "string"
+          }
+        }
+      },
+      "AgentModelInfo": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "defaultVariant": {
+            "type": "string",
+            "nullable": true
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string",
+            "nullable": true
+          },
+          "variants": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "nullable": true
+          }
+        }
+      },
+      "AgentModelsResponse": {
+        "type": "object",
+        "required": [
+          "models"
+        ],
+        "properties": {
+          "defaultModel": {
+            "type": "string",
+            "nullable": true
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AgentModelInfo"
+            }
           }
         }
       },

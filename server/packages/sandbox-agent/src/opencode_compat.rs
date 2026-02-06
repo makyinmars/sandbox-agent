@@ -4,11 +4,12 @@
 //! stubbed responses with deterministic helpers for snapshot testing. A minimal
 //! in-memory state tracks sessions/messages/ptys to keep behavior coherent.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -23,7 +24,7 @@ use tokio::sync::{broadcast, Mutex};
 use tokio::time::interval;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
-use crate::router::{AppState, CreateSessionRequest, PermissionReply};
+use crate::router::{AgentModelInfo, AppState, CreateSessionRequest, PermissionReply};
 use sandbox_agent_agent_management::agents::AgentId;
 use sandbox_agent_error::SandboxError;
 use sandbox_agent_universal_agent_schema::{
@@ -37,10 +38,10 @@ static MESSAGE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static PART_COUNTER: AtomicU64 = AtomicU64::new(1);
 static PTY_COUNTER: AtomicU64 = AtomicU64::new(1);
 static PROJECT_COUNTER: AtomicU64 = AtomicU64::new(1);
-const OPENCODE_PROVIDER_ID: &str = "sandbox-agent";
-const OPENCODE_PROVIDER_NAME: &str = "Sandbox Agent";
 const OPENCODE_DEFAULT_MODEL_ID: &str = "mock";
+const OPENCODE_DEFAULT_PROVIDER_ID: &str = "mock";
 const OPENCODE_DEFAULT_AGENT_MODE: &str = "build";
+const OPENCODE_MODEL_CACHE_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 struct OpenCodeCompatConfig {
@@ -212,6 +213,30 @@ struct OpenCodeSessionRuntime {
     part_id_by_message: HashMap<String, String>,
     tool_part_by_call: HashMap<String, String>,
     tool_message_by_call: HashMap<String, String>,
+    /// Tool name by call_id, persisted from ToolCall for use in ToolResult events
+    tool_name_by_call: HashMap<String, String>,
+    /// Tool arguments by call_id, persisted from ToolCall for use in ToolResult events
+    tool_args_by_call: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
+struct OpenCodeModelEntry {
+    model: AgentModelInfo,
+    group_id: String,
+    group_name: String,
+}
+
+#[derive(Clone, Debug)]
+struct OpenCodeModelCache {
+    entries: Vec<OpenCodeModelEntry>,
+    model_lookup: HashMap<String, AgentId>,
+    group_defaults: HashMap<String, String>,
+    group_agents: HashMap<String, AgentId>,
+    group_names: HashMap<String, String>,
+    default_group: String,
+    default_model: String,
+    cached_at: Instant,
+    had_discovery_errors: bool,
 }
 
 pub struct OpenCodeState {
@@ -225,6 +250,7 @@ pub struct OpenCodeState {
     session_runtime: Mutex<HashMap<String, OpenCodeSessionRuntime>>,
     session_streams: Mutex<HashMap<String, bool>>,
     event_broadcaster: broadcast::Sender<Value>,
+    model_cache: Mutex<Option<OpenCodeModelCache>>,
 }
 
 impl OpenCodeState {
@@ -242,6 +268,7 @@ impl OpenCodeState {
             session_runtime: Mutex::new(HashMap::new()),
             session_streams: Mutex::new(HashMap::new()),
             event_broadcaster,
+            model_cache: Mutex::new(None),
         }
     }
 
@@ -371,13 +398,17 @@ async fn ensure_backing_session(
     state: &Arc<OpenCodeAppState>,
     session_id: &str,
     agent: &str,
+    model: Option<String>,
+    variant: Option<String>,
 ) -> Result<(), SandboxError> {
+    let model = model.filter(|value| !value.trim().is_empty());
+    let variant = variant.filter(|value| !value.trim().is_empty());
     let request = CreateSessionRequest {
         agent: agent.to_string(),
         agent_mode: None,
         permission_mode: None,
-        model: None,
-        variant: None,
+        model: model.clone(),
+        variant: variant.clone(),
         agent_version: None,
     };
     match state
@@ -387,7 +418,15 @@ async fn ensure_backing_session(
         .await
     {
         Ok(_) => Ok(()),
-        Err(SandboxError::SessionAlreadyExists { .. }) => Ok(()),
+        Err(SandboxError::SessionAlreadyExists { .. }) => state
+            .inner
+            .session_manager()
+            .set_session_overrides(session_id, model, variant)
+            .await
+            .or_else(|err| match err {
+                SandboxError::SessionNotFound { .. } => Ok(()),
+                other => Err(other),
+            }),
         Err(err) => Err(err),
     }
 }
@@ -587,12 +626,208 @@ fn default_agent_mode() -> &'static str {
     OPENCODE_DEFAULT_AGENT_MODE
 }
 
-fn resolve_agent_from_model(provider_id: &str, model_id: &str) -> Option<AgentId> {
-    if provider_id == OPENCODE_PROVIDER_ID {
-        AgentId::parse(model_id)
-    } else {
-        None
+async fn opencode_model_cache(state: &OpenCodeAppState) -> OpenCodeModelCache {
+    let previous_cache = {
+        let cache = state.opencode.model_cache.lock().await;
+        if let Some(cache) = cache.as_ref() {
+            if cache.cached_at.elapsed() < OPENCODE_MODEL_CACHE_TTL {
+                return cache.clone();
+            }
+            Some(cache.clone())
+        } else {
+            None
+        }
+    };
+
+    let mut cache = build_opencode_model_cache(state).await;
+    if let Some(previous_cache) = previous_cache {
+        if cache.had_discovery_errors
+            && cache.entries.is_empty()
+            && !previous_cache.entries.is_empty()
+        {
+            cache = previous_cache;
+            cache.cached_at = Instant::now();
+        }
     }
+    let mut slot = state.opencode.model_cache.lock().await;
+    *slot = Some(cache.clone());
+    cache
+}
+
+async fn build_opencode_model_cache(state: &OpenCodeAppState) -> OpenCodeModelCache {
+    let mut entries = Vec::new();
+    let mut model_lookup = HashMap::new();
+    let mut ambiguous_models = HashSet::new();
+    let mut group_defaults: HashMap<String, String> = HashMap::new();
+    let mut group_agents: HashMap<String, AgentId> = HashMap::new();
+    let mut group_names: HashMap<String, String> = HashMap::new();
+    let mut default_model: Option<String> = None;
+    let mut had_discovery_errors = false;
+
+    for agent in available_agent_ids() {
+        let response = match state.inner.session_manager().agent_models(agent).await {
+            Ok(response) => response,
+            Err(err) => {
+                had_discovery_errors = true;
+                let (group_id, group_name) = fallback_group_for_agent(agent);
+                group_agents.entry(group_id.clone()).or_insert(agent);
+                group_names.entry(group_id).or_insert(group_name);
+                tracing::warn!(
+                    target = "sandbox_agent::opencode",
+                    ?agent,
+                    ?err,
+                    "failed to discover models for OpenCode provider"
+                );
+                continue;
+            }
+        };
+
+        if response.models.is_empty() {
+            let (group_id, group_name) = fallback_group_for_agent(agent);
+            group_agents.entry(group_id.clone()).or_insert(agent);
+            group_names.entry(group_id).or_insert(group_name);
+        }
+
+        let first_model_id = response.models.first().map(|model| model.id.clone());
+        for model in response.models {
+            let model_id = model.id.clone();
+            let (group_id, group_name) = group_for_agent_model(agent, &model_id);
+
+            if response.default_model.as_deref() == Some(model_id.as_str()) {
+                group_defaults.insert(group_id.clone(), model_id.clone());
+            }
+
+            group_agents.entry(group_id.clone()).or_insert(agent);
+            group_names
+                .entry(group_id.clone())
+                .or_insert_with(|| group_name.clone());
+
+            if !ambiguous_models.contains(&model_id) {
+                match model_lookup.get(&model_id) {
+                    None => {
+                        model_lookup.insert(model_id.clone(), agent);
+                    }
+                    Some(existing) if *existing != agent => {
+                        model_lookup.remove(&model_id);
+                        ambiguous_models.insert(model_id.clone());
+                    }
+                    _ => {}
+                }
+            }
+
+            entries.push(OpenCodeModelEntry {
+                model,
+                group_id,
+                group_name,
+            });
+        }
+
+        if default_model.is_none() {
+            default_model = response.default_model.clone().or(first_model_id);
+        }
+    }
+
+    let mut groups: BTreeMap<String, Vec<&OpenCodeModelEntry>> = BTreeMap::new();
+    for entry in &entries {
+        groups
+            .entry(entry.group_id.clone())
+            .or_default()
+            .push(entry);
+    }
+    for entries in groups.values_mut() {
+        entries.sort_by(|a, b| a.model.id.cmp(&b.model.id));
+    }
+
+    if entries
+        .iter()
+        .any(|entry| entry.model.id == OPENCODE_DEFAULT_MODEL_ID)
+    {
+        default_model = Some(OPENCODE_DEFAULT_MODEL_ID.to_string());
+    }
+
+    let default_model = default_model.unwrap_or_else(|| {
+        entries
+            .first()
+            .map(|entry| entry.model.id.clone())
+            .unwrap_or_else(|| OPENCODE_DEFAULT_MODEL_ID.to_string())
+    });
+
+    let mut default_group = entries
+        .iter()
+        .find(|entry| entry.model.id == default_model)
+        .map(|entry| entry.group_id.clone())
+        .unwrap_or_else(|| OPENCODE_DEFAULT_PROVIDER_ID.to_string());
+
+    if !groups.contains_key(&default_group) {
+        if let Some((group_id, _)) = groups.iter().next() {
+            default_group = group_id.clone();
+        }
+    }
+
+    for (group_id, entries) in &groups {
+        if !group_defaults.contains_key(group_id) {
+            if let Some(entry) = entries.first() {
+                group_defaults.insert(group_id.clone(), entry.model.id.clone());
+            }
+        }
+    }
+
+    OpenCodeModelCache {
+        entries,
+        model_lookup,
+        group_defaults,
+        group_agents,
+        group_names,
+        default_group,
+        default_model,
+        cached_at: Instant::now(),
+        had_discovery_errors,
+    }
+}
+
+fn fallback_group_for_agent(agent: AgentId) -> (String, String) {
+    if agent == AgentId::Opencode {
+        return (
+            "opencode".to_string(),
+            agent_display_name(agent).to_string(),
+        );
+    }
+    (
+        agent.as_str().to_string(),
+        agent_display_name(agent).to_string(),
+    )
+}
+
+fn resolve_agent_from_model(
+    cache: &OpenCodeModelCache,
+    provider_id: &str,
+    model_id: &str,
+) -> Option<AgentId> {
+    if let Some(agent) = cache.group_agents.get(provider_id) {
+        return Some(*agent);
+    }
+    if let Some(agent) = cache.model_lookup.get(model_id) {
+        return Some(*agent);
+    }
+    if let Some(agent) = AgentId::parse(model_id) {
+        return Some(agent);
+    }
+    if opencode_group_provider(provider_id).is_some() {
+        return Some(AgentId::Opencode);
+    }
+    if model_id.contains('/') {
+        return Some(AgentId::Opencode);
+    }
+    if model_id.starts_with("claude-") {
+        return Some(AgentId::Claude);
+    }
+    if ["smart", "rush", "deep", "free"].contains(&model_id) {
+        return Some(AgentId::Amp);
+    }
+    if model_id.starts_with("gpt-") || model_id.starts_with('o') {
+        return Some(AgentId::Codex);
+    }
+    None
 }
 
 fn normalize_agent_mode(agent: Option<String>) -> String {
@@ -607,19 +842,38 @@ async fn resolve_session_agent(
     requested_provider: Option<&str>,
     requested_model: Option<&str>,
 ) -> (String, String, String) {
+    let cache = opencode_model_cache(state).await;
+    let default_model_id = cache.default_model.clone();
     let mut provider_id = requested_provider
         .filter(|value| !value.is_empty())
-        .unwrap_or(OPENCODE_PROVIDER_ID)
-        .to_string();
-    let mut model_id = requested_model
+        .filter(|value| *value != "sandbox-agent")
+        .map(|value| value.to_string());
+    let model_id = requested_model
         .filter(|value| !value.is_empty())
-        .unwrap_or(OPENCODE_DEFAULT_MODEL_ID)
-        .to_string();
-    let mut resolved_agent = resolve_agent_from_model(&provider_id, &model_id);
+        .map(|value| value.to_string());
+    if provider_id.is_none() {
+        if let Some(model_value) = model_id.as_deref() {
+            if let Some(entry) = cache
+                .entries
+                .iter()
+                .find(|entry| entry.model.id == model_value)
+            {
+                provider_id = Some(entry.group_id.clone());
+            } else if let Some(agent) = AgentId::parse(model_value) {
+                provider_id = Some(agent.as_str().to_string());
+            }
+        }
+    }
+    let mut provider_id = provider_id.unwrap_or_else(|| cache.default_group.clone());
+    let mut model_id = model_id
+        .or_else(|| cache.group_defaults.get(&provider_id).cloned())
+        .unwrap_or_else(|| default_model_id.clone());
+    let mut resolved_agent = resolve_agent_from_model(&cache, &provider_id, &model_id);
     if resolved_agent.is_none() {
-        provider_id = OPENCODE_PROVIDER_ID.to_string();
-        model_id = OPENCODE_DEFAULT_MODEL_ID.to_string();
-        resolved_agent = Some(default_agent_id());
+        provider_id = cache.default_group.clone();
+        model_id = default_model_id.clone();
+        resolved_agent = resolve_agent_from_model(&cache, &provider_id, &model_id)
+            .or_else(|| Some(default_agent_id()));
     }
 
     let mut resolved_agent_id: Option<String> = None;
@@ -650,7 +904,7 @@ async fn resolve_session_agent(
 
 fn agent_display_name(agent: AgentId) -> &'static str {
     match agent {
-        AgentId::Claude => "Claude",
+        AgentId::Claude => "Claude Code",
         AgentId::Codex => "Codex",
         AgentId::Opencode => "OpenCode",
         AgentId::Amp => "Amp",
@@ -659,17 +913,63 @@ fn agent_display_name(agent: AgentId) -> &'static str {
     }
 }
 
-fn model_config_entry(agent: AgentId) -> Value {
+fn opencode_model_provider(model_id: &str) -> Option<&str> {
+    model_id.split_once('/').map(|(provider, _)| provider)
+}
+
+fn opencode_group_provider(group_id: &str) -> Option<&str> {
+    group_id.strip_prefix("opencode:")
+}
+
+fn group_for_agent_model(agent: AgentId, model_id: &str) -> (String, String) {
+    if agent == AgentId::Opencode {
+        let provider = opencode_model_provider(model_id).unwrap_or("unknown");
+        return (
+            format!("opencode:{provider}"),
+            format!("OpenCode ({provider})"),
+        );
+    }
+    let group_id = agent.as_str().to_string();
+    let group_name = agent_display_name(agent).to_string();
+    (group_id, group_name)
+}
+
+fn backing_model_for_agent(agent: AgentId, provider_id: &str, model_id: &str) -> Option<String> {
+    if model_id.trim().is_empty() {
+        return None;
+    }
+    if AgentId::parse(model_id).is_some() {
+        return None;
+    }
+    if agent != AgentId::Opencode {
+        return Some(model_id.to_string());
+    }
+    if model_id.contains('/') {
+        return Some(model_id.to_string());
+    }
+    if let Some(provider) = opencode_group_provider(provider_id) {
+        return Some(format!("{provider}/{model_id}"));
+    }
+    Some(model_id.to_string())
+}
+
+fn model_config_entry(entry: &OpenCodeModelEntry) -> Value {
+    let model_name = entry
+        .model
+        .name
+        .clone()
+        .unwrap_or_else(|| entry.model.id.clone());
+    let variants = model_variants_object(&entry.model);
     json!({
-        "id": agent.as_str(),
-        "providerID": OPENCODE_PROVIDER_ID,
+        "id": entry.model.id,
+        "providerID": entry.group_id,
         "api": {
             "id": "sandbox-agent",
             "url": "http://localhost",
             "npm": "@sandbox-agent/sdk"
         },
-        "name": agent_display_name(agent),
-        "family": "sandbox-agent",
+        "name": model_name,
+        "family": entry.group_name,
         "capabilities": {
             "temperature": true,
             "reasoning": true,
@@ -704,14 +1004,21 @@ fn model_config_entry(agent: AgentId) -> Value {
         "options": {},
         "headers": {},
         "release_date": "2024-01-01",
-        "variants": {}
+        "variants": variants
     })
 }
 
-fn model_summary_entry(agent: AgentId) -> Value {
+fn model_summary_entry(entry: &OpenCodeModelEntry) -> Value {
+    let model_name = entry
+        .model
+        .name
+        .clone()
+        .unwrap_or_else(|| entry.model.id.clone());
+    let variants = model_variants_object(&entry.model);
     json!({
-        "id": agent.as_str(),
-        "name": agent_display_name(agent),
+        "id": entry.model.id,
+        "name": model_name,
+        "family": entry.group_name,
         "release_date": "2024-01-01",
         "attachment": false,
         "reasoning": true,
@@ -721,8 +1028,20 @@ fn model_summary_entry(agent: AgentId) -> Value {
         "limit": {
             "context": 128000,
             "output": 4096
-        }
+        },
+        "variants": variants
     })
+}
+
+fn model_variants_object(model: &AgentModelInfo) -> Value {
+    let Some(variants) = model.variants.as_ref() else {
+        return json!({});
+    };
+    let mut map = serde_json::Map::new();
+    for variant in variants {
+        map.insert(variant.clone(), json!({}));
+    }
+    Value::Object(map)
 }
 
 fn bad_request(message: &str) -> (StatusCode, Json<Value>) {
@@ -1296,6 +1615,25 @@ async fn apply_universal_event(state: Arc<OpenCodeAppState>, event: UniversalEve
     match event.event_type {
         UniversalEventType::ItemStarted | UniversalEventType::ItemCompleted => {
             if let UniversalEventData::Item(ItemEventData { item }) = &event.data {
+                // turn.completed or session.idle status → emit session.idle
+                if event.event_type == UniversalEventType::ItemCompleted
+                    && item.kind == ItemKind::Status
+                {
+                    if let Some(ContentPart::Status { label, .. }) = item.content.first() {
+                        if label == "turn.completed" || label == "session.idle" {
+                            let session_id = event.session_id.clone();
+                            state.opencode.emit_event(json!({
+                                "type": "session.status",
+                                "properties": {"sessionID": session_id, "status": {"type": "idle"}}
+                            }));
+                            state.opencode.emit_event(json!({
+                                "type": "session.idle",
+                                "properties": {"sessionID": session_id}
+                            }));
+                            return;
+                        }
+                    }
+                }
                 apply_item_event(state, event.clone(), item.clone()).await;
             }
         }
@@ -1540,7 +1878,7 @@ async fn apply_item_event(
     let provider_id = runtime
         .last_model_provider
         .clone()
-        .unwrap_or_else(|| OPENCODE_PROVIDER_ID.to_string());
+        .unwrap_or_else(|| OPENCODE_DEFAULT_PROVIDER_ID.to_string());
     let model_id = runtime
         .last_model_id
         .clone()
@@ -1587,25 +1925,48 @@ async fn apply_item_event(
             .entry(message_id.clone())
             .or_insert_with(|| format!("{}_text", message_id))
             .clone();
-        runtime
-            .text_by_message
-            .insert(message_id.clone(), text.clone());
-        let part = build_text_part_with_id(&session_id, &message_id, &part_id, &text);
-        upsert_message_part(&state.opencode, &session_id, &message_id, part.clone()).await;
-        state
-            .opencode
-            .emit_event(part_event("message.part.updated", &part));
-        let _ = state
-            .opencode
-            .update_runtime(&session_id, |runtime| {
-                runtime
-                    .text_by_message
-                    .insert(message_id.clone(), text.clone());
-                runtime
-                    .part_id_by_message
-                    .insert(message_id.clone(), part_id.clone());
-            })
-            .await;
+        if event.event_type == UniversalEventType::ItemStarted {
+            // For ItemStarted, only store the text in runtime as the initial value
+            // without emitting a part event. Deltas will handle streaming, and
+            // ItemCompleted will emit the final text part.
+            let _ = state
+                .opencode
+                .update_runtime(&session_id, |runtime| {
+                    runtime
+                        .text_by_message
+                        .insert(message_id.clone(), String::new());
+                    runtime
+                        .part_id_by_message
+                        .insert(message_id.clone(), part_id.clone());
+                })
+                .await;
+        } else {
+            // For ItemCompleted, emit the final text part with the complete text.
+            // Use the accumulated text from deltas if available, otherwise use
+            // the text from the completed event.
+            let final_text = runtime
+                .text_by_message
+                .get(&message_id)
+                .filter(|t| !t.is_empty())
+                .cloned()
+                .unwrap_or_else(|| text.clone());
+            let part = build_text_part_with_id(&session_id, &message_id, &part_id, &final_text);
+            upsert_message_part(&state.opencode, &session_id, &message_id, part.clone()).await;
+            state
+                .opencode
+                .emit_event(part_event("message.part.updated", &part));
+            let _ = state
+                .opencode
+                .update_runtime(&session_id, |runtime| {
+                    runtime
+                        .text_by_message
+                        .insert(message_id.clone(), final_text.clone());
+                    runtime
+                        .part_id_by_message
+                        .insert(message_id.clone(), part_id.clone());
+                })
+                .await;
+        }
     }
 
     for part in item.content.iter() {
@@ -1635,9 +1996,10 @@ async fn apply_item_event(
                     .entry(call_id.clone())
                     .or_insert_with(|| next_id("part_", &PART_COUNTER))
                     .clone();
+                let input_value = tool_input_from_arguments(Some(arguments.as_str()));
                 let state_value = json!({
                     "status": "pending",
-                    "input": {"arguments": arguments},
+                    "input": input_value,
                     "raw": arguments,
                 });
                 let tool_part = build_tool_part(
@@ -1662,6 +2024,12 @@ async fn apply_item_event(
                         runtime
                             .tool_message_by_call
                             .insert(call_id.clone(), message_id.clone());
+                        runtime
+                            .tool_name_by_call
+                            .insert(call_id.clone(), name.clone());
+                        runtime
+                            .tool_args_by_call
+                            .insert(call_id.clone(), arguments.clone());
                     })
                     .await;
             }
@@ -1671,9 +2039,26 @@ async fn apply_item_event(
                     .entry(call_id.clone())
                     .or_insert_with(|| next_id("part_", &PART_COUNTER))
                     .clone();
+                // Resolve tool name from stored ToolCall data
+                let tool_name = runtime
+                    .tool_name_by_call
+                    .get(call_id)
+                    .cloned()
+                    .unwrap_or_else(|| "tool".to_string());
+                // Resolve input from stored ToolCall arguments
+                let input_value = runtime
+                    .tool_args_by_call
+                    .get(call_id)
+                    .and_then(|args| {
+                        tool_input_from_arguments(Some(args.as_str()))
+                            .as_object()
+                            .cloned()
+                    })
+                    .map(Value::Object)
+                    .unwrap_or_else(|| json!({}));
                 let state_value = json!({
                     "status": "completed",
-                    "input": {},
+                    "input": input_value,
                     "output": output,
                     "title": "Tool result",
                     "metadata": {},
@@ -1685,7 +2070,7 @@ async fn apply_item_event(
                     &message_id,
                     &part_id,
                     call_id,
-                    "tool",
+                    &tool_name,
                     state_value,
                 );
                 upsert_message_part(&state.opencode, &session_id, &message_id, tool_part.clone())
@@ -1735,20 +2120,6 @@ async fn apply_item_event(
             }
             _ => {}
         }
-    }
-
-    if event.event_type == UniversalEventType::ItemCompleted {
-        state.opencode.emit_event(json!({
-            "type": "session.status",
-            "properties": {
-                "sessionID": session_id,
-                "status": {"type": "idle"}
-            }
-        }));
-        state.opencode.emit_event(json!({
-            "type": "session.idle",
-            "properties": { "sessionID": session_id }
-        }));
     }
 }
 
@@ -1821,7 +2192,7 @@ async fn apply_tool_item_event(
     let provider_id = runtime
         .last_model_provider
         .clone()
-        .unwrap_or_else(|| OPENCODE_PROVIDER_ID.to_string());
+        .unwrap_or_else(|| OPENCODE_DEFAULT_PROVIDER_ID.to_string());
     let model_id = runtime
         .last_model_id
         .clone()
@@ -1878,12 +2249,19 @@ async fn apply_tool_item_event(
         .get(&call_id)
         .cloned()
         .unwrap_or_else(|| next_id("part_", &PART_COUNTER));
+    // Resolve tool name: prefer current event's data, fall back to stored value from ToolCall
     let tool_name = tool_info
         .tool_name
         .clone()
+        .or_else(|| runtime.tool_name_by_call.get(&call_id).cloned())
         .unwrap_or_else(|| "tool".to_string());
-    let input_value = tool_input_from_arguments(tool_info.arguments.as_deref());
-    let raw_args = tool_info.arguments.clone().unwrap_or_default();
+    // Resolve arguments: prefer current event's data, fall back to stored value from ToolCall
+    let effective_arguments = tool_info
+        .arguments
+        .clone()
+        .or_else(|| runtime.tool_args_by_call.get(&call_id).cloned());
+    let input_value = tool_input_from_arguments(effective_arguments.as_deref());
+    let raw_args = effective_arguments.clone().unwrap_or_default();
     let output_value = tool_info
         .output
         .clone()
@@ -1911,7 +2289,7 @@ async fn apply_tool_item_event(
                     json!({
                         "status": "error",
                         "input": input_value,
-                        "error": output_value.unwrap_or_else(|| "Tool failed".to_string()),
+                        "output": output_value.unwrap_or_else(|| "Tool failed".to_string()),
                         "metadata": {},
                         "time": {"start": now, "end": now},
                     })
@@ -1963,6 +2341,17 @@ async fn apply_tool_item_event(
             runtime
                 .tool_message_by_call
                 .insert(call_id.clone(), message_id.clone());
+            // Persist tool name and arguments from ToolCall for later ToolResult events
+            if let Some(name) = tool_info.tool_name.as_ref() {
+                runtime
+                    .tool_name_by_call
+                    .insert(call_id.clone(), name.clone());
+            }
+            if let Some(args) = tool_info.arguments.as_ref() {
+                runtime
+                    .tool_args_by_call
+                    .insert(call_id.clone(), args.clone());
+            }
         })
         .await;
 }
@@ -2037,7 +2426,7 @@ async fn apply_item_delta(
     let provider_id = runtime
         .last_model_provider
         .clone()
-        .unwrap_or_else(|| OPENCODE_PROVIDER_ID.to_string());
+        .unwrap_or_else(|| OPENCODE_DEFAULT_PROVIDER_ID.to_string());
     let model_id = runtime
         .last_model_id
         .clone()
@@ -2070,9 +2459,11 @@ async fn apply_item_delta(
         .unwrap_or_else(|| format!("{}_text", message_id));
     let part = build_text_part_with_id(&session_id, &message_id, &part_id, &text);
     upsert_message_part(&state.opencode, &session_id, &message_id, part.clone()).await;
-    state
-        .opencode
-        .emit_event(part_event("message.part.updated", &part));
+    state.opencode.emit_event(part_event_with_delta(
+        "message.part.updated",
+        &part,
+        Some(&delta),
+    ));
     let _ = state
         .opencode
         .update_runtime(&session_id, |runtime| {
@@ -2238,9 +2629,10 @@ pub fn build_opencode_router(state: Arc<OpenCodeAppState>) -> Router {
     tag = "opencode"
 )]
 async fn oc_agent_list(State(state): State<Arc<OpenCodeAppState>>) -> impl IntoResponse {
+    let name = state.inner.branding.product_name();
     let agent = json!({
-        "name": OPENCODE_PROVIDER_NAME,
-        "description": "Sandbox Agent compatibility layer",
+        "name": name,
+        "description": format!("{name} compatibility layer"),
         "mode": "all",
         "native": false,
         "hidden": false,
@@ -2287,26 +2679,46 @@ async fn oc_config_patch(Json(body): Json<Value>) -> impl IntoResponse {
     responses((status = 200)),
     tag = "opencode"
 )]
-async fn oc_config_providers() -> impl IntoResponse {
-    let mut models = serde_json::Map::new();
-    for agent in available_agent_ids() {
-        models.insert(agent.as_str().to_string(), model_config_entry(agent));
+async fn oc_config_providers(State(state): State<Arc<OpenCodeAppState>>) -> impl IntoResponse {
+    let cache = opencode_model_cache(&state).await;
+    let mut grouped: BTreeMap<String, Vec<&OpenCodeModelEntry>> = BTreeMap::new();
+    for entry in &cache.entries {
+        grouped
+            .entry(entry.group_id.clone())
+            .or_default()
+            .push(entry);
+    }
+    for group_id in cache.group_names.keys() {
+        grouped.entry(group_id.clone()).or_default();
+    }
+    let mut providers = Vec::new();
+    let mut defaults = serde_json::Map::new();
+    for (group_id, entries) in grouped {
+        let mut models = serde_json::Map::new();
+        for entry in entries {
+            models.insert(entry.model.id.clone(), model_config_entry(entry));
+        }
+        let name = cache
+            .group_names
+            .get(&group_id)
+            .cloned()
+            .unwrap_or_else(|| group_id.clone());
+        providers.push(json!({
+            "id": group_id,
+            "name": name,
+            "source": "custom",
+            "env": [],
+            "key": "",
+            "options": {},
+            "models": Value::Object(models),
+        }));
+        if let Some(default_model) = cache.group_defaults.get(&group_id) {
+            defaults.insert(group_id, Value::String(default_model.clone()));
+        }
     }
     let providers = json!({
-        "providers": [
-            {
-                "id": OPENCODE_PROVIDER_ID,
-                "name": OPENCODE_PROVIDER_NAME,
-                "source": "custom",
-                "env": [],
-                "key": "",
-                "options": {},
-                "models": Value::Object(models),
-            }
-        ],
-        "default": {
-            OPENCODE_PROVIDER_ID: OPENCODE_DEFAULT_MODEL_ID
-        }
+        "providers": providers,
+        "default": Value::Object(defaults),
     });
     (StatusCode::OK, Json(providers))
 }
@@ -2957,6 +3369,9 @@ async fn oc_session_message_create(
         .and_then(|v| v.as_str());
     let (session_agent, provider_id, model_id) =
         resolve_session_agent(&state, &session_id, requested_provider, requested_model).await;
+    let session_agent_id = AgentId::parse(&session_agent).unwrap_or_else(default_agent_id);
+    let backing_model = backing_model_for_agent(session_agent_id, &provider_id, &model_id);
+    let backing_variant = body.variant.clone();
 
     let parts_input = body.parts.unwrap_or_default();
     if parts_input.is_empty() {
@@ -3020,7 +3435,15 @@ async fn oc_session_message_create(
         })
         .await;
 
-    if let Err(err) = ensure_backing_session(&state, &session_id, &session_agent).await {
+    if let Err(err) = ensure_backing_session(
+        &state,
+        &session_id,
+        &session_agent,
+        backing_model,
+        backing_variant,
+    )
+    .await
+    {
         tracing::warn!(
             target = "sandbox_agent::opencode",
             ?err,
@@ -3226,7 +3649,7 @@ async fn oc_session_command(
         &directory,
         &worktree,
         &agent,
-        OPENCODE_PROVIDER_ID,
+        OPENCODE_DEFAULT_PROVIDER_ID,
         OPENCODE_DEFAULT_MODEL_ID,
     );
 
@@ -3276,7 +3699,7 @@ async fn oc_session_shell(
             .as_ref()
             .and_then(|v| v.get("providerID"))
             .and_then(|v| v.as_str())
-            .unwrap_or(OPENCODE_PROVIDER_ID),
+            .unwrap_or(OPENCODE_DEFAULT_PROVIDER_ID),
         body.model
             .as_ref()
             .and_then(|v| v.get("modelID"))
@@ -3584,24 +4007,46 @@ async fn oc_question_reject(
     responses((status = 200)),
     tag = "opencode"
 )]
-async fn oc_provider_list() -> impl IntoResponse {
-    let mut models = serde_json::Map::new();
-    for agent in available_agent_ids() {
-        models.insert(agent.as_str().to_string(), model_summary_entry(agent));
+async fn oc_provider_list(State(state): State<Arc<OpenCodeAppState>>) -> impl IntoResponse {
+    let cache = opencode_model_cache(&state).await;
+    let mut grouped: BTreeMap<String, Vec<&OpenCodeModelEntry>> = BTreeMap::new();
+    for entry in &cache.entries {
+        grouped
+            .entry(entry.group_id.clone())
+            .or_default()
+            .push(entry);
+    }
+    for group_id in cache.group_names.keys() {
+        grouped.entry(group_id.clone()).or_default();
+    }
+    let mut providers = Vec::new();
+    let mut defaults = serde_json::Map::new();
+    let mut connected = Vec::new();
+    for (group_id, entries) in grouped {
+        let mut models = serde_json::Map::new();
+        for entry in entries {
+            models.insert(entry.model.id.clone(), model_summary_entry(entry));
+        }
+        let name = cache
+            .group_names
+            .get(&group_id)
+            .cloned()
+            .unwrap_or_else(|| group_id.clone());
+        providers.push(json!({
+            "id": group_id,
+            "name": name,
+            "env": [],
+            "models": Value::Object(models),
+        }));
+        if let Some(default_model) = cache.group_defaults.get(&group_id) {
+            defaults.insert(group_id.clone(), Value::String(default_model.clone()));
+        }
+        connected.push(group_id);
     }
     let providers = json!({
-        "all": [
-            {
-                "id": OPENCODE_PROVIDER_ID,
-                "name": OPENCODE_PROVIDER_NAME,
-                "env": [],
-                "models": Value::Object(models),
-            }
-        ],
-        "default": {
-            OPENCODE_PROVIDER_ID: OPENCODE_DEFAULT_MODEL_ID
-        },
-        "connected": [OPENCODE_PROVIDER_ID]
+        "all": providers,
+        "default": Value::Object(defaults),
+        "connected": connected
     });
     (StatusCode::OK, Json(providers))
 }
@@ -3612,11 +4057,13 @@ async fn oc_provider_list() -> impl IntoResponse {
     responses((status = 200)),
     tag = "opencode"
 )]
-async fn oc_provider_auth() -> impl IntoResponse {
-    let auth = json!({
-        OPENCODE_PROVIDER_ID: []
-    });
-    (StatusCode::OK, Json(auth))
+async fn oc_provider_auth(State(state): State<Arc<OpenCodeAppState>>) -> impl IntoResponse {
+    let cache = opencode_model_cache(&state).await;
+    let mut auth_map = serde_json::Map::new();
+    for group_id in cache.group_names.keys() {
+        auth_map.insert(group_id.clone(), json!([]));
+    }
+    (StatusCode::OK, Json(Value::Object(auth_map)))
 }
 
 #[utoipa::path(
