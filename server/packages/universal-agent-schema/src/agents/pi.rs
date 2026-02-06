@@ -21,6 +21,46 @@ pub struct PiEventConverter {
 }
 
 impl PiEventConverter {
+    pub fn event_value_to_universal(
+        &mut self,
+        raw: &Value,
+    ) -> Result<Vec<EventConversion>, String> {
+        let event_type = raw
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "missing event type".to_string())?;
+        let native_session_id = extract_session_id(raw);
+
+        let conversions = match event_type {
+            "message_start" => self.message_start(raw),
+            "message_update" => self.message_update(raw),
+            "message_end" => self.message_end(raw),
+            "tool_execution_start" => self.tool_execution_start(raw),
+            "tool_execution_update" => self.tool_execution_update(raw),
+            "tool_execution_end" => self.tool_execution_end(raw),
+            "agent_start"
+            | "agent_end"
+            | "turn_start"
+            | "turn_end"
+            | "auto_compaction"
+            | "auto_compaction_start"
+            | "auto_compaction_end"
+            | "auto_retry"
+            | "auto_retry_start"
+            | "auto_retry_end"
+            | "hook_error" => Ok(vec![status_event(event_type, raw)]),
+            "extension_ui_request" | "extension_ui_response" | "extension_error" => {
+                Ok(vec![status_event(event_type, raw)])
+            }
+            other => Err(format!("unsupported Pi event type: {other}")),
+        }?;
+
+        Ok(conversions
+            .into_iter()
+            .map(|conversion| attach_metadata(conversion, &native_session_id, raw))
+            .collect())
+    }
+
     fn next_synthetic_message_id(&mut self) -> String {
         self.message_counter += 1;
         format!("pi_msg_{}", self.message_counter)
@@ -72,40 +112,7 @@ impl PiEventConverter {
         event: &schema::RpcEvent,
     ) -> Result<Vec<EventConversion>, String> {
         let raw = serde_json::to_value(event).map_err(|err| err.to_string())?;
-        let event_type = raw
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "missing event type".to_string())?;
-        let native_session_id = extract_session_id(&raw);
-
-        let conversions = match event_type {
-            "message_start" => self.message_start(&raw),
-            "message_update" => self.message_update(&raw),
-            "message_end" => self.message_end(&raw),
-            "tool_execution_start" => self.tool_execution_start(&raw),
-            "tool_execution_update" => self.tool_execution_update(&raw),
-            "tool_execution_end" => self.tool_execution_end(&raw),
-            "agent_start"
-            | "agent_end"
-            | "turn_start"
-            | "turn_end"
-            | "auto_compaction"
-            | "auto_compaction_start"
-            | "auto_compaction_end"
-            | "auto_retry"
-            | "auto_retry_start"
-            | "auto_retry_end"
-            | "hook_error" => Ok(vec![status_event(event_type, &raw)]),
-            "extension_ui_request" | "extension_ui_response" | "extension_error" => {
-                Ok(vec![status_event(event_type, &raw)])
-            }
-            other => Err(format!("unsupported Pi event type: {other}")),
-        }?;
-
-        Ok(conversions
-            .into_iter()
-            .map(|conversion| attach_metadata(conversion, &native_session_id, &raw))
-            .collect())
+        self.event_value_to_universal(&raw)
     }
 
     fn message_start(&mut self, raw: &Value) -> Result<Vec<EventConversion>, String> {
@@ -265,6 +272,8 @@ impl PiEventConverter {
         message: Option<&Value>,
     ) -> EventConversion {
         let mut content = message.and_then(parse_message_content).unwrap_or_default();
+        let failed = message_is_failed(message);
+        let message_error_text = extract_message_error_text(message);
 
         if let Some(id) = message_id.clone() {
             if content.is_empty() {
@@ -292,6 +301,12 @@ impl PiEventConverter {
             self.message_started.remove(&id);
         }
 
+        if failed && content.is_empty() {
+            if let Some(text) = message_error_text {
+                content.push(ContentPart::Text { text });
+            }
+        }
+
         let item = UniversalItem {
             item_id: String::new(),
             native_item_id: message_id,
@@ -299,7 +314,11 @@ impl PiEventConverter {
             kind: ItemKind::Message,
             role: Some(ItemRole::Assistant),
             content,
-            status: ItemStatus::Completed,
+            status: if failed {
+                ItemStatus::Failed
+            } else {
+                ItemStatus::Completed
+            },
         };
         EventConversion::new(
             UniversalEventType::ItemCompleted,
@@ -432,6 +451,10 @@ impl PiEventConverter {
 
 pub fn event_to_universal(event: &schema::RpcEvent) -> Result<Vec<EventConversion>, String> {
     PiEventConverter::default().event_to_universal(event)
+}
+
+pub fn event_value_to_universal(raw: &Value) -> Result<Vec<EventConversion>, String> {
+    PiEventConverter::default().event_value_to_universal(raw)
 }
 
 fn attach_metadata(
@@ -582,6 +605,53 @@ fn parse_message_content(message: &Value) -> Option<Vec<ContentPart>> {
         _ => {}
     }
     Some(parts)
+}
+
+fn message_is_failed(message: Option<&Value>) -> bool {
+    message
+        .and_then(|value| {
+            value
+                .get("stopReason")
+                .or_else(|| value.get("stop_reason"))
+                .and_then(Value::as_str)
+        })
+        .is_some_and(|reason| reason == "error" || reason == "aborted")
+}
+
+fn extract_message_error_text(message: Option<&Value>) -> Option<String> {
+    let value = message?;
+
+    if let Some(text) = value
+        .get("errorMessage")
+        .or_else(|| value.get("error_message"))
+        .and_then(Value::as_str)
+    {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    let error = value.get("error")?;
+    if let Some(text) = error.as_str() {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(text) = error
+        .get("errorMessage")
+        .or_else(|| error.get("error_message"))
+        .or_else(|| error.get("message"))
+        .and_then(Value::as_str)
+    {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    None
 }
 
 fn content_part_from_value(value: &Value) -> Option<ContentPart> {

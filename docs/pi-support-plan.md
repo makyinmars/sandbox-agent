@@ -1,5 +1,15 @@
 # Pi Agent Support Plan (pi-mono)
 
+## Implementation Status Update
+
+- Runtime selection now supports two internal modes:
+  - `PerSession` (default for unknown/non-allowlisted Pi capabilities)
+  - `Shared` (allowlist-only compatibility path)
+- Pi sessions now use per-session process isolation by default, enabling true concurrent Pi sessions in Inspector and API clients.
+- Shared Pi server code remains available and is used only when capability checks allow multiplexing.
+- Session termination for per-session Pi mode hard-kills the underlying Pi process and clears queued prompts/pending waiters.
+- In-session concurrent sends are serialized with an unbounded daemon-side FIFO queue per session.
+
 ## Investigation Summary
 
 ### Pi CLI modes and RPC protocol

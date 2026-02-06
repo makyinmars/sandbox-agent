@@ -262,3 +262,46 @@ fn pi_message_done_completes_without_message_end() {
         panic!("expected item event");
     }
 }
+
+#[test]
+fn pi_message_end_error_surfaces_failed_status_and_error_text() {
+    let mut converter = PiEventConverter::default();
+
+    let start_event = parse_event(json!({
+        "type": "message_start",
+        "sessionId": "session-1",
+        "messageId": "msg-err",
+        "message": {
+            "role": "assistant",
+            "content": []
+        }
+    }));
+    let _ = converter
+        .event_to_universal(&start_event)
+        .expect("start conversions");
+
+    let end_raw = json!({
+        "type": "message_end",
+        "sessionId": "session-1",
+        "messageId": "msg-err",
+        "message": {
+            "role": "assistant",
+            "content": [],
+            "stopReason": "error",
+            "errorMessage": "Connection error."
+        }
+    });
+    let end_events = converter
+        .event_value_to_universal(&end_raw)
+        .expect("end conversions");
+
+    assert_eq!(end_events[0].event_type, UniversalEventType::ItemCompleted);
+    if let UniversalEventData::Item(item) = &end_events[0].data {
+        assert_eq!(item.item.status, ItemStatus::Failed);
+        assert!(
+            matches!(item.item.content.first(), Some(ContentPart::Text { text }) if text == "Connection error.")
+        );
+    } else {
+        panic!("expected item event");
+    }
+}
