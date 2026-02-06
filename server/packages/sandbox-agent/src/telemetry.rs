@@ -135,7 +135,12 @@ fn build_beacon_event(dt: i64) -> TelemetryEvent<BeaconData> {
     )
 }
 
-fn new_event<D: Serialize>(dt: i64, entity_type: &str, event_name: &str, data: D) -> TelemetryEvent<D> {
+fn new_event<D: Serialize>(
+    dt: i64,
+    entity_type: &str,
+    event_name: &str,
+    data: D,
+) -> TelemetryEvent<D> {
     let eid = load_or_create_id();
     TelemetryEvent {
         p: "sandbox-agent".to_string(),

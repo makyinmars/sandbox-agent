@@ -1,6 +1,6 @@
 use clap::Parser;
 use sandbox_agent::cli::{
-    CliConfig, CliError, Command, GigacodeCli, OpencodeArgs, init_logging, run_command,
+    init_logging, run_command, CliConfig, CliError, Command, GigacodeCli, OpencodeArgs,
 };
 
 fn main() {

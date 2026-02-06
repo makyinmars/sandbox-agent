@@ -11,12 +11,10 @@ use clap::{Args, Parser, Subcommand};
 mod build_version {
     include!(concat!(env!("OUT_DIR"), "/version.rs"));
 }
-use reqwest::blocking::Client as HttpClient;
-use reqwest::Method;
 use crate::router::{build_router_with_state, shutdown_servers};
 use crate::router::{
-    AgentInstallRequest, AppState, AuthConfig, BrandingMode, CreateSessionRequest,
-    MessageRequest, PermissionReply, PermissionReplyRequest, QuestionReplyRequest,
+    AgentInstallRequest, AppState, AuthConfig, BrandingMode, CreateSessionRequest, MessageRequest,
+    PermissionReply, PermissionReplyRequest, QuestionReplyRequest,
 };
 use crate::router::{
     AgentListResponse, AgentModelsResponse, AgentModesResponse, CreateSessionResponse,
@@ -25,6 +23,8 @@ use crate::router::{
 use crate::server_logs::ServerLogs;
 use crate::telemetry;
 use crate::ui;
+use reqwest::blocking::Client as HttpClient;
+use reqwest::Method;
 use sandbox_agent_agent_management::agents::{AgentId, AgentManager, InstallOptions};
 use sandbox_agent_agent_management::credentials::{
     extract_all_credentials, AuthType, CredentialExtractionOptions, ExtractedCredentials,
@@ -459,7 +459,11 @@ pub fn run_sandbox_agent() -> Result<(), CliError> {
         token,
         no_token,
     } = cli;
-    let config = CliConfig { token, no_token, gigacode: false };
+    let config = CliConfig {
+        token,
+        no_token,
+        gigacode: false,
+    };
     if let Err(err) = init_logging(&command) {
         eprintln!("failed to init logging: {err}");
         return Err(err);
@@ -585,7 +589,11 @@ fn run_api(command: &ApiCommand, cli: &CliConfig) -> Result<(), CliError> {
 }
 
 fn run_opencode(cli: &CliConfig, args: &OpencodeArgs) -> Result<(), CliError> {
-    let name = if cli.gigacode { "Gigacode" } else { "OpenCode command" };
+    let name = if cli.gigacode {
+        "Gigacode"
+    } else {
+        "OpenCode command"
+    };
     write_stderr_line(&format!("\nEXPERIMENTAL: Please report bugs to:\n- GitHub: https://github.com/rivet-dev/sandbox-agent/issues\n- Discord: https://rivet.dev/discord\n\n{name} is powered by:\n- OpenCode (TUI): https://opencode.ai/\n- Sandbox Agent SDK (multi-agent compatibility): https://sandboxagent.dev/\n\n"))?;
 
     let token = cli.token.clone();
@@ -628,12 +636,8 @@ fn run_opencode(cli: &CliConfig, args: &OpencodeArgs) -> Result<(), CliError> {
 fn run_daemon(command: &DaemonCommand, cli: &CliConfig) -> Result<(), CliError> {
     let token = cli.token.as_deref();
     match command {
-        DaemonCommand::Start(args) => {
-            crate::daemon::start(cli, &args.host, args.port, token)
-        }
-        DaemonCommand::Stop(args) => {
-            crate::daemon::stop(&args.host, args.port)
-        }
+        DaemonCommand::Start(args) => crate::daemon::start(cli, &args.host, args.port, token),
+        DaemonCommand::Stop(args) => crate::daemon::stop(&args.host, args.port),
         DaemonCommand::Status(args) => {
             let st = crate::daemon::status(&args.host, args.port, token)?;
             write_stderr_line(&st.to_string())?;
@@ -848,7 +852,10 @@ fn resolve_opencode_bin(explicit: Option<&PathBuf>) -> Result<PathBuf, CliError>
         return Ok(PathBuf::from(path));
     }
     if let Some(path) = find_in_path("opencode") {
-        write_stderr_line(&format!("using opencode binary from PATH: {}", path.display()))?;
+        write_stderr_line(&format!(
+            "using opencode binary from PATH: {}",
+            path.display()
+        ))?;
         return Ok(path);
     }
 

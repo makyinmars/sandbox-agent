@@ -414,17 +414,15 @@ async fn ensure_backing_session(
         .await
     {
         Ok(_) => Ok(()),
-        Err(SandboxError::SessionAlreadyExists { .. }) => {
-            state
-                .inner
-                .session_manager()
-                .set_session_overrides(session_id, model, variant)
-                .await
-                .or_else(|err| match err {
-                    SandboxError::SessionNotFound { .. } => Ok(()),
-                    other => Err(other),
-                })
-        }
+        Err(SandboxError::SessionAlreadyExists { .. }) => state
+            .inner
+            .session_manager()
+            .set_session_overrides(session_id, model, variant)
+            .await
+            .or_else(|err| match err {
+                SandboxError::SessionNotFound { .. } => Ok(()),
+                other => Err(other),
+            }),
         Err(err) => Err(err),
     }
 }
@@ -822,8 +820,8 @@ async fn resolve_session_agent(
     if resolved_agent.is_none() {
         provider_id = cache.default_group.clone();
         model_id = default_model_id.clone();
-        resolved_agent =
-            resolve_agent_from_model(&cache, &provider_id, &model_id).or_else(|| Some(default_agent_id()));
+        resolved_agent = resolve_agent_from_model(&cache, &provider_id, &model_id)
+            .or_else(|| Some(default_agent_id()));
     }
 
     let mut resolved_agent_id: Option<String> = None;
@@ -1998,7 +1996,11 @@ async fn apply_item_event(
                 let input_value = runtime
                     .tool_args_by_call
                     .get(call_id)
-                    .and_then(|args| tool_input_from_arguments(Some(args.as_str())).as_object().cloned())
+                    .and_then(|args| {
+                        tool_input_from_arguments(Some(args.as_str()))
+                            .as_object()
+                            .cloned()
+                    })
                     .map(Value::Object)
                     .unwrap_or_else(|| json!({}));
                 let state_value = json!({
@@ -2066,7 +2068,6 @@ async fn apply_item_event(
             _ => {}
         }
     }
-
 }
 
 async fn apply_tool_item_event(
@@ -2405,9 +2406,11 @@ async fn apply_item_delta(
         .unwrap_or_else(|| format!("{}_text", message_id));
     let part = build_text_part_with_id(&session_id, &message_id, &part_id, &text);
     upsert_message_part(&state.opencode, &session_id, &message_id, part.clone()).await;
-    state
-        .opencode
-        .emit_event(part_event_with_delta("message.part.updated", &part, Some(&delta)));
+    state.opencode.emit_event(part_event_with_delta(
+        "message.part.updated",
+        &part,
+        Some(&delta),
+    ));
     let _ = state
         .opencode
         .update_runtime(&session_id, |runtime| {
@@ -2623,9 +2626,7 @@ async fn oc_config_patch(Json(body): Json<Value>) -> impl IntoResponse {
     responses((status = 200)),
     tag = "opencode"
 )]
-async fn oc_config_providers(
-    State(state): State<Arc<OpenCodeAppState>>,
-) -> impl IntoResponse {
+async fn oc_config_providers(State(state): State<Arc<OpenCodeAppState>>) -> impl IntoResponse {
     let cache = opencode_model_cache(&state).await;
     let mut grouped: BTreeMap<String, Vec<&OpenCodeModelEntry>> = BTreeMap::new();
     for entry in &cache.entries {
@@ -3950,9 +3951,7 @@ async fn oc_question_reject(
     responses((status = 200)),
     tag = "opencode"
 )]
-async fn oc_provider_list(
-    State(state): State<Arc<OpenCodeAppState>>,
-) -> impl IntoResponse {
+async fn oc_provider_list(State(state): State<Arc<OpenCodeAppState>>) -> impl IntoResponse {
     let cache = opencode_model_cache(&state).await;
     let mut grouped: BTreeMap<String, Vec<&OpenCodeModelEntry>> = BTreeMap::new();
     for entry in &cache.entries {
@@ -3999,9 +3998,7 @@ async fn oc_provider_list(
     responses((status = 200)),
     tag = "opencode"
 )]
-async fn oc_provider_auth(
-    State(state): State<Arc<OpenCodeAppState>>,
-) -> impl IntoResponse {
+async fn oc_provider_auth(State(state): State<Arc<OpenCodeAppState>>) -> impl IntoResponse {
     let cache = opencode_model_cache(&state).await;
     let mut auth_map = serde_json::Map::new();
     for group_id in cache.group_names.keys() {

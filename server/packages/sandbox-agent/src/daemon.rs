@@ -309,12 +309,7 @@ pub fn status(host: &str, port: u16, token: Option<&str>) -> Result<DaemonStatus
     Ok(DaemonStatus::NotRunning)
 }
 
-pub fn start(
-    cli: &CliConfig,
-    host: &str,
-    port: u16,
-    token: Option<&str>,
-) -> Result<(), CliError> {
+pub fn start(cli: &CliConfig, host: &str, port: u16, token: Option<&str>) -> Result<(), CliError> {
     let base_url = format!("http://{host}:{port}");
     let pid_path = daemon_pid_path(host, port);
     let log_path = daemon_log_path(host, port);
@@ -451,9 +446,7 @@ pub fn ensure_running(
         // Check build version
         if !is_version_current(host, port) {
             let old = read_daemon_version(host, port).unwrap_or_else(|| "unknown".to_string());
-            eprintln!(
-                "daemon outdated (build {old} -> {BUILD_ID}), restarting..."
-            );
+            eprintln!("daemon outdated (build {old} -> {BUILD_ID}), restarting...");
             stop(host, port)?;
             return start(cli, host, port, token);
         }

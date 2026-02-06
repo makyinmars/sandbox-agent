@@ -91,7 +91,11 @@ impl AppState {
         Self::with_branding(auth, agent_manager, BrandingMode::default())
     }
 
-    pub fn with_branding(auth: AuthConfig, agent_manager: AgentManager, branding: BrandingMode) -> Self {
+    pub fn with_branding(
+        auth: AuthConfig,
+        agent_manager: AgentManager,
+        branding: BrandingMode,
+    ) -> Self {
         let agent_manager = Arc::new(agent_manager);
         let session_manager = Arc::new(SessionManager::new(agent_manager.clone()));
         session_manager
@@ -3392,11 +3396,12 @@ impl SessionManager {
                     "limit": null
                 }
             });
-            let rx = server
-                .send_request(id, &request)
-                .ok_or_else(|| SandboxError::StreamError {
-                    message: "failed to send model/list request".to_string(),
-                })?;
+            let rx =
+                server
+                    .send_request(id, &request)
+                    .ok_or_else(|| SandboxError::StreamError {
+                        message: "failed to send model/list request".to_string(),
+                    })?;
 
             let result = tokio::time::timeout(Duration::from_secs(30), rx).await;
             let value = match result {
@@ -4758,10 +4763,7 @@ fn parse_opencode_models(value: &Value) -> Option<AgentModelsResponse> {
 
     let mut default_model = None;
     for provider_id in provider_order {
-        if let Some(model_id) = default_map
-            .get(&provider_id)
-            .and_then(Value::as_str)
-        {
+        if let Some(model_id) = default_map.get(&provider_id).and_then(Value::as_str) {
             default_model = Some(format!("{provider_id}/{model_id}"));
             break;
         }
@@ -7017,20 +7019,19 @@ fn build_anthropic_headers(
         AuthType::ApiKey => {
             let value =
                 reqwest::header::HeaderValue::from_str(&credentials.api_key).map_err(|_| {
-                SandboxError::StreamError {
-                    message: "invalid anthropic api key header".to_string(),
-                }
-            })?;
+                    SandboxError::StreamError {
+                        message: "invalid anthropic api key header".to_string(),
+                    }
+                })?;
             headers.insert("x-api-key", value);
         }
         AuthType::Oauth => {
             let value = format!("Bearer {}", credentials.api_key);
-            let header =
-                reqwest::header::HeaderValue::from_str(&value).map_err(|_| {
-                    SandboxError::StreamError {
-                        message: "invalid anthropic oauth header".to_string(),
-                    }
-                })?;
+            let header = reqwest::header::HeaderValue::from_str(&value).map_err(|_| {
+                SandboxError::StreamError {
+                    message: "invalid anthropic oauth header".to_string(),
+                }
+            })?;
             headers.insert(reqwest::header::AUTHORIZATION, header);
         }
     }
