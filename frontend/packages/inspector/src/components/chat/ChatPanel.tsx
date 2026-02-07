@@ -28,6 +28,10 @@ const ChatPanel = ({
   permissionMode,
   model,
   variant,
+  modelDisabled,
+  variantDisabled,
+  modelHint,
+  variantHint,
   streamMode,
   activeModes,
   currentAgentVersion,
@@ -71,6 +75,10 @@ const ChatPanel = ({
   permissionMode: string;
   model: string;
   variant: string;
+  modelDisabled?: boolean;
+  variantDisabled?: boolean;
+  modelHint?: string | null;
+  variantHint?: string | null;
   streamMode: "poll" | "sse" | "turn";
   activeModes: AgentModeInfo[];
   currentAgentVersion?: string | null;
@@ -274,16 +282,20 @@ const ChatPanel = ({
         disabled={!sessionId || turnStreaming}
       />
 
-      <ChatSetup
-        agentMode={agentMode}
-        permissionMode={permissionMode}
-        model={model}
-        variant={variant}
-        activeModes={activeModes}
-        modesLoading={modesLoading}
-        modesError={modesError}
-        onAgentModeChange={onAgentModeChange}
-        onPermissionModeChange={onPermissionModeChange}
+        <ChatSetup
+          agentMode={agentMode}
+          permissionMode={permissionMode}
+          model={model}
+          variant={variant}
+          modelDisabled={modelDisabled}
+          variantDisabled={variantDisabled}
+          modelHint={modelHint}
+          variantHint={variantHint}
+          activeModes={activeModes}
+          modesLoading={modesLoading}
+          modesError={modesError}
+          onAgentModeChange={onAgentModeChange}
+          onPermissionModeChange={onPermissionModeChange}
         onModelChange={onModelChange}
         onVariantChange={onVariantChange}
         onSessionUpdate={onSessionUpdate}

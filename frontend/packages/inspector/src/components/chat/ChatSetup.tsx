@@ -7,6 +7,10 @@ const ChatSetup = ({
   variant,
   activeModes,
   hasSession,
+  modelDisabled,
+  variantDisabled,
+  modelHint,
+  variantHint,
   modesLoading,
   modesError,
   onAgentModeChange,
@@ -21,6 +25,10 @@ const ChatSetup = ({
   variant: string;
   activeModes: AgentModeInfo[];
   hasSession: boolean;
+  modelDisabled?: boolean;
+  variantDisabled?: boolean;
+  modelHint?: string | null;
+  variantHint?: string | null;
   modesLoading: boolean;
   modesError: string | null;
   onAgentModeChange: (value: string) => void;
@@ -80,8 +88,9 @@ const ChatSetup = ({
           onBlur={onSessionUpdate}
           placeholder="Model"
           title="Model"
-          disabled={!hasSession}
+          disabled={!hasSession || Boolean(modelDisabled)}
         />
+        {modelHint ? <span className="setup-hint">{modelHint}</span> : null}
       </div>
 
       <div className="setup-field">
@@ -93,8 +102,9 @@ const ChatSetup = ({
           onBlur={onSessionUpdate}
           placeholder="Variant"
           title="Variant"
-          disabled={!hasSession}
+          disabled={!hasSession || Boolean(variantDisabled)}
         />
+        {variantHint ? <span className="setup-hint">{variantHint}</span> : null}
       </div>
     </div>
   );

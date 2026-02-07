@@ -399,17 +399,30 @@ export default function App() {
     const selectedSession = sessions.find((session) => session.sessionId === sessionId);
     if (!selectedSession) return;
 
+    const sessionAgent = selectedSession.agent;
+    const modelUpdateLocked =
+      (sessionAgent === "claude" || sessionAgent === "amp") &&
+      Boolean(selectedSession.nativeSessionId);
+    const variantUpdateDisabled = sessionAgent !== "opencode" && sessionAgent !== "mock";
     const currentModel = selectedSession.model ?? "";
     const currentVariant = selectedSession.variant ?? "";
     const body: { model?: string; variant?: string } = {};
 
-    if (!model) {
+    if (modelUpdateLocked) {
+      if (model !== currentModel) {
+        setModel(currentModel);
+      }
+    } else if (!model) {
       if (currentModel) setModel(currentModel);
     } else if (model !== currentModel) {
       body.model = model;
     }
 
-    if (!variant) {
+    if (variantUpdateDisabled) {
+      if (variant !== currentVariant) {
+        setVariant(currentVariant);
+      }
+    } else if (!variant) {
       if (currentVariant) setVariant(currentVariant);
     } else if (variant !== currentVariant) {
       body.variant = variant;
@@ -431,6 +444,8 @@ export default function App() {
       setSessionError(null);
     } catch (error) {
       setSessionError(getErrorMessage(error, "Unable to update session"));
+      setModel(currentModel);
+      setVariant(currentVariant);
     }
   }, [getClient, getErrorMessage, model, sessionId, sessions, variant]);
 
@@ -876,6 +891,17 @@ export default function App() {
   const activeModes = modesByAgent[agentId] ?? [];
   const modesLoading = modesLoadingByAgent[agentId] ?? false;
   const modesError = modesErrorByAgent[agentId] ?? null;
+  const hasSession = Boolean(sessionId);
+  const selectedSession = sessions.find((session) => session.sessionId === sessionId);
+  const sessionAgentId = selectedSession?.agent ?? agentId;
+  const modelUpdateLocked =
+    (sessionAgentId === "claude" || sessionAgentId === "amp") &&
+    Boolean(selectedSession?.nativeSessionId);
+  const variantUpdateDisabled = sessionAgentId !== "opencode" && sessionAgentId !== "mock";
+  const modelHint =
+    hasSession && modelUpdateLocked ? "Model locked after session start for Claude/Amp." : null;
+  const variantHint =
+    hasSession && variantUpdateDisabled ? "Variant supported only for OpenCode." : null;
   const agentDisplayNames: Record<string, string> = {
     claude: "Claude Code",
     codex: "Codex",
@@ -976,6 +1002,10 @@ export default function App() {
           permissionMode={permissionMode}
           model={model}
           variant={variant}
+          modelDisabled={modelUpdateLocked}
+          variantDisabled={variantUpdateDisabled}
+          modelHint={modelHint}
+          variantHint={variantHint}
           streamMode={streamMode}
           activeModes={activeModes}
           currentAgentVersion={currentAgent?.version ?? null}
@@ -989,7 +1019,7 @@ export default function App() {
           onStreamModeChange={setStreamMode}
           onToggleStream={toggleStream}
           onEndSession={endSession}
-          hasSession={Boolean(sessionId)}
+          hasSession={hasSession}
           eventError={eventError}
           questionRequests={questionRequests}
           permissionRequests={permissionRequests}

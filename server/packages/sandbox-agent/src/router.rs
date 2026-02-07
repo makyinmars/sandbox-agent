@@ -1605,11 +1605,23 @@ impl SessionManager {
             }
         })?;
 
+        if request.variant.is_some() && !agent_supports_variant(session.agent) {
+            return Err(SandboxError::InvalidRequest {
+                message: "variant updates are only supported for OpenCode".to_string(),
+            });
+        }
+        if request.model.is_some()
+            && session.native_session_id.is_some()
+            && !agent_allows_model_update_after_start(session.agent)
+        {
+            return Err(SandboxError::InvalidRequest {
+                message: "model updates are not supported after session start for Claude or Amp"
+                    .to_string(),
+            });
+        }
+
         if let Some(model) = request.model {
             session.model = Some(model);
-            if matches!(session.agent, AgentId::Claude | AgentId::Amp) {
-                session.native_session_id = None;
-            }
         }
         if let Some(variant) = request.variant {
             session.variant = Some(variant);
@@ -4019,6 +4031,14 @@ fn agent_supports_resume(agent: AgentId) -> bool {
         agent,
         AgentId::Claude | AgentId::Amp | AgentId::Opencode | AgentId::Codex
     )
+}
+
+fn agent_supports_variant(agent: AgentId) -> bool {
+    matches!(agent, AgentId::Opencode | AgentId::Mock)
+}
+
+fn agent_allows_model_update_after_start(agent: AgentId) -> bool {
+    !matches!(agent, AgentId::Claude | AgentId::Amp)
 }
 
 fn agent_supports_item_started(agent: AgentId) -> bool {
