@@ -3796,10 +3796,20 @@ async fn oc_session_create(
 async fn oc_session_list(State(state): State<Arc<OpenCodeAppState>>) -> impl IntoResponse {
     let sessions = state.inner.session_manager().list_sessions().await;
     let project_id = &state.opencode.default_project_id;
-    let values: Vec<Value> = sessions
+    let mut values: Vec<Value> = sessions
         .iter()
         .map(|s| session_info_to_opencode_value(s, project_id))
         .collect();
+    let mut seen_session_ids: HashSet<String> = sessions
+        .iter()
+        .map(|session| session.session_id.clone())
+        .collect();
+    let compat_sessions = state.opencode.sessions.lock().await;
+    for (session_id, session) in compat_sessions.iter() {
+        if seen_session_ids.insert(session_id.clone()) {
+            values.push(session.to_value());
+        }
+    }
     (StatusCode::OK, Json(json!(values)))
 }
 
@@ -3828,6 +3838,10 @@ async fn oc_session_get(
             Json(session_info_to_opencode_value(&info, project_id)),
         )
             .into_response();
+    }
+    let sessions = state.opencode.sessions.lock().await;
+    if let Some(session) = sessions.get(&session_id) {
+        return (StatusCode::OK, Json(session.to_value())).into_response();
     }
     not_found("Session not found").into_response()
 }

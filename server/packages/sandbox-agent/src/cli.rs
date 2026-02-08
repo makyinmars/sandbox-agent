@@ -620,14 +620,20 @@ fn run_opencode(cli: &CliConfig, args: &OpencodeArgs) -> Result<(), CliError> {
     crate::daemon::ensure_running(cli, &args.host, args.port, token.as_deref())?;
     write_stderr_line("gigacode startup: daemon is healthy")?;
 
-    write_stderr_line("gigacode startup: creating OpenCode session via /opencode/session")?;
-    let session_id = create_opencode_session(
-        &base_url,
-        token.as_deref(),
-        args.session_title.as_deref(),
-        yolo,
-    )?;
-    write_stdout_line(&format!("OpenCode session: {session_id}"))?;
+    let attach_session_id = if args.session_title.is_some() || yolo {
+        write_stderr_line("gigacode startup: creating OpenCode session via /opencode/session")?;
+        let session_id = create_opencode_session(
+            &base_url,
+            token.as_deref(),
+            args.session_title.as_deref(),
+            yolo,
+        )?;
+        write_stdout_line(&format!("OpenCode session: {session_id}"))?;
+        Some(session_id)
+    } else {
+        write_stderr_line("gigacode startup: attaching OpenCode without precreating a session")?;
+        None
+    };
 
     let attach_url = format!("{base_url}/opencode");
     write_stderr_line("gigacode startup: resolving OpenCode binary (installing if needed)")?;
@@ -640,11 +646,12 @@ fn run_opencode(cli: &CliConfig, args: &OpencodeArgs) -> Result<(), CliError> {
     opencode_cmd
         .arg("attach")
         .arg(&attach_url)
-        .arg("--session")
-        .arg(&session_id)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    if let Some(session_id) = attach_session_id.as_deref() {
+        opencode_cmd.arg("--session").arg(session_id);
+    }
     if let Some(token) = token.as_deref() {
         opencode_cmd.arg("--password").arg(token);
     }

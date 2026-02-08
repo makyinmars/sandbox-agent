@@ -291,6 +291,41 @@ describe("OpenCode-compatible Session API", () => {
       expect(response.data?.title).toBe("Test");
     });
 
+    it("should keep session.get available during first prompt after /new-style creation", async () => {
+      const providers = await getProvidersViaHttp();
+      const providerId = providers.connected.find(
+        (provider) => provider !== "mock" && typeof providers.default?.[provider] === "string"
+      );
+      if (!providerId) {
+        return;
+      }
+      const modelId = providers.default?.[providerId];
+      if (!modelId) {
+        return;
+      }
+
+      const created = await client.session.create({ body: { title: "Race Repro" } });
+      const sessionId = created.data?.id!;
+      expect(sessionId).toBeDefined();
+
+      const promptPromise = client.session.prompt({
+        path: { id: sessionId },
+        body: {
+          model: { providerID: providerId, modelID: modelId },
+          parts: [{ type: "text", text: "hello after /new" }],
+        },
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 25));
+
+      const getDuringPrompt = await client.session.get({ path: { id: sessionId } });
+      expect(getDuringPrompt.error).toBeUndefined();
+      expect(getDuringPrompt.data?.id).toBe(sessionId);
+
+      // Best-effort settle; this assertion focuses on availability during the in-flight turn.
+      await promptPromise;
+    });
+
     it("should return error for non-existent session", async () => {
       const response = await client.session.get({
         path: { id: "non-existent-session-id" },
