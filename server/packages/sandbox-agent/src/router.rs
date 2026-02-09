@@ -1,22 +1,23 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
-use std::io::{BufRead, BufReader, Write};
+use std::fs;
+use std::io::{BufRead, BufReader, Cursor, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
-use std::process::Stdio;
+use std::path::{Path as StdPath, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::sse::Event;
 use axum::response::{IntoResponse, Response, Sse};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Json;
 use axum::Router;
-use base64::Engine;
 use futures::{stream, StreamExt};
 use reqwest::Client;
 use sandbox_agent_error::{AgentError, ErrorType, ProblemDetails, SandboxError};
@@ -31,18 +32,20 @@ use sandbox_agent_universal_agent_schema::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::sync::futures::OwnedNotified;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify};
 use tokio::time::sleep;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::trace::TraceLayer;
+use base64::Engine;
+use tar::Archive;
+use toml_edit::{value, Array, DocumentMut, Item, Table};
 use tracing::Span;
 use utoipa::{Modify, OpenApi, ToSchema};
 
 use crate::agent_server_logs::AgentServerLogs;
 use crate::opencode_compat::{build_opencode_router, OpenCodeAppState};
-use crate::telemetry;
 use crate::ui;
 use sandbox_agent_agent_management::agents::{
     AgentError as ManagerError, AgentId, AgentManager, InstallOptions, SpawnOptions, StreamingSpawn,
@@ -57,6 +60,7 @@ static USER_MESSAGE_COUNTER: AtomicU64 = AtomicU64::new(1);
 const ANTHROPIC_MODELS_URL: &str = "https://api.anthropic.com/v1/models?beta=true";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const CODEX_MODEL_LIST_TIMEOUT_SECS: u64 = 10;
+const SKILL_ROOTS: [&str; 3] = [".agents/skills", ".claude/skills", ".opencode/skill"];
 
 fn claude_fallback_models() -> AgentModelsResponse {
     // Claude Code accepts model aliases: default, sonnet, opus, haiku
@@ -120,12 +124,12 @@ pub struct AppState {
     auth: AuthConfig,
     agent_manager: Arc<AgentManager>,
     session_manager: Arc<SessionManager>,
-    pub branding: BrandingMode,
+    pub(crate) branding: BrandingMode,
 }
 
 impl AppState {
     pub fn new(auth: AuthConfig, agent_manager: AgentManager) -> Self {
-        Self::with_branding(auth, agent_manager, BrandingMode::default())
+        Self::with_branding(auth, agent_manager, BrandingMode::SandboxAgent)
     }
 
     pub fn with_branding(
@@ -203,6 +207,13 @@ pub fn build_router_with_state(shared: Arc<AppState>) -> (Router, Arc<AppState>)
             "/sessions/:session_id/permissions/:permission_id/reply",
             post(reply_permission),
         )
+        .route("/fs/entries", get(fs_entries))
+        .route("/fs/file", get(fs_read_file).put(fs_write_file))
+        .route("/fs/entry", delete(fs_delete_entry))
+        .route("/fs/mkdir", post(fs_mkdir))
+        .route("/fs/move", post(fs_move))
+        .route("/fs/stat", get(fs_stat))
+        .route("/fs/upload-batch", post(fs_upload_batch))
         .with_state(shared.clone());
 
     if shared.auth.token.is_some() {
@@ -226,15 +237,12 @@ pub fn build_router_with_state(shared: Arc<AppState>) -> (Router, Arc<AppState>)
         ));
     }
 
-    let root_router = Router::new()
+    let mut router = Router::new()
         .route("/", get(get_root))
-        .fallback(not_found)
-        .with_state(shared.clone());
-
-    let mut router = root_router
         .nest("/v1", v1_router)
         .nest("/opencode", opencode_router)
-        .merge(opencode_root_router);
+        .merge(opencode_root_router)
+        .fallback(not_found);
 
     router = router.merge(ui::router());
 
@@ -308,7 +316,15 @@ pub async fn shutdown_servers(state: &Arc<AppState>) {
         get_events_sse,
         reply_question,
         reject_question,
-        reply_permission
+        reply_permission,
+        fs_entries,
+        fs_read_file,
+        fs_write_file,
+        fs_delete_entry,
+        fs_mkdir,
+        fs_move,
+        fs_stat,
+        fs_upload_batch
     ),
     components(
         schemas(
@@ -326,8 +342,29 @@ pub async fn shutdown_servers(state: &Arc<AppState>) {
             SessionListResponse,
             HealthResponse,
             CreateSessionRequest,
+            SkillsConfig,
+            SkillSource,
+            McpCommand,
+            McpRemoteTransport,
+            McpOAuthConfig,
+            McpOAuthConfigOrDisabled,
+            McpServerConfig,
             CreateSessionResponse,
+            FsPathQuery,
+            FsEntriesQuery,
+            FsSessionQuery,
+            FsDeleteQuery,
+            FsUploadBatchQuery,
+            FsEntryType,
+            FsEntry,
+            FsStat,
+            FsWriteResponse,
+            FsMoveRequest,
+            FsMoveResponse,
+            FsActionResponse,
+            FsUploadBatchResponse,
             MessageRequest,
+            MessageAttachment,
             EventsQuery,
             TurnStreamQuery,
             EventsResponse,
@@ -368,7 +405,8 @@ pub async fn shutdown_servers(state: &Arc<AppState>) {
     tags(
         (name = "meta", description = "Service metadata"),
         (name = "agents", description = "Agent management"),
-        (name = "sessions", description = "Session management")
+        (name = "sessions", description = "Session management"),
+        (name = "fs", description = "Filesystem operations")
     ),
     modifiers(&ServerAddon)
 )]
@@ -407,6 +445,7 @@ struct SessionState {
     permission_mode: String,
     model: Option<String>,
     variant: Option<String>,
+    working_dir: PathBuf,
     native_session_id: Option<String>,
     ended: bool,
     ended_exit_code: Option<i32>,
@@ -436,6 +475,8 @@ struct SessionState {
     updated_at: i64,
     directory: Option<String>,
     title: Option<String>,
+    mcp: Option<BTreeMap<String, McpServerConfig>>,
+    skills: Option<SkillsConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -462,6 +503,9 @@ impl SessionState {
             request.permission_mode.as_deref(),
         )?;
         let (broadcaster, _rx) = broadcast::channel(256);
+        let working_dir = std::env::current_dir().map_err(|err| SandboxError::StreamError {
+            message: err.to_string(),
+        })?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -474,6 +518,7 @@ impl SessionState {
             permission_mode,
             model: request.model.clone(),
             variant: request.variant.clone(),
+            working_dir,
             native_session_id: None,
             ended: false,
             ended_exit_code: None,
@@ -503,6 +548,8 @@ impl SessionState {
             updated_at: now,
             directory: request.directory.clone(),
             title: request.title.clone(),
+            mcp: request.mcp.clone(),
+            skills: request.skills.clone(),
         })
     }
 
@@ -1759,6 +1806,33 @@ impl SessionManager {
             .find(|session| session.session_id == session_id)
     }
 
+    async fn session_working_dir(&self, session_id: &str) -> Result<PathBuf, SandboxError> {
+        let sessions = self.sessions.lock().await;
+        let session = Self::session_ref(&sessions, session_id).ok_or_else(|| {
+            SandboxError::SessionNotFound {
+                session_id: session_id.to_string(),
+            }
+        })?;
+        Ok(session.working_dir.clone())
+    }
+
+    pub(crate) async fn set_session_overrides(
+        &self,
+        session_id: &str,
+        model: Option<String>,
+        variant: Option<String>,
+    ) -> Result<(), SandboxError> {
+        let mut sessions = self.sessions.lock().await;
+        let session = Self::session_mut(&mut sessions, session_id).ok_or_else(|| {
+            SandboxError::SessionNotFound {
+                session_id: session_id.to_string(),
+            }
+        })?;
+        session.model = model;
+        session.variant = variant;
+        Ok(())
+    }
+
     /// Read agent stderr for error diagnostics
     fn read_agent_stderr(&self, agent: AgentId) -> Option<StderrOutput> {
         let logs = AgentServerLogs::new(self.server_manager.log_base_dir.clone(), agent.as_str());
@@ -1802,6 +1876,40 @@ impl SessionManager {
             install_result.map_err(|err| map_install_error(agent_id, err))?;
         }
 
+        let skill_dirs = if let Some(skills) = &request.skills {
+            let sources = skills.sources.clone();
+            Some(
+                tokio::task::spawn_blocking(move || install_skill_sources(&sources))
+                    .await
+                    .map_err(|err| SandboxError::StreamError {
+                        message: err.to_string(),
+                    })??,
+            )
+        } else {
+            None
+        };
+
+        if let Some(mcp) = &request.mcp {
+            self.apply_mcp_config(agent_id, mcp).await?;
+        }
+
+        if agent_id == AgentId::Opencode {
+            if let Some(skill_dirs) = skill_dirs.as_ref() {
+                self.apply_opencode_skills(skill_dirs).await?;
+            }
+        }
+
+        // Resolve default model if none was explicitly provided
+        let request = if request.model.is_none() {
+            let mut request = request;
+            if let Ok(models_response) = self.agent_models(agent_id).await {
+                request.model = models_response.default_model;
+            }
+            request
+        } else {
+            request
+        };
+
         let mut session = SessionState::new(session_id.clone(), agent_id, &request)?;
         if agent_id == AgentId::Opencode {
             let opencode_session_id = self.create_opencode_session().await?;
@@ -1825,9 +1933,6 @@ impl SessionManager {
             session.native_session_id = Some(format!("mock-{session_id}"));
         }
 
-        let telemetry_agent = request.agent.clone();
-        let telemetry_model = request.model.clone();
-        let telemetry_variant = request.variant.clone();
         let metadata = json!({
             "agent": request.agent,
             "agentMode": session.agent_mode,
@@ -1857,8 +1962,6 @@ impl SessionManager {
         }
 
         let native_session_id = session.native_session_id.clone();
-        let telemetry_agent_mode = session.agent_mode.clone();
-        let telemetry_permission_mode = session.permission_mode.clone();
         let mut sessions = self.sessions.lock().await;
         sessions.push(session);
         drop(sessions);
@@ -1872,14 +1975,6 @@ impl SessionManager {
             self.ensure_opencode_stream(session_id).await?;
         }
 
-        telemetry::log_session_created(telemetry::SessionConfig {
-            agent: telemetry_agent,
-            agent_mode: Some(telemetry_agent_mode),
-            permission_mode: Some(telemetry_permission_mode),
-            model: telemetry_model,
-            variant: telemetry_variant,
-        });
-
         Ok(CreateSessionResponse {
             healthy: true,
             error: None,
@@ -1887,25 +1982,94 @@ impl SessionManager {
         })
     }
 
-    pub(crate) async fn set_session_overrides(
-        &self,
-        session_id: &str,
-        model: Option<String>,
-        variant: Option<String>,
+    async fn apply_mcp_config(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        mcp: &BTreeMap<String, McpServerConfig>,
     ) -> Result<(), SandboxError> {
-        let mut sessions = self.sessions.lock().await;
-        let Some(session) = SessionManager::session_mut(&mut sessions, session_id) else {
-            return Err(SandboxError::SessionNotFound {
-                session_id: session_id.to_string(),
-            });
-        };
-        if let Some(model) = model {
-            session.model = Some(model);
+        if mcp.is_empty() {
+            return Ok(());
         }
-        if let Some(variant) = variant {
-            session.variant = Some(variant);
+        match agent_id {
+            AgentId::Claude => {
+                let mcp = mcp.clone();
+                tokio::task::spawn_blocking(move || write_claude_mcp_config(&mcp))
+                    .await
+                    .map_err(|err| SandboxError::StreamError {
+                        message: err.to_string(),
+                    })??;
+                Ok(())
+            }
+            AgentId::Codex => {
+                let mcp = mcp.clone();
+                tokio::task::spawn_blocking(move || write_codex_mcp_config(&mcp))
+                    .await
+                    .map_err(|err| SandboxError::StreamError {
+                        message: err.to_string(),
+                    })??;
+                let server = self.ensure_codex_server().await?;
+                self.reload_codex_mcp(&server).await
+            }
+            AgentId::Opencode => self.apply_opencode_mcp(mcp).await,
+            AgentId::Amp => {
+                let agent_manager = self.agent_manager.clone();
+                let mcp = mcp.clone();
+                tokio::task::spawn_blocking(move || apply_amp_mcp_config(&agent_manager, &mcp))
+                    .await
+                    .map_err(|err| SandboxError::StreamError {
+                        message: err.to_string(),
+                    })??;
+                Ok(())
+            }
+            AgentId::Mock => Ok(()),
         }
-        Ok(())
+    }
+
+    async fn apply_opencode_skills(&self, skill_dirs: &[PathBuf]) -> Result<(), SandboxError> {
+        if skill_dirs.is_empty() {
+            return Ok(());
+        }
+        let base_url = self.ensure_opencode_server().await?;
+        let url = format!("{base_url}/config");
+        let response = self.http_client.get(&url).send().await;
+        let mut existing_paths = Vec::<String>::new();
+        if let Ok(response) = response {
+            if response.status().is_success() {
+                if let Ok(value) = response.json::<Value>().await {
+                    if let Some(paths) = value
+                        .get("skills")
+                        .and_then(|skills| skills.get("paths"))
+                        .and_then(Value::as_array)
+                    {
+                        existing_paths.extend(
+                            paths
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(|path| path.to_string()),
+                        );
+                    }
+                }
+            }
+        }
+        let mut merged = existing_paths;
+        for dir in skill_dirs {
+            let path = dir.to_string_lossy().to_string();
+            if !merged.contains(&path) {
+                merged.push(path);
+            }
+        }
+        let body = json!({ "skills": { "paths": merged } });
+        let response = self.http_client.patch(&url).json(&body).send().await;
+        let response = response.map_err(|err| SandboxError::StreamError {
+            message: err.to_string(),
+        })?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(SandboxError::StreamError {
+                message: format!("OpenCode config update failed: {}", response.status()),
+            })
+        }
     }
 
     pub(crate) async fn set_session_title(
@@ -2104,9 +2268,16 @@ impl SessionManager {
         self: &Arc<Self>,
         session_id: String,
         message: String,
+        attachments: Vec<MessageAttachment>,
     ) -> Result<(), SandboxError> {
         // Use allow_ended=true and do explicit check to allow resumable agents
         let session_snapshot = self.session_snapshot_for_message(&session_id).await?;
+        let prompt_with_attachments = format_message_with_attachments(&message, &attachments);
+        let prompt = if session_snapshot.agent == AgentId::Opencode {
+            message.clone()
+        } else {
+            prompt_with_attachments
+        };
         if !agent_emits_turn_started(session_snapshot.agent) {
             let _ = self
                 .record_conversions(
@@ -2116,17 +2287,17 @@ impl SessionManager {
                 .await;
         }
         if session_snapshot.agent == AgentId::Mock {
-            self.send_mock_message(session_id, message).await?;
+            self.send_mock_message(session_id, prompt).await?;
             return Ok(());
         }
         if matches!(session_snapshot.agent, AgentId::Claude | AgentId::Amp) {
             let _ = self
-                .record_conversions(&session_id, user_message_conversions(&message))
+                .record_conversions(&session_id, user_message_conversions(&prompt))
                 .await;
         }
         if session_snapshot.agent == AgentId::Opencode {
             self.ensure_opencode_stream(session_id.clone()).await?;
-            self.send_opencode_prompt(&session_snapshot, &message)
+            self.send_opencode_prompt(&session_snapshot, &prompt, &attachments)
                 .await?;
             if !agent_supports_item_started(session_snapshot.agent) {
                 let _ = self
@@ -2137,7 +2308,7 @@ impl SessionManager {
         }
         if session_snapshot.agent == AgentId::Codex {
             // Use the shared Codex app-server
-            self.send_codex_turn(&session_snapshot, &message).await?;
+            self.send_codex_turn(&session_snapshot, &prompt).await?;
             if !agent_supports_item_started(session_snapshot.agent) {
                 let _ = self
                     .emit_synthetic_assistant_start(&session_snapshot.session_id)
@@ -2150,7 +2321,6 @@ impl SessionManager {
         self.reopen_session_if_ended(&session_id).await;
 
         let manager = self.agent_manager.clone();
-        let prompt = message;
         let initial_input = if session_snapshot.agent == AgentId::Claude {
             Some(claude_user_message_line(&session_snapshot, &prompt))
         } else {
@@ -2309,27 +2479,17 @@ impl SessionManager {
         sessions
             .iter()
             .rev()
-            .map(|state| SessionInfo {
-                session_id: state.session_id.clone(),
-                agent: state.agent.as_str().to_string(),
-                agent_mode: state.agent_mode.clone(),
-                permission_mode: state.permission_mode.clone(),
-                model: state.model.clone(),
-                variant: state.variant.clone(),
-                native_session_id: state.native_session_id.clone(),
-                ended: state.ended,
-                event_count: state.events.len() as u64,
-                created_at: state.created_at,
-                updated_at: state.updated_at,
-                directory: state.directory.clone(),
-                title: state.title.clone(),
-            })
+            .map(|state| Self::build_session_info(state))
             .collect()
     }
 
     pub(crate) async fn get_session_info(&self, session_id: &str) -> Option<SessionInfo> {
         let sessions = self.sessions.lock().await;
-        Self::session_ref(&sessions, session_id).map(|state| SessionInfo {
+        Self::session_ref(&sessions, session_id).map(Self::build_session_info)
+    }
+
+    fn build_session_info(state: &SessionState) -> SessionInfo {
+        SessionInfo {
             session_id: state.session_id.clone(),
             agent: state.agent.as_str().to_string(),
             agent_mode: state.agent_mode.clone(),
@@ -2343,7 +2503,9 @@ impl SessionManager {
             updated_at: state.updated_at,
             directory: state.directory.clone(),
             title: state.title.clone(),
-        })
+            mcp: state.mcp.clone(),
+            skills: state.skills.clone(),
+        }
     }
 
     pub(crate) async fn subscribe(
@@ -3799,6 +3961,29 @@ impl SessionManager {
         }
     }
 
+    async fn reload_codex_mcp(&self, server: &CodexServer) -> Result<(), SandboxError> {
+        let id = server.next_request_id();
+        let request = codex_schema::ClientRequest::ConfigMcpServerReload {
+            id: codex_schema::RequestId::from(id),
+            params: (),
+        };
+        let rx = server
+            .send_request(id, &request)
+            .ok_or_else(|| SandboxError::StreamError {
+                message: "failed to send config/mcpServer/reload request".to_string(),
+            })?;
+        let result = tokio::time::timeout(Duration::from_secs(15), rx).await;
+        match result {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(_)) => Err(SandboxError::StreamError {
+                message: "config/mcpServer/reload request cancelled".to_string(),
+            }),
+            Err(_) => Err(SandboxError::StreamError {
+                message: "config/mcpServer/reload request timed out".to_string(),
+            }),
+        }
+    }
+
     /// Creates a new Codex thread/session via the shared app-server.
     async fn create_codex_thread(
         self: &Arc<Self>,
@@ -3879,7 +4064,7 @@ impl SessionManager {
             approval_policy: codex_approval_policy(Some(&session.permission_mode)),
             collaboration_mode: None,
             cwd: None,
-            effort: codex_effort_from_variant(session.variant.as_deref()),
+            effort: None,
             input: vec![codex_schema::UserInput::Text {
                 text: prompt_text,
                 text_elements: Vec::new(),
@@ -4146,31 +4331,6 @@ impl SessionManager {
                     .get("displayName")
                     .and_then(Value::as_str)
                     .map(|value| value.to_string());
-                let default_variant = item
-                    .get("defaultReasoningEffort")
-                    .and_then(Value::as_str)
-                    .map(|value| value.to_string());
-                let mut variants: Vec<String> = item
-                    .get("supportedReasoningEfforts")
-                    .and_then(Value::as_array)
-                    .map(|values| {
-                        values
-                            .iter()
-                            .filter_map(|value| {
-                                value
-                                    .get("reasoningEffort")
-                                    .and_then(Value::as_str)
-                                    .or_else(|| value.as_str())
-                                    .map(|entry| entry.to_string())
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                if variants.is_empty() {
-                    variants = codex_variants();
-                }
-                variants.sort();
-                variants.dedup();
 
                 if default_model.is_none()
                     && item
@@ -4184,8 +4344,8 @@ impl SessionManager {
                 models.push(AgentModelInfo {
                     id: model_id.to_string(),
                     name,
-                    variants: Some(variants),
-                    default_variant,
+                    variants: None,
+                    default_variant: None,
                 });
             }
 
@@ -4334,10 +4494,52 @@ impl SessionManager {
         })
     }
 
+    async fn apply_opencode_mcp(
+        &self,
+        mcp: &BTreeMap<String, McpServerConfig>,
+    ) -> Result<(), SandboxError> {
+        if mcp.is_empty() {
+            return Ok(());
+        }
+        let base_url = self.ensure_opencode_server().await?;
+        let url = format!("{base_url}/mcp");
+        let mut existing = HashSet::new();
+        if let Ok(response) = self.http_client.get(&url).send().await {
+            if response.status().is_success() {
+                if let Ok(value) = response.json::<Value>().await {
+                    if let Some(map) = value.as_object() {
+                        for key in map.keys() {
+                            existing.insert(key.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        for (name, config) in mcp {
+            if existing.contains(name) {
+                continue;
+            }
+            let config_value = opencode_mcp_config(config)?;
+            let body = json!({ "name": name, "config": config_value });
+            let response = self.http_client.post(&url).json(&body).send().await;
+            let response = response.map_err(|err| SandboxError::StreamError {
+                message: err.to_string(),
+            })?;
+            if !response.status().is_success() {
+                return Err(SandboxError::StreamError {
+                    message: format!("OpenCode MCP add failed: {}", response.status()),
+                });
+            }
+        }
+        Ok(())
+    }
+
     async fn send_opencode_prompt(
         &self,
         session: &SessionSnapshot,
         prompt: &str,
+        attachments: &[MessageAttachment],
     ) -> Result<(), SandboxError> {
         let base_url = self.ensure_opencode_server().await?;
         let session_id =
@@ -4348,9 +4550,13 @@ impl SessionManager {
                     message: "missing OpenCode session id".to_string(),
                 })?;
         let url = format!("{base_url}/session/{session_id}/prompt");
+        let mut parts = vec![json!({ "type": "text", "text": prompt })];
+        for attachment in attachments {
+            parts.push(opencode_file_part_input(attachment));
+        }
         let mut body = json!({
             "agent": session.agent_mode.clone(),
-            "parts": [{ "type": "text", "text": prompt }]
+            "parts": parts
         });
         if let Some(model) = session.model.as_deref() {
             if let Some((provider, model_id)) = model.split_once('/') {
@@ -4556,12 +4762,6 @@ pub struct AgentModeInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct AgentModesResponse {
-    pub modes: Vec<AgentModeInfo>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct AgentModelInfo {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4578,6 +4778,12 @@ pub struct AgentModelsResponse {
     pub models: Vec<AgentModelInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModesResponse {
+    pub modes: Vec<AgentModeInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
@@ -4601,7 +4807,6 @@ pub struct AgentCapabilities {
     pub mcp_tools: bool,
     pub streaming_deltas: bool,
     pub item_started: bool,
-    pub variants: bool,
     /// Whether this agent uses a shared long-running server process (vs per-turn subprocess)
     pub shared_process: bool,
 }
@@ -4670,6 +4875,10 @@ pub struct SessionInfo {
     pub updated_at: i64,
     pub directory: Option<String>,
     pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<BTreeMap<String, McpServerConfig>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<SkillsConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
@@ -4681,6 +4890,248 @@ pub struct SessionListResponse {
 #[serde(rename_all = "camelCase")]
 pub struct HealthResponse {
     pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FsPathQuery {
+    pub path: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "session_id"
+    )]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FsEntriesQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "session_id"
+    )]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FsSessionQuery {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "session_id"
+    )]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FsDeleteQuery {
+    pub path: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "session_id"
+    )]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recursive: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FsUploadBatchQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "session_id"
+    )]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum FsEntryType {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FsEntry {
+    pub name: String,
+    pub path: String,
+    pub entry_type: FsEntryType,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FsStat {
+    pub path: String,
+    pub entry_type: FsEntryType,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FsWriteResponse {
+    pub path: String,
+    pub bytes_written: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FsMoveRequest {
+    pub from: String,
+    pub to: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overwrite: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FsMoveResponse {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FsActionResponse {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FsUploadBatchResponse {
+    pub paths: Vec<String>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillsConfig {
+    pub sources: Vec<SkillSource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillSource {
+    #[serde(rename = "type")]
+    pub source_type: String,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "ref")]
+    pub git_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subpath: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(untagged)]
+pub enum McpCommand {
+    Command(String),
+    CommandWithArgs(Vec<String>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum McpRemoteTransport {
+    Http,
+    Sse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct McpOAuthConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(untagged)]
+pub enum McpOAuthConfigOrDisabled {
+    Config(McpOAuthConfig),
+    Disabled(bool),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum McpServerConfig {
+    #[serde(rename = "local", alias = "stdio")]
+    Local {
+        command: McpCommand,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none", alias = "environment")]
+        env: Option<BTreeMap<String, String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        enabled: Option<bool>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "timeoutMs",
+            alias = "timeout"
+        )]
+        #[schema(rename = "timeoutMs")]
+        timeout_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    #[serde(rename = "remote", alias = "http")]
+    Remote {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        headers: Option<BTreeMap<String, String>>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "bearerTokenEnvVar",
+            alias = "bearerTokenEnvVar",
+            alias = "bearer_token_env_var"
+        )]
+        #[schema(rename = "bearerTokenEnvVar")]
+        bearer_token_env_var: Option<String>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "envHeaders",
+            alias = "envHttpHeaders",
+            alias = "env_http_headers"
+        )]
+        #[schema(rename = "envHeaders")]
+        env_headers: Option<BTreeMap<String, String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        oauth: Option<McpOAuthConfigOrDisabled>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        enabled: Option<bool>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "timeoutMs",
+            alias = "timeout"
+        )]
+        #[schema(rename = "timeoutMs")]
+        timeout_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transport: Option<McpRemoteTransport>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
@@ -4701,6 +5152,9 @@ pub struct CreateSessionRequest {
     pub directory: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    pub mcp: Option<BTreeMap<String, McpServerConfig>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<SkillsConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
@@ -4717,6 +5171,18 @@ pub struct CreateSessionResponse {
 #[serde(rename_all = "camelCase")]
 pub struct MessageRequest {
     pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<MessageAttachment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageAttachment {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
@@ -4791,13 +5257,16 @@ impl std::str::FromStr for PermissionReply {
     request_body = AgentInstallRequest,
     responses(
         (status = 204, description = "Agent installed"),
-        (status = 400, body = ProblemDetails),
-        (status = 404, body = ProblemDetails),
-        (status = 500, body = ProblemDetails)
+        (status = 400, description = "Invalid request", body = ProblemDetails),
+        (status = 404, description = "Agent not found", body = ProblemDetails),
+        (status = 500, description = "Installation failed", body = ProblemDetails)
     ),
     params(("agent" = String, Path, description = "Agent id")),
     tag = "agents"
 )]
+/// Install Agent
+///
+/// Installs or updates a coding agent (e.g. claude, codex, opencode, amp).
 async fn install_agent(
     State(state): State<Arc<AppState>>,
     Path(agent): Path<String>,
@@ -4830,12 +5299,15 @@ async fn install_agent(
     get,
     path = "/v1/agents/{agent}/modes",
     responses(
-        (status = 200, body = AgentModesResponse),
-        (status = 400, body = ProblemDetails)
+        (status = 200, description = "Available modes", body = AgentModesResponse),
+        (status = 400, description = "Invalid request", body = ProblemDetails)
     ),
     params(("agent" = String, Path, description = "Agent id")),
     tag = "agents"
 )]
+/// List Agent Modes
+///
+/// Returns the available interaction modes for an agent.
 async fn get_agent_modes(
     State(state): State<Arc<AppState>>,
     Path(agent): Path<String>,
@@ -4849,12 +5321,15 @@ async fn get_agent_modes(
     get,
     path = "/v1/agents/{agent}/models",
     responses(
-        (status = 200, body = AgentModelsResponse),
-        (status = 400, body = ProblemDetails)
+        (status = 200, description = "Available models", body = AgentModelsResponse),
+        (status = 404, description = "Agent not found", body = ProblemDetails)
     ),
     params(("agent" = String, Path, description = "Agent id")),
     tag = "agents"
 )]
+/// List Agent Models
+///
+/// Returns the available LLM models for an agent.
 async fn get_agent_models(
     State(state): State<Arc<AppState>>,
     Path(agent): Path<String>,
@@ -4864,35 +5339,33 @@ async fn get_agent_models(
     Ok(Json(models))
 }
 
-fn server_info(branding: BrandingMode) -> String {
-    format!(
-        "This is a {} server. Available endpoints:\n\
-         \x20 - GET  /           - Server info\n\
-         \x20 - GET  /v1/health  - Health check\n\
-         \x20 - GET  /ui/        - Inspector UI\n\n\
-         See {} for API documentation.",
-        branding.product_name(),
-        branding.docs_url(),
-    )
+const SERVER_INFO: &str = "\
+This is a Sandbox Agent server. Available endpoints:\n\
+  - GET  /           - Server info\n\
+  - GET  /v1/health  - Health check\n\
+  - GET  /ui/        - Inspector UI\n\n\
+See https://sandboxagent.dev for API documentation.";
+
+async fn get_root() -> &'static str {
+    SERVER_INFO
 }
 
-async fn get_root(State(state): State<Arc<AppState>>) -> String {
-    server_info(state.branding)
-}
-
-async fn not_found(State(state): State<Arc<AppState>>) -> (StatusCode, String) {
+async fn not_found() -> (StatusCode, String) {
     (
         StatusCode::NOT_FOUND,
-        format!("404 Not Found\n\n{}", server_info(state.branding)),
+        format!("404 Not Found\n\n{SERVER_INFO}"),
     )
 }
 
 #[utoipa::path(
     get,
     path = "/v1/health",
-    responses((status = 200, body = HealthResponse)),
+    responses((status = 200, description = "Server is healthy", body = HealthResponse)),
     tag = "meta"
 )]
+/// Health Check
+///
+/// Returns the server health status.
 async fn get_health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".to_string(),
@@ -4902,9 +5375,12 @@ async fn get_health() -> Json<HealthResponse> {
 #[utoipa::path(
     get,
     path = "/v1/agents",
-    responses((status = 200, body = AgentListResponse)),
+    responses((status = 200, description = "List of available agents", body = AgentListResponse)),
     tag = "agents"
 )]
+/// List Agents
+///
+/// Returns all available coding agents and their installation status.
 async fn list_agents(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<AgentListResponse>, ApiError> {
@@ -4971,9 +5447,12 @@ async fn list_agents(
 #[utoipa::path(
     get,
     path = "/v1/sessions",
-    responses((status = 200, body = SessionListResponse)),
+    responses((status = 200, description = "List of active sessions", body = SessionListResponse)),
     tag = "sessions"
 )]
+/// List Sessions
+///
+/// Returns all active sessions.
 async fn list_sessions(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<SessionListResponse>, ApiError> {
@@ -4986,13 +5465,16 @@ async fn list_sessions(
     path = "/v1/sessions/{session_id}",
     request_body = CreateSessionRequest,
     responses(
-        (status = 200, body = CreateSessionResponse),
-        (status = 400, body = ProblemDetails),
-        (status = 409, body = ProblemDetails)
+        (status = 200, description = "Session created", body = CreateSessionResponse),
+        (status = 400, description = "Invalid request", body = ProblemDetails),
+        (status = 409, description = "Session already exists", body = ProblemDetails)
     ),
     params(("session_id" = String, Path, description = "Client session id")),
     tag = "sessions"
 )]
+/// Create Session
+///
+/// Creates a new agent session with the given configuration.
 async fn create_session(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -5011,11 +5493,14 @@ async fn create_session(
     request_body = MessageRequest,
     responses(
         (status = 204, description = "Message accepted"),
-        (status = 404, body = ProblemDetails)
+        (status = 404, description = "Session not found", body = ProblemDetails)
     ),
     params(("session_id" = String, Path, description = "Session id")),
     tag = "sessions"
 )]
+/// Send Message
+///
+/// Sends a message to a session and returns immediately.
 async fn post_message(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -5023,7 +5508,7 @@ async fn post_message(
 ) -> Result<StatusCode, ApiError> {
     state
         .session_manager
-        .send_message(session_id, request.message)
+        .send_message(session_id, request.message, request.attachments)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -5038,10 +5523,13 @@ async fn post_message(
     ),
     responses(
         (status = 200, description = "SSE event stream"),
-        (status = 404, body = ProblemDetails)
+        (status = 404, description = "Session not found", body = ProblemDetails)
     ),
     tag = "sessions"
 )]
+/// Send Message (Streaming)
+///
+/// Sends a message and returns an SSE event stream of the agent's response.
 async fn post_message_stream(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -5055,7 +5543,7 @@ async fn post_message_stream(
         .await?;
     state
         .session_manager
-        .send_message(session_id, request.message)
+        .send_message(session_id, request.message, request.attachments)
         .await?;
     let stream = stream_turn_events(subscription, snapshot.agent, include_raw);
     Ok(Sse::new(stream))
@@ -5067,10 +5555,13 @@ async fn post_message_stream(
     params(("session_id" = String, Path, description = "Session id")),
     responses(
         (status = 204, description = "Session terminated"),
-        (status = 404, body = ProblemDetails)
+        (status = 404, description = "Session not found", body = ProblemDetails)
     ),
     tag = "sessions"
 )]
+/// Terminate Session
+///
+/// Terminates a running session and cleans up resources.
 async fn terminate_session(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -5089,11 +5580,14 @@ async fn terminate_session(
         ("include_raw" = Option<bool>, Query, description = "Include raw provider payloads")
     ),
     responses(
-        (status = 200, body = EventsResponse),
-        (status = 404, body = ProblemDetails)
+        (status = 200, description = "Session events", body = EventsResponse),
+        (status = 404, description = "Session not found", body = ProblemDetails)
     ),
     tag = "sessions"
 )]
+/// Get Events
+///
+/// Returns session events with optional offset-based pagination.
 async fn get_events(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -5123,6 +5617,9 @@ async fn get_events(
     responses((status = 200, description = "SSE event stream")),
     tag = "sessions"
 )]
+/// Subscribe to Events (SSE)
+///
+/// Opens an SSE stream for real-time session events.
 async fn get_events_sse(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -5166,7 +5663,7 @@ async fn get_events_sse(
     request_body = QuestionReplyRequest,
     responses(
         (status = 204, description = "Question answered"),
-        (status = 404, body = ProblemDetails)
+        (status = 404, description = "Session or question not found", body = ProblemDetails)
     ),
     params(
         ("session_id" = String, Path, description = "Session id"),
@@ -5174,6 +5671,9 @@ async fn get_events_sse(
     ),
     tag = "sessions"
 )]
+/// Reply to Question
+///
+/// Replies to a human-in-the-loop question from the agent.
 async fn reply_question(
     State(state): State<Arc<AppState>>,
     Path((session_id, question_id)): Path<(String, String)>,
@@ -5191,7 +5691,7 @@ async fn reply_question(
     path = "/v1/sessions/{session_id}/questions/{question_id}/reject",
     responses(
         (status = 204, description = "Question rejected"),
-        (status = 404, body = ProblemDetails)
+        (status = 404, description = "Session or question not found", body = ProblemDetails)
     ),
     params(
         ("session_id" = String, Path, description = "Session id"),
@@ -5199,6 +5699,9 @@ async fn reply_question(
     ),
     tag = "sessions"
 )]
+/// Reject Question
+///
+/// Rejects a human-in-the-loop question from the agent.
 async fn reject_question(
     State(state): State<Arc<AppState>>,
     Path((session_id, question_id)): Path<(String, String)>,
@@ -5216,7 +5719,7 @@ async fn reject_question(
     request_body = PermissionReplyRequest,
     responses(
         (status = 204, description = "Permission reply accepted"),
-        (status = 404, body = ProblemDetails)
+        (status = 404, description = "Session or permission not found", body = ProblemDetails)
     ),
     params(
         ("session_id" = String, Path, description = "Session id"),
@@ -5224,6 +5727,9 @@ async fn reject_question(
     ),
     tag = "sessions"
 )]
+/// Reply to Permission
+///
+/// Approves or denies a permission request from the agent.
 async fn reply_permission(
     State(state): State<Arc<AppState>>,
     Path((session_id, permission_id)): Path<(String, String)>,
@@ -5234,6 +5740,338 @@ async fn reply_permission(
         .reply_permission(&session_id, &permission_id, request.reply)
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/fs/entries",
+    params(
+        ("path" = Option<String>, Query, description = "Path to list (relative or absolute)"),
+        ("session_id" = Option<String>, Query, description = "Session id for relative paths")
+    ),
+    responses((status = 200, description = "Directory listing", body = Vec<FsEntry>)),
+    tag = "fs"
+)]
+/// List Directory
+///
+/// Lists files and directories at the given path.
+async fn fs_entries(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<FsEntriesQuery>,
+) -> Result<Json<Vec<FsEntry>>, ApiError> {
+    let path = query.path.unwrap_or_else(|| ".".to_string());
+    let target = resolve_fs_path(&state, query.session_id.as_deref(), &path).await?;
+    let metadata = fs::metadata(&target).map_err(|err| map_fs_error(&target, err))?;
+    if !metadata.is_dir() {
+        return Err(SandboxError::InvalidRequest {
+            message: format!("path is not a directory: {}", target.display()),
+        }
+        .into());
+    }
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(&target).map_err(|err| map_fs_error(&target, err))? {
+        let entry = entry.map_err(|err| SandboxError::StreamError {
+            message: err.to_string(),
+        })?;
+        let path = entry.path();
+        let metadata = entry.metadata().map_err(|err| SandboxError::StreamError {
+            message: err.to_string(),
+        })?;
+        let entry_type = if metadata.is_dir() {
+            FsEntryType::Directory
+        } else {
+            FsEntryType::File
+        };
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339().into());
+        entries.push(FsEntry {
+            name: entry.file_name().to_string_lossy().to_string(),
+            path: path.to_string_lossy().to_string(),
+            entry_type,
+            size: metadata.len(),
+            modified,
+        });
+    }
+    Ok(Json(entries))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/fs/file",
+    params(
+        ("path" = String, Query, description = "File path (relative or absolute)"),
+        ("session_id" = Option<String>, Query, description = "Session id for relative paths")
+    ),
+    responses((status = 200, description = "File content", body = Vec<u8>)),
+    tag = "fs"
+)]
+/// Read File
+///
+/// Reads the raw bytes of a file.
+async fn fs_read_file(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<FsPathQuery>,
+) -> Result<Response, ApiError> {
+    let target = resolve_fs_path(&state, query.session_id.as_deref(), &query.path).await?;
+    let metadata = fs::metadata(&target).map_err(|err| map_fs_error(&target, err))?;
+    if !metadata.is_file() {
+        return Err(SandboxError::InvalidRequest {
+            message: format!("path is not a file: {}", target.display()),
+        }
+        .into());
+    }
+    let bytes = fs::read(&target).map_err(|err| map_fs_error(&target, err))?;
+    Ok((
+        [(header::CONTENT_TYPE, "application/octet-stream")],
+        Bytes::from(bytes),
+    )
+        .into_response())
+}
+
+#[utoipa::path(
+    put,
+    path = "/v1/fs/file",
+    request_body = Vec<u8>,
+    params(
+        ("path" = String, Query, description = "File path (relative or absolute)"),
+        ("session_id" = Option<String>, Query, description = "Session id for relative paths")
+    ),
+    responses((status = 200, description = "Write result", body = FsWriteResponse)),
+    tag = "fs"
+)]
+/// Write File
+///
+/// Writes raw bytes to a file, creating it if it doesn't exist.
+async fn fs_write_file(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<FsPathQuery>,
+    body: Bytes,
+) -> Result<Json<FsWriteResponse>, ApiError> {
+    let target = resolve_fs_path(&state, query.session_id.as_deref(), &query.path).await?;
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|err| map_fs_error(parent, err))?;
+    }
+    fs::write(&target, &body).map_err(|err| map_fs_error(&target, err))?;
+    Ok(Json(FsWriteResponse {
+        path: target.to_string_lossy().to_string(),
+        bytes_written: body.len() as u64,
+    }))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/fs/entry",
+    params(
+        ("path" = String, Query, description = "File or directory path"),
+        ("session_id" = Option<String>, Query, description = "Session id for relative paths"),
+        ("recursive" = Option<bool>, Query, description = "Delete directories recursively")
+    ),
+    responses((status = 200, description = "Delete result", body = FsActionResponse)),
+    tag = "fs"
+)]
+/// Delete Entry
+///
+/// Deletes a file or directory.
+async fn fs_delete_entry(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<FsDeleteQuery>,
+) -> Result<Json<FsActionResponse>, ApiError> {
+    let target = resolve_fs_path(&state, query.session_id.as_deref(), &query.path).await?;
+    let metadata = fs::metadata(&target).map_err(|err| map_fs_error(&target, err))?;
+    if metadata.is_dir() {
+        if query.recursive.unwrap_or(false) {
+            fs::remove_dir_all(&target).map_err(|err| map_fs_error(&target, err))?;
+        } else {
+            fs::remove_dir(&target).map_err(|err| map_fs_error(&target, err))?;
+        }
+    } else {
+        fs::remove_file(&target).map_err(|err| map_fs_error(&target, err))?;
+    }
+    Ok(Json(FsActionResponse {
+        path: target.to_string_lossy().to_string(),
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/fs/mkdir",
+    params(
+        ("path" = String, Query, description = "Directory path to create"),
+        ("session_id" = Option<String>, Query, description = "Session id for relative paths")
+    ),
+    responses((status = 200, description = "Directory created", body = FsActionResponse)),
+    tag = "fs"
+)]
+/// Create Directory
+///
+/// Creates a directory, including any missing parent directories.
+async fn fs_mkdir(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<FsPathQuery>,
+) -> Result<Json<FsActionResponse>, ApiError> {
+    let target = resolve_fs_path(&state, query.session_id.as_deref(), &query.path).await?;
+    fs::create_dir_all(&target).map_err(|err| map_fs_error(&target, err))?;
+    Ok(Json(FsActionResponse {
+        path: target.to_string_lossy().to_string(),
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/fs/move",
+    request_body = FsMoveRequest,
+    params(("session_id" = Option<String>, Query, description = "Session id for relative paths")),
+    responses((status = 200, description = "Move result", body = FsMoveResponse)),
+    tag = "fs"
+)]
+/// Move Entry
+///
+/// Moves or renames a file or directory.
+async fn fs_move(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<FsSessionQuery>,
+    Json(request): Json<FsMoveRequest>,
+) -> Result<Json<FsMoveResponse>, ApiError> {
+    let session_id = query.session_id.as_deref();
+    let from = resolve_fs_path(&state, session_id, &request.from).await?;
+    let to = resolve_fs_path(&state, session_id, &request.to).await?;
+    if to.exists() {
+        if request.overwrite.unwrap_or(false) {
+            let metadata = fs::metadata(&to).map_err(|err| map_fs_error(&to, err))?;
+            if metadata.is_dir() {
+                fs::remove_dir_all(&to).map_err(|err| map_fs_error(&to, err))?;
+            } else {
+                fs::remove_file(&to).map_err(|err| map_fs_error(&to, err))?;
+            }
+        } else {
+            return Err(SandboxError::InvalidRequest {
+                message: format!("destination already exists: {}", to.display()),
+            }
+            .into());
+        }
+    }
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent).map_err(|err| map_fs_error(parent, err))?;
+    }
+    fs::rename(&from, &to).map_err(|err| map_fs_error(&from, err))?;
+    Ok(Json(FsMoveResponse {
+        from: from.to_string_lossy().to_string(),
+        to: to.to_string_lossy().to_string(),
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/fs/stat",
+    params(
+        ("path" = String, Query, description = "Path to stat"),
+        ("session_id" = Option<String>, Query, description = "Session id for relative paths")
+    ),
+    responses((status = 200, description = "File metadata", body = FsStat)),
+    tag = "fs"
+)]
+/// Get File Info
+///
+/// Returns metadata (size, timestamps, type) for a path.
+async fn fs_stat(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<FsPathQuery>,
+) -> Result<Json<FsStat>, ApiError> {
+    let target = resolve_fs_path(&state, query.session_id.as_deref(), &query.path).await?;
+    let metadata = fs::metadata(&target).map_err(|err| map_fs_error(&target, err))?;
+    let entry_type = if metadata.is_dir() {
+        FsEntryType::Directory
+    } else {
+        FsEntryType::File
+    };
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339().into());
+    Ok(Json(FsStat {
+        path: target.to_string_lossy().to_string(),
+        entry_type,
+        size: metadata.len(),
+        modified,
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/fs/upload-batch",
+    request_body = Vec<u8>,
+    params(
+        ("path" = Option<String>, Query, description = "Destination directory for extraction"),
+        ("session_id" = Option<String>, Query, description = "Session id for relative paths")
+    ),
+    responses((status = 200, description = "Upload result", body = FsUploadBatchResponse)),
+    tag = "fs"
+)]
+/// Upload Files
+///
+/// Uploads a tar.gz archive and extracts it to the destination directory.
+async fn fs_upload_batch(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<FsUploadBatchQuery>,
+    body: Bytes,
+) -> Result<Json<FsUploadBatchResponse>, ApiError> {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !content_type.starts_with("application/x-tar") {
+        return Err(SandboxError::InvalidRequest {
+            message: "content-type must be application/x-tar".to_string(),
+        }
+        .into());
+    }
+    let path = query.path.unwrap_or_else(|| ".".to_string());
+    let base = resolve_fs_path(&state, query.session_id.as_deref(), &path).await?;
+    fs::create_dir_all(&base).map_err(|err| map_fs_error(&base, err))?;
+
+    let mut archive = Archive::new(Cursor::new(body));
+    let mut extracted = Vec::new();
+    let mut truncated = false;
+    for entry in archive.entries().map_err(|err| SandboxError::StreamError {
+        message: err.to_string(),
+    })? {
+        let mut entry = entry.map_err(|err| SandboxError::StreamError {
+            message: err.to_string(),
+        })?;
+        let entry_path = entry.path().map_err(|err| SandboxError::StreamError {
+            message: err.to_string(),
+        })?;
+        let clean_path = sanitize_relative_path(&entry_path)?;
+        if clean_path.as_os_str().is_empty() {
+            continue;
+        }
+        let dest = base.join(&clean_path);
+        if !dest.starts_with(&base) {
+            return Err(SandboxError::InvalidRequest {
+                message: format!("tar entry escapes destination: {}", entry_path.display()),
+            }
+            .into());
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|err| map_fs_error(parent, err))?;
+        }
+        entry.unpack(&dest).map_err(|err| SandboxError::StreamError {
+            message: err.to_string(),
+        })?;
+        if extracted.len() < 1024 {
+            extracted.push(dest.to_string_lossy().to_string());
+        } else {
+            truncated = true;
+        }
+    }
+
+    Ok(Json(FsUploadBatchResponse {
+        paths: extracted,
+        truncated,
+    }))
 }
 
 fn all_agents() -> [AgentId; 5] {
@@ -5282,10 +6120,9 @@ fn agent_capabilities_for(agent: AgentId) -> AgentCapabilities {
             status: false,
             command_execution: false,
             file_changes: false,
-            mcp_tools: false,
+            mcp_tools: true,
             streaming_deltas: true,
             item_started: false,
-            variants: false,
             shared_process: false, // per-turn subprocess with --resume
         },
         AgentId::Codex => AgentCapabilities {
@@ -5306,7 +6143,6 @@ fn agent_capabilities_for(agent: AgentId) -> AgentCapabilities {
             mcp_tools: true,
             streaming_deltas: true,
             item_started: true,
-            variants: true,
             shared_process: true, // shared app-server via JSON-RPC
         },
         AgentId::Opencode => AgentCapabilities {
@@ -5324,10 +6160,9 @@ fn agent_capabilities_for(agent: AgentId) -> AgentCapabilities {
             status: false,
             command_execution: false,
             file_changes: false,
-            mcp_tools: false,
+            mcp_tools: true,
             streaming_deltas: true,
             item_started: true,
-            variants: true,
             shared_process: true, // shared HTTP server
         },
         AgentId::Amp => AgentCapabilities {
@@ -5345,10 +6180,9 @@ fn agent_capabilities_for(agent: AgentId) -> AgentCapabilities {
             status: false,
             command_execution: false,
             file_changes: false,
-            mcp_tools: false,
+            mcp_tools: true,
             streaming_deltas: false,
             item_started: false,
-            variants: true,
             shared_process: false, // per-turn subprocess with --continue
         },
         AgentId::Mock => AgentCapabilities {
@@ -5369,7 +6203,6 @@ fn agent_capabilities_for(agent: AgentId) -> AgentCapabilities {
             mcp_tools: true,
             streaming_deltas: true,
             item_started: true,
-            variants: false,
             shared_process: false, // in-memory mock (no subprocess)
         },
     }
@@ -5445,23 +6278,15 @@ fn agent_modes_for(agent: AgentId) -> Vec<AgentModeInfo> {
 }
 
 fn amp_models_response() -> AgentModelsResponse {
-    // NOTE: Amp models are hardcoded based on ampcode.com manual:
-    // - smart
-    // - rush
-    // - deep
-    // - free
-    let models = ["smart", "rush", "deep", "free"]
-        .into_iter()
-        .map(|id| AgentModelInfo {
-            id: id.to_string(),
-            name: None,
-            variants: Some(amp_variants()),
-            default_variant: Some("medium".to_string()),
-        })
-        .collect();
+    let models = vec![AgentModelInfo {
+        id: "amp-default".to_string(),
+        name: Some("Amp Default".to_string()),
+        variants: None,
+        default_variant: None,
+    }];
     AgentModelsResponse {
         models,
-        default_model: Some("smart".to_string()),
+        default_model: Some("amp-default".to_string()),
     }
 }
 
@@ -5482,20 +6307,6 @@ fn should_cache_agent_models(agent: AgentId, response: &AgentModelsResponse) -> 
         return false;
     }
     true
-}
-
-fn amp_variants() -> Vec<String> {
-    vec!["medium", "high", "xhigh"]
-        .into_iter()
-        .map(|value| value.to_string())
-        .collect()
-}
-
-fn codex_variants() -> Vec<String> {
-    vec!["none", "minimal", "low", "medium", "high", "xhigh"]
-        .into_iter()
-        .map(|value| value.to_string())
-        .collect()
 }
 
 fn parse_opencode_models(value: &Value) -> Option<AgentModelsResponse> {
@@ -5768,6 +6579,9 @@ fn build_spawn_options(
 mod tests {
     use super::*;
 
+    /// Mutex to serialize tests that change the process-global CWD.
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn test_snapshot(agent: AgentId) -> SessionSnapshot {
         SessionSnapshot {
             session_id: "test-session".to_string(),
@@ -5897,6 +6711,1352 @@ mod tests {
             Some("gpt-5.3-codex-NOTREAL".to_string())
         );
     }
+
+    // ── Skill source tests ──────────────────────────────────────────
+
+    fn make_skill_dir(base: &StdPath, name: &str) -> PathBuf {
+        let dir = base.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), format!("# {name}")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn skill_source_serde_github_roundtrip() {
+        let json = r#"{"type":"github","source":"rivet-dev/skills","skills":["sandbox-agent"],"ref":"main"}"#;
+        let source: SkillSource = serde_json::from_str(json).unwrap();
+        assert_eq!(source.source_type, "github");
+        assert_eq!(source.source, "rivet-dev/skills");
+        assert_eq!(source.skills, Some(vec!["sandbox-agent".to_string()]));
+        assert_eq!(source.git_ref, Some("main".to_string()));
+        assert_eq!(source.subpath, None);
+
+        let roundtrip = serde_json::to_string(&source).unwrap();
+        let back: SkillSource = serde_json::from_str(&roundtrip).unwrap();
+        assert_eq!(back.source_type, source.source_type);
+        assert_eq!(back.source, source.source);
+    }
+
+    #[test]
+    fn skill_source_serde_local_minimal() {
+        let json = r#"{"type":"local","source":"/workspace/my-skill"}"#;
+        let source: SkillSource = serde_json::from_str(json).unwrap();
+        assert_eq!(source.source_type, "local");
+        assert_eq!(source.source, "/workspace/my-skill");
+        assert_eq!(source.skills, None);
+        assert_eq!(source.git_ref, None);
+        assert_eq!(source.subpath, None);
+    }
+
+    #[test]
+    fn skills_config_serde_roundtrip() {
+        let json = r#"{"sources":[{"type":"github","source":"owner/repo"},{"type":"local","source":"/path"}]}"#;
+        let config: SkillsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.sources.len(), 2);
+        assert_eq!(config.sources[0].source_type, "github");
+        assert_eq!(config.sources[1].source_type, "local");
+    }
+
+    #[test]
+    fn discover_skills_finds_root_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_skill_dir(tmp.path(), ".");
+        // SKILL.md is directly in the search dir
+        fs::write(tmp.path().join("SKILL.md"), "# root skill").unwrap();
+
+        let found = discover_skills_in_dir(tmp.path(), None).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0], tmp.path().to_path_buf());
+    }
+
+    #[test]
+    fn discover_skills_finds_skills_subdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_skill_dir(&tmp.path().join("skills"), "alpha");
+        make_skill_dir(&tmp.path().join("skills"), "beta");
+
+        let found = discover_skills_in_dir(tmp.path(), None).unwrap();
+        let names: Vec<String> = found
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert!(names.contains(&"alpha".to_string()));
+        assert!(names.contains(&"beta".to_string()));
+    }
+
+    #[test]
+    fn discover_skills_finds_top_level_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_skill_dir(tmp.path(), "my-skill");
+
+        let found = discover_skills_in_dir(tmp.path(), None).unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(found[0].ends_with("my-skill"));
+    }
+
+    #[test]
+    fn discover_skills_deduplicates_children_and_skills_subdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Put a skill both at top level and in skills/ subdir with same name
+        make_skill_dir(tmp.path(), "dupe");
+        make_skill_dir(&tmp.path().join("skills"), "dupe");
+
+        let found = discover_skills_in_dir(tmp.path(), None).unwrap();
+        let dupe_count = found
+            .iter()
+            .filter(|p| p.file_name().map(|n| n == "dupe").unwrap_or(false))
+            .count();
+        // Both should be present since they're different paths
+        assert_eq!(dupe_count, 2);
+    }
+
+    #[test]
+    fn discover_skills_respects_subpath() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_skill_dir(&tmp.path().join("nested/skills"), "deep-skill");
+        // Also put a skill at root that should NOT be discovered
+        make_skill_dir(tmp.path(), "root-skill");
+
+        let found = discover_skills_in_dir(tmp.path(), Some("nested")).unwrap();
+        let names: Vec<String> = found
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert!(names.contains(&"deep-skill".to_string()));
+        assert!(!names.contains(&"root-skill".to_string()));
+    }
+
+    #[test]
+    fn discover_skills_empty_dir_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let found = discover_skills_in_dir(tmp.path(), None).unwrap();
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn discover_skills_missing_subpath_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = discover_skills_in_dir(tmp.path(), Some("nonexistent"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn discover_skills_ignores_non_skill_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create a directory without SKILL.md
+        fs::create_dir_all(tmp.path().join("not-a-skill")).unwrap();
+        fs::write(tmp.path().join("not-a-skill/README.md"), "# readme").unwrap();
+        // Create an actual skill
+        make_skill_dir(tmp.path(), "real-skill");
+
+        let found = discover_skills_in_dir(tmp.path(), None).unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(found[0].ends_with("real-skill"));
+    }
+
+    #[test]
+    fn resolve_skill_source_local_absolute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill = make_skill_dir(tmp.path(), "my-skill");
+        let source = SkillSource {
+            source_type: "local".to_string(),
+            source: skill.to_string_lossy().to_string(),
+            skills: None,
+            git_ref: None,
+            subpath: None,
+        };
+        let result = resolve_skill_source(&source, tmp.path()).unwrap();
+        assert_eq!(result, skill);
+    }
+
+    #[test]
+    fn resolve_skill_source_local_relative() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_skill_dir(tmp.path(), "my-skill");
+        let source = SkillSource {
+            source_type: "local".to_string(),
+            source: "my-skill".to_string(),
+            skills: None,
+            git_ref: None,
+            subpath: None,
+        };
+        let result = resolve_skill_source(&source, tmp.path()).unwrap();
+        assert_eq!(result, tmp.path().join("my-skill"));
+    }
+
+    #[test]
+    fn resolve_skill_source_local_missing_dir_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = SkillSource {
+            source_type: "local".to_string(),
+            source: "/nonexistent/path".to_string(),
+            skills: None,
+            git_ref: None,
+            subpath: None,
+        };
+        let result = resolve_skill_source(&source, tmp.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_skill_source_unsupported_type_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = SkillSource {
+            source_type: "s3".to_string(),
+            source: "bucket/key".to_string(),
+            skills: None,
+            git_ref: None,
+            subpath: None,
+        };
+        let result = resolve_skill_source(&source, tmp.path());
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("unsupported"), "expected 'unsupported' in: {msg}");
+    }
+
+    #[test]
+    fn install_skill_sources_local_single() {
+        let _lock = CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        make_skill_dir(tmp.path(), "alpha");
+
+        let sources = vec![SkillSource {
+            source_type: "local".to_string(),
+            source: tmp.path().join("alpha").to_string_lossy().to_string(),
+            skills: None,
+            git_ref: None,
+            subpath: None,
+        }];
+
+        // Run from a temp working directory so symlinks go there
+        let work = tempfile::tempdir().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(work.path()).unwrap();
+        let result = install_skill_sources(&sources);
+        std::env::set_current_dir(prev).unwrap();
+
+        let dirs = result.unwrap();
+        assert_eq!(dirs.len(), 1);
+        // Verify symlinks were created
+        for root in SKILL_ROOTS {
+            let link = work.path().join(root).join("alpha");
+            assert!(
+                link.exists(),
+                "expected skill link at {}",
+                link.display()
+            );
+            assert!(link.join("SKILL.md").exists());
+        }
+    }
+
+    #[test]
+    fn install_skill_sources_filters_by_name() {
+        let _lock = CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        // Repo-like layout with skills/ subdir containing two skills
+        make_skill_dir(&tmp.path().join("skills"), "wanted");
+        make_skill_dir(&tmp.path().join("skills"), "unwanted");
+
+        let sources = vec![SkillSource {
+            source_type: "local".to_string(),
+            source: tmp.path().to_string_lossy().to_string(),
+            skills: Some(vec!["wanted".to_string()]),
+            git_ref: None,
+            subpath: None,
+        }];
+
+        let work = tempfile::tempdir().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(work.path()).unwrap();
+        let result = install_skill_sources(&sources);
+        std::env::set_current_dir(prev).unwrap();
+
+        let dirs = result.unwrap();
+        assert_eq!(dirs.len(), 1);
+        assert!(dirs[0].ends_with("wanted"));
+    }
+
+    #[test]
+    fn install_skill_sources_errors_when_filter_matches_nothing() {
+        let _lock = CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        make_skill_dir(&tmp.path().join("skills"), "alpha");
+
+        let sources = vec![SkillSource {
+            source_type: "local".to_string(),
+            source: tmp.path().to_string_lossy().to_string(),
+            skills: Some(vec!["nonexistent".to_string()]),
+            git_ref: None,
+            subpath: None,
+        }];
+
+        let work = tempfile::tempdir().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(work.path()).unwrap();
+        let result = install_skill_sources(&sources);
+        std::env::set_current_dir(prev).unwrap();
+
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("no skills found"), "expected 'no skills found' in: {msg}");
+    }
+
+    #[test]
+    fn install_skill_sources_multiple_sources() {
+        let _lock = CWD_LOCK.lock().unwrap();
+        let tmp1 = tempfile::tempdir().unwrap();
+        let tmp2 = tempfile::tempdir().unwrap();
+        make_skill_dir(tmp1.path(), "skill-a");
+        make_skill_dir(tmp2.path(), "skill-b");
+
+        let sources = vec![
+            SkillSource {
+                source_type: "local".to_string(),
+                source: tmp1.path().join("skill-a").to_string_lossy().to_string(),
+                skills: None,
+                git_ref: None,
+                subpath: None,
+            },
+            SkillSource {
+                source_type: "local".to_string(),
+                source: tmp2.path().join("skill-b").to_string_lossy().to_string(),
+                skills: None,
+                git_ref: None,
+                subpath: None,
+            },
+        ];
+
+        let work = tempfile::tempdir().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(work.path()).unwrap();
+        let result = install_skill_sources(&sources);
+        std::env::set_current_dir(prev).unwrap();
+
+        let dirs = result.unwrap();
+        assert_eq!(dirs.len(), 2);
+    }
+
+    #[test]
+    fn install_skill_sources_deduplicates_same_skill() {
+        let _lock = CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let skill = make_skill_dir(tmp.path(), "shared");
+        let path_str = skill.to_string_lossy().to_string();
+
+        let sources = vec![
+            SkillSource {
+                source_type: "local".to_string(),
+                source: path_str.clone(),
+                skills: None,
+                git_ref: None,
+                subpath: None,
+            },
+            SkillSource {
+                source_type: "local".to_string(),
+                source: path_str,
+                skills: None,
+                git_ref: None,
+                subpath: None,
+            },
+        ];
+
+        let work = tempfile::tempdir().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(work.path()).unwrap();
+        let result = install_skill_sources(&sources);
+        std::env::set_current_dir(prev).unwrap();
+
+        let dirs = result.unwrap();
+        assert_eq!(dirs.len(), 1, "duplicate skill should be deduplicated");
+    }
+
+    #[test]
+    fn ensure_skill_link_replaces_dangling_symlink() {
+        let work = tempfile::tempdir().unwrap();
+        let dest = work.path().join("test-link");
+
+        // Create a dangling symlink (target doesn't exist)
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/nonexistent/target", &dest).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir("/nonexistent/target", &dest).unwrap();
+
+        assert!(dest.symlink_metadata().is_ok(), "symlink should exist");
+        assert!(!dest.exists(), "symlink target should not exist (dangling)");
+
+        // Create a real skill directory as the new target
+        let skill = tempfile::tempdir().unwrap();
+        std::fs::write(skill.path().join("SKILL.md"), "# Test").unwrap();
+
+        // ensure_skill_link should replace the dangling symlink
+        let result = ensure_skill_link(skill.path(), &dest);
+        assert!(result.is_ok(), "should replace dangling symlink: {result:?}");
+        assert!(dest.exists(), "link should now point to valid target");
+        assert!(dest.join("SKILL.md").exists());
+    }
+
+    #[test]
+    fn download_github_zip_extracts_correctly() {
+        use std::io::Write;
+
+        // Build a zip in memory with GitHub-style prefix directory
+        let buf = Vec::new();
+        let cursor = std::io::Cursor::new(buf);
+        let mut zip_writer = zip::ZipWriter::new(cursor);
+
+        let options =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+        // GitHub wraps all content under "owner-repo-sha/"
+        zip_writer
+            .add_directory("owner-repo-abc123/", options)
+            .unwrap();
+
+        zip_writer
+            .start_file("owner-repo-abc123/SKILL.md", options)
+            .unwrap();
+        zip_writer.write_all(b"# Test Skill").unwrap();
+
+        zip_writer
+            .add_directory("owner-repo-abc123/sub/", options)
+            .unwrap();
+
+        zip_writer
+            .start_file("owner-repo-abc123/sub/nested.txt", options)
+            .unwrap();
+        zip_writer.write_all(b"nested content").unwrap();
+
+        let zip_bytes = zip_writer.finish().unwrap().into_inner();
+
+        // Extract using the same logic as download_github_zip (minus HTTP)
+        let work = tempfile::tempdir().unwrap();
+        let dest = work.path().join("test-skill");
+
+        let reader = std::io::Cursor::new(&zip_bytes);
+        let mut archive = zip::ZipArchive::new(reader).unwrap();
+
+        // Detect prefix
+        let prefix = {
+            let first = archive.by_index(0).unwrap();
+            let name = first.name().to_string();
+            match name.find('/') {
+                Some(pos) => name[..=pos].to_string(),
+                None => String::new(),
+            }
+        };
+
+        fs::create_dir_all(&dest).unwrap();
+
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i).unwrap();
+            let full_name = file.name().to_string();
+
+            let relative = if !prefix.is_empty() && full_name.starts_with(&prefix) {
+                &full_name[prefix.len()..]
+            } else {
+                &full_name
+            };
+
+            if relative.is_empty() {
+                continue;
+            }
+
+            let out_path = dest.join(relative);
+            if !out_path.starts_with(&dest) {
+                continue;
+            }
+
+            if file.is_dir() {
+                fs::create_dir_all(&out_path).unwrap();
+            } else {
+                if let Some(parent) = out_path.parent() {
+                    fs::create_dir_all(parent).unwrap();
+                }
+                let mut out_file = fs::File::create(&out_path).unwrap();
+                std::io::copy(&mut file, &mut out_file).unwrap();
+            }
+        }
+
+        // Verify files were extracted without the prefix directory
+        assert!(dest.join("SKILL.md").exists(), "SKILL.md should exist at root");
+        assert_eq!(fs::read_to_string(dest.join("SKILL.md")).unwrap(), "# Test Skill");
+        assert!(dest.join("sub/nested.txt").exists(), "nested file should exist");
+        assert_eq!(
+            fs::read_to_string(dest.join("sub/nested.txt")).unwrap(),
+            "nested content"
+        );
+        // Ensure no prefix directory leaked through
+        assert!(!dest.join("owner-repo-abc123").exists(), "prefix dir should be stripped");
+    }
+}
+
+fn install_skill_sources(sources: &[SkillSource]) -> Result<Vec<PathBuf>, SandboxError> {
+    let cwd = std::env::current_dir().map_err(|err| SandboxError::StreamError {
+        message: err.to_string(),
+    })?;
+    let mut skill_dirs = Vec::new();
+
+    for source in sources {
+        let base_dir = resolve_skill_source(source, &cwd)?;
+        let discovered = discover_skills_in_dir(&base_dir, source.subpath.as_deref())?;
+
+        let filtered: Vec<PathBuf> = if let Some(filter) = &source.skills {
+            discovered
+                .into_iter()
+                .filter(|p| {
+                    p.file_name()
+                        .map(|n| filter.iter().any(|f| f == n.to_string_lossy().as_ref()))
+                        .unwrap_or(false)
+                })
+                .collect()
+        } else {
+            discovered
+        };
+
+        if filtered.is_empty() {
+            let filter_msg = source
+                .skills
+                .as_ref()
+                .map(|f| format!(" (filter: {})", f.join(", ")))
+                .unwrap_or_default();
+            return Err(SandboxError::InvalidRequest {
+                message: format!(
+                    "no skills found in {} ({}){filter_msg}",
+                    source.source, source.source_type
+                ),
+            });
+        }
+
+        for skill_path in &filtered {
+            let canonical =
+                fs::canonicalize(skill_path).map_err(|err| SandboxError::StreamError {
+                    message: err.to_string(),
+                })?;
+            if !skill_dirs.contains(&canonical) {
+                skill_dirs.push(canonical.clone());
+            }
+            let skill_name = canonical
+                .file_name()
+                .ok_or_else(|| SandboxError::InvalidRequest {
+                    message: format!("invalid skill directory: {}", canonical.display()),
+                })?
+                .to_string_lossy()
+                .to_string();
+            for root in SKILL_ROOTS {
+                let dest = cwd.join(root).join(&skill_name);
+                ensure_skill_link(&canonical, &dest)?;
+            }
+        }
+    }
+
+    Ok(skill_dirs)
+}
+
+fn skills_cache_dir() -> Result<PathBuf, SandboxError> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map_err(|_| SandboxError::StreamError {
+            message: "cannot determine home directory".to_string(),
+        })?;
+    let cache = PathBuf::from(home).join(".sandbox-agent/skills-cache");
+    fs::create_dir_all(&cache).map_err(|err| SandboxError::StreamError {
+        message: format!("failed to create skills cache: {err}"),
+    })?;
+    Ok(cache)
+}
+
+fn download_github_zip(
+    owner_repo: &str,
+    cache_name: &str,
+    git_ref: Option<&str>,
+) -> Result<PathBuf, SandboxError> {
+    let cache = skills_cache_dir()?;
+    let dest = cache.join(cache_name);
+
+    // Remove existing cache dir if present (no .git state to preserve)
+    if dest.is_dir() {
+        fs::remove_dir_all(&dest).map_err(|err| SandboxError::StreamError {
+            message: format!("failed to remove old skills cache: {err}"),
+        })?;
+    }
+
+    let git_ref = git_ref.unwrap_or("HEAD");
+    let url = format!(
+        "https://api.github.com/repos/{}/zipball/{}",
+        owner_repo, git_ref
+    );
+
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .get(&url)
+        .header("User-Agent", "sandbox-agent")
+        .send()
+        .map_err(|err| SandboxError::StreamError {
+            message: format!("failed to download github zip for {owner_repo}: {err}"),
+        })?;
+
+    if !response.status().is_success() {
+        return Err(SandboxError::StreamError {
+            message: format!(
+                "github zip download failed for {owner_repo}: HTTP {}",
+                response.status()
+            ),
+        });
+    }
+
+    let bytes = response.bytes().map_err(|err| SandboxError::StreamError {
+        message: format!("failed to read github zip response: {err}"),
+    })?;
+
+    let reader = std::io::Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(reader).map_err(|err| SandboxError::StreamError {
+        message: format!("failed to open github zip archive: {err}"),
+    })?;
+
+    // GitHub zipball wraps contents in a {owner}-{repo}-{sha}/ prefix directory.
+    // Detect this prefix from the first entry and strip it during extraction.
+    let prefix = {
+        let first = archive
+            .by_index(0)
+            .map_err(|err| SandboxError::StreamError {
+                message: format!("failed to read zip entry: {err}"),
+            })?;
+        let name = first.name().to_string();
+        // The first entry is typically the top-level directory itself (e.g. "owner-repo-sha/")
+        match name.find('/') {
+            Some(pos) => name[..=pos].to_string(),
+            None => String::new(),
+        }
+    };
+
+    fs::create_dir_all(&dest).map_err(|err| SandboxError::StreamError {
+        message: format!("failed to create skills cache dir: {err}"),
+    })?;
+
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|err| SandboxError::StreamError {
+                message: format!("failed to read zip entry: {err}"),
+            })?;
+
+        let full_name = file.name().to_string();
+
+        // Strip the GitHub prefix directory
+        let relative = if !prefix.is_empty() && full_name.starts_with(&prefix) {
+            &full_name[prefix.len()..]
+        } else {
+            &full_name
+        };
+
+        // Skip the prefix directory entry itself and empty paths
+        if relative.is_empty() {
+            continue;
+        }
+
+        let out_path = dest.join(relative);
+
+        // Prevent path traversal
+        if !out_path.starts_with(&dest) {
+            continue;
+        }
+
+        if file.is_dir() {
+            fs::create_dir_all(&out_path).map_err(|err| SandboxError::StreamError {
+                message: format!("failed to create directory: {err}"),
+            })?;
+        } else {
+            if let Some(parent) = out_path.parent() {
+                fs::create_dir_all(parent).map_err(|err| SandboxError::StreamError {
+                    message: format!("failed to create parent directory: {err}"),
+                })?;
+            }
+            let mut out_file =
+                fs::File::create(&out_path).map_err(|err| SandboxError::StreamError {
+                    message: format!("failed to create file: {err}"),
+                })?;
+            std::io::copy(&mut file, &mut out_file).map_err(|err| SandboxError::StreamError {
+                message: format!("failed to write file: {err}"),
+            })?;
+        }
+    }
+
+    Ok(dest)
+}
+
+fn clone_or_update_repo(
+    url: &str,
+    cache_name: &str,
+    git_ref: Option<&str>,
+) -> Result<PathBuf, SandboxError> {
+    let cache = skills_cache_dir()?;
+    let dest = cache.join(cache_name);
+
+    if dest.join(".git").is_dir() {
+        // Update existing clone
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C").arg(&dest).arg("pull").arg("--ff-only");
+        let output = cmd.output().map_err(|err| SandboxError::StreamError {
+            message: format!("git pull failed: {err}"),
+        })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::warn!("git pull failed for {cache_name}, re-cloning: {stderr}");
+            fs::remove_dir_all(&dest).map_err(|err| SandboxError::StreamError {
+                message: format!("failed to remove stale cache: {err}"),
+            })?;
+            return clone_or_update_repo(url, cache_name, git_ref);
+        }
+    } else {
+        // Fresh clone
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("clone").arg("--depth").arg("1");
+        if let Some(r) = git_ref {
+            cmd.arg("--branch").arg(r);
+        }
+        cmd.arg(url).arg(&dest);
+        let output = cmd.output().map_err(|err| SandboxError::StreamError {
+            message: format!("git clone failed: {err}"),
+        })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::StreamError {
+                message: format!("git clone failed for {url}: {stderr}"),
+            });
+        }
+    }
+
+    Ok(dest)
+}
+
+fn resolve_skill_source(source: &SkillSource, cwd: &StdPath) -> Result<PathBuf, SandboxError> {
+    match source.source_type.as_str() {
+        "github" => {
+            let cache_name = source.source.replace('/', "-");
+            download_github_zip(&source.source, &cache_name, source.git_ref.as_deref())
+        }
+        "git" => {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            source.source.hash(&mut hasher);
+            let hash = format!("{:016x}", hasher.finish());
+            clone_or_update_repo(&source.source, &hash, source.git_ref.as_deref())
+        }
+        "local" => {
+            let mut path = PathBuf::from(&source.source);
+            if path.is_relative() {
+                path = cwd.join(path);
+            }
+            if !path.is_dir() {
+                return Err(SandboxError::InvalidRequest {
+                    message: format!("local skill directory not found: {}", path.display()),
+                });
+            }
+            Ok(path)
+        }
+        other => Err(SandboxError::InvalidRequest {
+            message: format!("unsupported skill source type: {other}"),
+        }),
+    }
+}
+
+fn discover_skills_in_dir(
+    base: &StdPath,
+    subpath: Option<&str>,
+) -> Result<Vec<PathBuf>, SandboxError> {
+    let search_dir = if let Some(sub) = subpath {
+        base.join(sub)
+    } else {
+        base.to_path_buf()
+    };
+
+    if !search_dir.is_dir() {
+        return Err(SandboxError::InvalidRequest {
+            message: format!("skill search directory not found: {}", search_dir.display()),
+        });
+    }
+
+    let mut skills = Vec::new();
+
+    // Check if the search dir itself is a skill
+    if search_dir.join("SKILL.md").exists() {
+        skills.push(search_dir.clone());
+    }
+
+    // Check skills/ subdirectory
+    let skills_subdir = search_dir.join("skills");
+    if skills_subdir.is_dir() {
+        if let Ok(entries) = fs::read_dir(&skills_subdir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() && path.join("SKILL.md").exists() {
+                    skills.push(path);
+                }
+            }
+        }
+    }
+
+    // Check immediate children of search dir (for repos with skills at top level)
+    if let Ok(entries) = fs::read_dir(&search_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && path.join("SKILL.md").exists() && !skills.contains(&path) {
+                skills.push(path);
+            }
+        }
+    }
+
+    Ok(skills)
+}
+
+fn ensure_skill_link(target: &StdPath, dest: &StdPath) -> Result<(), SandboxError> {
+    if dest.exists() {
+        if dest.is_dir() && dest.join("SKILL.md").exists() {
+            return Ok(());
+        }
+        if let Ok(link_target) = fs::read_link(dest) {
+            if link_target == target {
+                return Ok(());
+            }
+        }
+        return Err(SandboxError::InvalidRequest {
+            message: format!(
+                "skill path conflict: {} already exists",
+                dest.display()
+            ),
+        });
+    }
+    // Remove dangling symlinks (exists() follows symlinks and returns false for dangling ones)
+    if dest.symlink_metadata().is_ok() {
+        let _ = fs::remove_file(dest);
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|err| SandboxError::StreamError {
+            message: err.to_string(),
+        })?;
+    }
+    if let Err(err) = create_symlink_dir(target, dest) {
+        copy_dir_recursive(target, dest).map_err(|copy_err| SandboxError::StreamError {
+            message: format!("{err}; fallback copy failed: {copy_err}"),
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_symlink_dir(target: &StdPath, dest: &StdPath) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, dest)
+}
+
+#[cfg(windows)]
+fn create_symlink_dir(target: &StdPath, dest: &StdPath) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(target, dest)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_symlink_dir(_target: &StdPath, _dest: &StdPath) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "symlinks unsupported",
+    ))
+}
+
+fn copy_dir_recursive(src: &StdPath, dest: &StdPath) -> std::io::Result<()> {
+    fs::create_dir_all(dest)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let src_path = entry.path();
+        let dest_path = dest.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&src_path, &dest_path)?;
+        } else {
+            fs::copy(&src_path, &dest_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_claude_mcp_config(mcp: &BTreeMap<String, McpServerConfig>) -> Result<(), SandboxError> {
+    let cwd = std::env::current_dir().map_err(|err| SandboxError::StreamError {
+        message: err.to_string(),
+    })?;
+    let path = cwd.join(".mcp.json");
+    let mut root = if path.exists() {
+        let text = fs::read_to_string(&path).map_err(|err| SandboxError::StreamError {
+            message: err.to_string(),
+        })?;
+        serde_json::from_str::<Value>(&text).map_err(|err| SandboxError::InvalidRequest {
+            message: format!("invalid .mcp.json: {err}"),
+        })?
+    } else {
+        Value::Object(Map::new())
+    };
+    let Some(object) = root.as_object_mut() else {
+        return Err(SandboxError::InvalidRequest {
+            message: "invalid .mcp.json: expected object".to_string(),
+        });
+    };
+    let servers = object
+        .entry("mcpServers")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(server_map) = servers.as_object_mut() else {
+        return Err(SandboxError::InvalidRequest {
+            message: "invalid .mcp.json: mcpServers must be an object".to_string(),
+        });
+    };
+    for (name, config) in mcp {
+        server_map.insert(name.clone(), claude_mcp_entry(config)?);
+    }
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(&root).map_err(|err| SandboxError::StreamError {
+            message: err.to_string(),
+        })?,
+    )
+    .map_err(|err| SandboxError::StreamError {
+        message: err.to_string(),
+    })?;
+    Ok(())
+}
+
+fn write_codex_mcp_config(mcp: &BTreeMap<String, McpServerConfig>) -> Result<(), SandboxError> {
+    let cwd = std::env::current_dir().map_err(|err| SandboxError::StreamError {
+        message: err.to_string(),
+    })?;
+    let path = cwd.join(".codex").join("config.toml");
+    let mut doc = if path.exists() {
+        let text = fs::read_to_string(&path).map_err(|err| SandboxError::StreamError {
+            message: err.to_string(),
+        })?;
+        text.parse::<DocumentMut>()
+            .map_err(|err| SandboxError::InvalidRequest {
+                message: format!("invalid Codex config.toml: {err}"),
+            })?
+    } else {
+        DocumentMut::new()
+    };
+    let mcp_item = doc.entry("mcp_servers").or_insert(Item::Table(Table::new()));
+    let mcp_table = mcp_item.as_table_mut().ok_or_else(|| SandboxError::InvalidRequest {
+        message: "invalid Codex config.toml: mcp_servers must be a table".to_string(),
+    })?;
+    for (name, config) in mcp {
+        let table = codex_mcp_table(config)?;
+        mcp_table.insert(name, Item::Table(table));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| SandboxError::StreamError {
+            message: err.to_string(),
+        })?;
+    }
+    fs::write(&path, doc.to_string()).map_err(|err| SandboxError::StreamError {
+        message: err.to_string(),
+    })?;
+    Ok(())
+}
+
+fn apply_amp_mcp_config(
+    agent_manager: &AgentManager,
+    mcp: &BTreeMap<String, McpServerConfig>,
+) -> Result<(), SandboxError> {
+    let path = agent_manager
+        .resolve_binary(AgentId::Amp)
+        .map_err(|_| SandboxError::AgentNotInstalled {
+            agent: "amp".to_string(),
+        })?;
+    let cwd = std::env::current_dir().map_err(|err| SandboxError::StreamError {
+        message: err.to_string(),
+    })?;
+    for (name, config) in mcp {
+        let mut cmd = Command::new(&path);
+        cmd.current_dir(&cwd);
+        cmd.arg("mcp").arg("add").arg(name);
+        match config {
+            McpServerConfig::Local { command, args, .. } => {
+                let (cmd_name, cmd_args) = mcp_command_parts(command, args)?;
+                cmd.arg("--").arg(cmd_name).args(cmd_args);
+            }
+            McpServerConfig::Remote {
+                url,
+                headers,
+                bearer_token_env_var,
+                env_headers,
+                ..
+            } => {
+                let merged = merged_headers(
+                    headers.as_ref(),
+                    bearer_token_env_var.as_ref(),
+                    env_headers.as_ref(),
+                );
+                for (key, value) in merged {
+                    cmd.arg("--header").arg(format!("{key}: {value}"));
+                }
+                cmd.arg(url);
+            }
+        }
+        let output = cmd.output().map_err(|err| SandboxError::StreamError {
+            message: err.to_string(),
+        })?;
+        if !output.status.success() {
+            return Err(SandboxError::StreamError {
+                message: format!("amp mcp add failed for {name}: {}", output.status),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn opencode_mcp_config(config: &McpServerConfig) -> Result<Value, SandboxError> {
+    match config {
+        McpServerConfig::Local {
+            command,
+            args,
+            env,
+            enabled,
+            timeout_ms,
+            ..
+        } => {
+            let (cmd_name, cmd_args) = mcp_command_parts(command, args)?;
+            let mut map = Map::new();
+            map.insert("type".to_string(), Value::String("local".to_string()));
+            let mut command_parts = vec![Value::String(cmd_name)];
+            command_parts.extend(cmd_args.into_iter().map(Value::String));
+            map.insert("command".to_string(), Value::Array(command_parts));
+            if let Some(env) = env {
+                map.insert("environment".to_string(), json!(env));
+            }
+            if let Some(enabled) = enabled {
+                map.insert("enabled".to_string(), Value::Bool(*enabled));
+            }
+            if let Some(timeout) = timeout_ms {
+                map.insert(
+                    "timeout".to_string(),
+                    Value::Number(serde_json::Number::from(*timeout)),
+                );
+            }
+            Ok(Value::Object(map))
+        }
+        McpServerConfig::Remote {
+            url,
+            headers,
+            bearer_token_env_var,
+            env_headers,
+            oauth,
+            enabled,
+            timeout_ms,
+            ..
+        } => {
+            let mut map = Map::new();
+            map.insert("type".to_string(), Value::String("remote".to_string()));
+            map.insert("url".to_string(), Value::String(url.clone()));
+            let merged = merged_headers(
+                headers.as_ref(),
+                bearer_token_env_var.as_ref(),
+                env_headers.as_ref(),
+            );
+            if !merged.is_empty() {
+                map.insert("headers".to_string(), json!(merged));
+            }
+            if let Some(oauth) = oauth {
+                map.insert(
+                    "oauth".to_string(),
+                    serde_json::to_value(oauth).map_err(|err| SandboxError::StreamError {
+                        message: err.to_string(),
+                    })?,
+                );
+            }
+            if let Some(enabled) = enabled {
+                map.insert("enabled".to_string(), Value::Bool(*enabled));
+            }
+            if let Some(timeout) = timeout_ms {
+                map.insert(
+                    "timeout".to_string(),
+                    Value::Number(serde_json::Number::from(*timeout)),
+                );
+            }
+            Ok(Value::Object(map))
+        }
+    }
+}
+
+fn claude_mcp_entry(config: &McpServerConfig) -> Result<Value, SandboxError> {
+    match config {
+        McpServerConfig::Local {
+            command,
+            args,
+            env,
+            ..
+        } => {
+            let (cmd_name, cmd_args) = mcp_command_parts(command, args)?;
+            let mut map = Map::new();
+            map.insert("command".to_string(), Value::String(cmd_name));
+            if !cmd_args.is_empty() {
+                map.insert(
+                    "args".to_string(),
+                    Value::Array(cmd_args.into_iter().map(Value::String).collect()),
+                );
+            }
+            if let Some(env) = env {
+                map.insert("env".to_string(), json!(env));
+            }
+            Ok(Value::Object(map))
+        }
+        McpServerConfig::Remote {
+            url,
+            headers,
+            bearer_token_env_var,
+            env_headers,
+            transport,
+            ..
+        } => {
+            let mut map = Map::new();
+            let transport = transport.clone().unwrap_or(McpRemoteTransport::Http);
+            map.insert(
+                "type".to_string(),
+                Value::String(
+                    match transport {
+                        McpRemoteTransport::Http => "http",
+                        McpRemoteTransport::Sse => "sse",
+                    }
+                    .to_string(),
+                ),
+            );
+            map.insert("url".to_string(), Value::String(url.clone()));
+            let merged = merged_headers(
+                headers.as_ref(),
+                bearer_token_env_var.as_ref(),
+                env_headers.as_ref(),
+            );
+            if !merged.is_empty() {
+                map.insert("headers".to_string(), json!(merged));
+            }
+            Ok(Value::Object(map))
+        }
+    }
+}
+
+fn codex_mcp_table(config: &McpServerConfig) -> Result<Table, SandboxError> {
+    let mut table = Table::new();
+    match config {
+        McpServerConfig::Local {
+            command,
+            args,
+            env,
+            enabled,
+            timeout_ms,
+            ..
+        } => {
+            let (cmd_name, cmd_args) = mcp_command_parts(command, args)?;
+            table.insert("command", value(cmd_name));
+            if !cmd_args.is_empty() {
+                let mut array = Array::new();
+                for arg in cmd_args {
+                    array.push(arg);
+                }
+                table.insert("args", value(array));
+            }
+            if let Some(env) = env {
+                let mut env_table = Table::new();
+                for (key, val) in env {
+                    env_table.insert(key, value(val.clone()));
+                }
+                table.insert("env", Item::Table(env_table));
+            }
+            if let Some(enabled) = enabled {
+                table.insert("enabled", value(*enabled));
+            }
+            if let Some(timeout) = timeout_ms {
+                let seconds = (*timeout + 999) / 1000;
+                table.insert("tool_timeout_sec", value(seconds as i64));
+            }
+        }
+        McpServerConfig::Remote {
+            url,
+            headers,
+            bearer_token_env_var,
+            env_headers,
+            enabled,
+            timeout_ms,
+            ..
+        } => {
+            table.insert("url", value(url.clone()));
+            if let Some(headers) = headers {
+                let mut header_table = Table::new();
+                for (key, val) in headers {
+                    header_table.insert(key, value(val.clone()));
+                }
+                table.insert("http_headers", Item::Table(header_table));
+            }
+            if let Some(env_headers) = env_headers {
+                let mut header_table = Table::new();
+                for (key, val) in env_headers {
+                    header_table.insert(key, value(val.clone()));
+                }
+                table.insert("env_http_headers", Item::Table(header_table));
+            }
+            if let Some(bearer) = bearer_token_env_var {
+                table.insert("bearer_token_env_var", value(bearer.clone()));
+            }
+            if let Some(enabled) = enabled {
+                table.insert("enabled", value(*enabled));
+            }
+            if let Some(timeout) = timeout_ms {
+                let seconds = (*timeout + 999) / 1000;
+                table.insert("tool_timeout_sec", value(seconds as i64));
+            }
+        }
+    }
+    Ok(table)
+}
+
+fn mcp_command_parts(
+    command: &McpCommand,
+    args: &[String],
+) -> Result<(String, Vec<String>), SandboxError> {
+    match command {
+        McpCommand::Command(value) => Ok((value.clone(), args.to_vec())),
+        McpCommand::CommandWithArgs(values) => {
+            if values.is_empty() {
+                return Err(SandboxError::InvalidRequest {
+                    message: "mcp command cannot be empty".to_string(),
+                });
+            }
+            let mut iter = values.iter();
+            let cmd = iter
+                .next()
+                .map(|value| value.to_string())
+                .ok_or_else(|| SandboxError::InvalidRequest {
+                    message: "mcp command cannot be empty".to_string(),
+                })?;
+            let mut cmd_args = iter.map(|value| value.to_string()).collect::<Vec<_>>();
+            cmd_args.extend(args.iter().cloned());
+            Ok((cmd, cmd_args))
+        }
+    }
+}
+
+fn merged_headers(
+    headers: Option<&BTreeMap<String, String>>,
+    bearer_token_env_var: Option<&String>,
+    env_headers: Option<&BTreeMap<String, String>>,
+) -> BTreeMap<String, String> {
+    let mut merged = headers.cloned().unwrap_or_default();
+    if let Some(env_var) = bearer_token_env_var {
+        merged
+            .entry("Authorization".to_string())
+            .or_insert_with(|| format!("Bearer ${env_var}"));
+    }
+    if let Some(env_headers) = env_headers {
+        for (key, value) in env_headers {
+            merged
+                .entry(key.clone())
+                .or_insert_with(|| format!("${value}"));
+        }
+    }
+    merged
+}
+
+async fn resolve_fs_path(
+    state: &Arc<AppState>,
+    session_id: Option<&str>,
+    raw_path: &str,
+) -> Result<PathBuf, SandboxError> {
+    let path = PathBuf::from(raw_path);
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    let root = resolve_fs_root(state, session_id).await?;
+    let relative = sanitize_relative_path(&path)?;
+    Ok(root.join(relative))
+}
+
+async fn resolve_fs_root(
+    state: &Arc<AppState>,
+    session_id: Option<&str>,
+) -> Result<PathBuf, SandboxError> {
+    if let Some(session_id) = session_id {
+        return state.session_manager.session_working_dir(session_id).await;
+    }
+    let home = dirs::home_dir().ok_or_else(|| SandboxError::InvalidRequest {
+        message: "home directory unavailable".to_string(),
+    })?;
+    Ok(home)
+}
+
+fn sanitize_relative_path(path: &StdPath) -> Result<PathBuf, SandboxError> {
+    use std::path::Component;
+    let mut sanitized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(value) => sanitized.push(value),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(SandboxError::InvalidRequest {
+                    message: format!("invalid relative path: {}", path.display()),
+                });
+            }
+        }
+    }
+    Ok(sanitized)
+}
+
+fn map_fs_error(path: &StdPath, err: std::io::Error) -> SandboxError {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        SandboxError::InvalidRequest {
+            message: format!("path not found: {}", path.display()),
+        }
+    } else {
+        SandboxError::StreamError {
+            message: err.to_string(),
+        }
+    }
+}
+
+fn format_message_with_attachments(message: &str, attachments: &[MessageAttachment]) -> String {
+    if attachments.is_empty() {
+        return message.to_string();
+    }
+    let mut combined = String::new();
+    combined.push_str(message);
+    combined.push_str("\n\nAttachments:\n");
+    for attachment in attachments {
+        combined.push_str("- ");
+        combined.push_str(&attachment.path);
+        combined.push('\n');
+    }
+    combined
+}
+
+fn opencode_file_part_input(attachment: &MessageAttachment) -> Value {
+    let path = attachment.path.as_str();
+    let url = if path.starts_with("file://") {
+        path.to_string()
+    } else {
+        format!("file://{path}")
+    };
+    let filename = attachment.filename.clone().or_else(|| {
+        let clean = path.strip_prefix("file://").unwrap_or(path);
+        StdPath::new(clean)
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+    });
+    let mut map = serde_json::Map::new();
+    map.insert("type".to_string(), json!("file"));
+    map.insert(
+        "mime".to_string(),
+        json!(
+            attachment
+                .mime
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".to_string())
+        ),
+    );
+    map.insert("url".to_string(), json!(url));
+    if let Some(filename) = filename {
+        map.insert("filename".to_string(), json!(filename));
+    }
+    Value::Object(map)
 }
 
 fn claude_input_session_id(session: &SessionSnapshot) -> String {
@@ -6093,7 +8253,6 @@ struct CodexAppServerState {
     next_id: i64,
     prompt: String,
     model: Option<String>,
-    effort: Option<codex_schema::ReasoningEffort>,
     cwd: Option<String>,
     approval_policy: Option<codex_schema::AskForApproval>,
     sandbox_mode: Option<codex_schema::SandboxMode>,
@@ -6118,7 +8277,6 @@ impl CodexAppServerState {
             next_id: 1,
             prompt,
             model: options.model.clone(),
-            effort: codex_effort_from_variant(options.variant.as_deref()),
             cwd,
             approval_policy: codex_approval_policy(options.permission_mode.as_deref()),
             sandbox_mode: codex_sandbox_mode(options.permission_mode.as_deref()),
@@ -6364,7 +8522,7 @@ impl CodexAppServerState {
             approval_policy: self.approval_policy,
             collaboration_mode: None,
             cwd: self.cwd.clone(),
-            effort: self.effort.clone(),
+            effort: None,
             input: vec![codex_schema::UserInput::Text {
                 text: self.prompt.clone(),
                 text_elements: Vec::new(),
@@ -6405,15 +8563,6 @@ fn codex_prompt_for_mode(prompt: &str, mode: Option<&str>) -> String {
         Some("plan") => format!("Make a plan before acting.\n\n{prompt}"),
         _ => prompt.to_string(),
     }
-}
-
-fn codex_effort_from_variant(variant: Option<&str>) -> Option<codex_schema::ReasoningEffort> {
-    let variant = variant?.trim();
-    if variant.is_empty() {
-        return None;
-    }
-    let normalized = variant.to_lowercase();
-    serde_json::from_value(Value::String(normalized)).ok()
 }
 
 fn codex_approval_policy(mode: Option<&str>) -> Option<codex_schema::AskForApproval> {
@@ -6964,6 +9113,8 @@ pub mod test_utils {
                 agent_version: None,
                 directory: None,
                 title: None,
+                mcp: None,
+                skills: None,
             };
             let mut session =
                 SessionState::new(session_id.to_string(), agent, &request).expect("session");

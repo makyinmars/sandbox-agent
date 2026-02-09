@@ -6,48 +6,162 @@
 
 export interface paths {
   "/v1/agents": {
+    /**
+     * List Agents
+     * @description Returns all available coding agents and their installation status.
+     */
     get: operations["list_agents"];
   };
   "/v1/agents/{agent}/install": {
+    /**
+     * Install Agent
+     * @description Installs or updates a coding agent (e.g. claude, codex, opencode, amp).
+     */
     post: operations["install_agent"];
   };
   "/v1/agents/{agent}/models": {
+    /**
+     * List Agent Models
+     * @description Returns the available LLM models for an agent.
+     */
     get: operations["get_agent_models"];
   };
   "/v1/agents/{agent}/modes": {
+    /**
+     * List Agent Modes
+     * @description Returns the available interaction modes for an agent.
+     */
     get: operations["get_agent_modes"];
   };
+  "/v1/fs/entries": {
+    /**
+     * List Directory
+     * @description Lists files and directories at the given path.
+     */
+    get: operations["fs_entries"];
+  };
+  "/v1/fs/entry": {
+    /**
+     * Delete Entry
+     * @description Deletes a file or directory.
+     */
+    delete: operations["fs_delete_entry"];
+  };
+  "/v1/fs/file": {
+    /**
+     * Read File
+     * @description Reads the raw bytes of a file.
+     */
+    get: operations["fs_read_file"];
+    /**
+     * Write File
+     * @description Writes raw bytes to a file, creating it if it doesn't exist.
+     */
+    put: operations["fs_write_file"];
+  };
+  "/v1/fs/mkdir": {
+    /**
+     * Create Directory
+     * @description Creates a directory, including any missing parent directories.
+     */
+    post: operations["fs_mkdir"];
+  };
+  "/v1/fs/move": {
+    /**
+     * Move Entry
+     * @description Moves or renames a file or directory.
+     */
+    post: operations["fs_move"];
+  };
+  "/v1/fs/stat": {
+    /**
+     * Get File Info
+     * @description Returns metadata (size, timestamps, type) for a path.
+     */
+    get: operations["fs_stat"];
+  };
+  "/v1/fs/upload-batch": {
+    /**
+     * Upload Files
+     * @description Uploads a tar.gz archive and extracts it to the destination directory.
+     */
+    post: operations["fs_upload_batch"];
+  };
   "/v1/health": {
+    /**
+     * Health Check
+     * @description Returns the server health status.
+     */
     get: operations["get_health"];
   };
   "/v1/sessions": {
+    /**
+     * List Sessions
+     * @description Returns all active sessions.
+     */
     get: operations["list_sessions"];
   };
   "/v1/sessions/{session_id}": {
+    /**
+     * Create Session
+     * @description Creates a new agent session with the given configuration.
+     */
     post: operations["create_session"];
   };
   "/v1/sessions/{session_id}/events": {
+    /**
+     * Get Events
+     * @description Returns session events with optional offset-based pagination.
+     */
     get: operations["get_events"];
   };
   "/v1/sessions/{session_id}/events/sse": {
+    /**
+     * Subscribe to Events (SSE)
+     * @description Opens an SSE stream for real-time session events.
+     */
     get: operations["get_events_sse"];
   };
   "/v1/sessions/{session_id}/messages": {
+    /**
+     * Send Message
+     * @description Sends a message to a session and returns immediately.
+     */
     post: operations["post_message"];
   };
   "/v1/sessions/{session_id}/messages/stream": {
+    /**
+     * Send Message (Streaming)
+     * @description Sends a message and returns an SSE event stream of the agent's response.
+     */
     post: operations["post_message_stream"];
   };
   "/v1/sessions/{session_id}/permissions/{permission_id}/reply": {
+    /**
+     * Reply to Permission
+     * @description Approves or denies a permission request from the agent.
+     */
     post: operations["reply_permission"];
   };
   "/v1/sessions/{session_id}/questions/{question_id}/reject": {
+    /**
+     * Reject Question
+     * @description Rejects a human-in-the-loop question from the agent.
+     */
     post: operations["reject_question"];
   };
   "/v1/sessions/{session_id}/questions/{question_id}/reply": {
+    /**
+     * Reply to Question
+     * @description Replies to a human-in-the-loop question from the agent.
+     */
     post: operations["reply_question"];
   };
   "/v1/sessions/{session_id}/terminate": {
+    /**
+     * Terminate Session
+     * @description Terminates a running session and cleans up resources.
+     */
     post: operations["terminate_session"];
   };
 }
@@ -76,7 +190,6 @@ export interface components {
       textMessages: boolean;
       toolCalls: boolean;
       toolResults: boolean;
-      variants: boolean;
     };
     AgentError: {
       agent?: string | null;
@@ -170,8 +283,12 @@ export interface components {
       agentMode?: string | null;
       agentVersion?: string | null;
       directory?: string | null;
+      mcp?: {
+        [key: string]: components["schemas"]["McpServerConfig"];
+      } | null;
       model?: string | null;
       permissionMode?: string | null;
+      skills?: components["schemas"]["SkillsConfig"] | null;
       title?: string | null;
       variant?: string | null;
     };
@@ -202,6 +319,64 @@ export interface components {
     };
     /** @enum {string} */
     FileAction: "read" | "write" | "patch";
+    FsActionResponse: {
+      path: string;
+    };
+    FsDeleteQuery: {
+      path: string;
+      recursive?: boolean | null;
+      sessionId?: string | null;
+    };
+    FsEntriesQuery: {
+      path?: string | null;
+      sessionId?: string | null;
+    };
+    FsEntry: {
+      entryType: components["schemas"]["FsEntryType"];
+      modified?: string | null;
+      name: string;
+      path: string;
+      /** Format: int64 */
+      size: number;
+    };
+    /** @enum {string} */
+    FsEntryType: "file" | "directory";
+    FsMoveRequest: {
+      from: string;
+      overwrite?: boolean | null;
+      to: string;
+    };
+    FsMoveResponse: {
+      from: string;
+      to: string;
+    };
+    FsPathQuery: {
+      path: string;
+      sessionId?: string | null;
+    };
+    FsSessionQuery: {
+      sessionId?: string | null;
+    };
+    FsStat: {
+      entryType: components["schemas"]["FsEntryType"];
+      modified?: string | null;
+      path: string;
+      /** Format: int64 */
+      size: number;
+    };
+    FsUploadBatchQuery: {
+      path?: string | null;
+      sessionId?: string | null;
+    };
+    FsUploadBatchResponse: {
+      paths: string[];
+      truncated: boolean;
+    };
+    FsWriteResponse: {
+      /** Format: int64 */
+      bytesWritten: number;
+      path: string;
+    };
     HealthResponse: {
       status: string;
     };
@@ -219,7 +394,51 @@ export interface components {
     ItemRole: "user" | "assistant" | "system" | "tool";
     /** @enum {string} */
     ItemStatus: "in_progress" | "completed" | "failed";
+    McpCommand: string | string[];
+    McpOAuthConfig: {
+      clientId?: string | null;
+      clientSecret?: string | null;
+      scope?: string | null;
+    };
+    McpOAuthConfigOrDisabled: components["schemas"]["McpOAuthConfig"] | boolean;
+    /** @enum {string} */
+    McpRemoteTransport: "http" | "sse";
+    McpServerConfig: ({
+      args?: string[];
+      command: components["schemas"]["McpCommand"];
+      cwd?: string | null;
+      enabled?: boolean | null;
+      env?: {
+        [key: string]: string;
+      } | null;
+      /** Format: int64 */
+      timeoutMs?: number | null;
+      /** @enum {string} */
+      type: "local";
+    }) | ({
+      bearerTokenEnvVar?: string | null;
+      enabled?: boolean | null;
+      envHeaders?: {
+        [key: string]: string;
+      } | null;
+      headers?: {
+        [key: string]: string;
+      } | null;
+      oauth?: components["schemas"]["McpOAuthConfigOrDisabled"] | null;
+      /** Format: int64 */
+      timeoutMs?: number | null;
+      transport?: components["schemas"]["McpRemoteTransport"] | null;
+      /** @enum {string} */
+      type: "remote";
+      url: string;
+    });
+    MessageAttachment: {
+      filename?: string | null;
+      mime?: string | null;
+      path: string;
+    };
     MessageRequest: {
+      attachments?: components["schemas"]["MessageAttachment"][];
       message: string;
     };
     PermissionEventData: {
@@ -295,10 +514,14 @@ export interface components {
       ended: boolean;
       /** Format: int64 */
       eventCount: number;
+      mcp?: {
+        [key: string]: components["schemas"]["McpServerConfig"];
+      } | null;
       model?: string | null;
       nativeSessionId?: string | null;
       permissionMode: string;
       sessionId: string;
+      skills?: components["schemas"]["SkillsConfig"] | null;
       title?: string | null;
       /** Format: int64 */
       updatedAt: number;
@@ -309,6 +532,16 @@ export interface components {
     };
     SessionStartedData: {
       metadata?: unknown;
+    };
+    SkillSource: {
+      ref?: string | null;
+      skills?: string[] | null;
+      source: string;
+      subpath?: string | null;
+      type: string;
+    };
+    SkillsConfig: {
+      sources: components["schemas"]["SkillSource"][];
     };
     StderrOutput: {
       /** @description First N lines of stderr (if truncated) or full stderr (if not truncated) */
@@ -371,8 +604,13 @@ export type external = Record<string, never>;
 
 export interface operations {
 
+  /**
+   * List Agents
+   * @description Returns all available coding agents and their installation status.
+   */
   list_agents: {
     responses: {
+      /** @description List of available agents */
       200: {
         content: {
           "application/json": components["schemas"]["AgentListResponse"];
@@ -380,6 +618,10 @@ export interface operations {
       };
     };
   };
+  /**
+   * Install Agent
+   * @description Installs or updates a coding agent (e.g. claude, codex, opencode, amp).
+   */
   install_agent: {
     parameters: {
       path: {
@@ -397,16 +639,19 @@ export interface operations {
       204: {
         content: never;
       };
+      /** @description Invalid request */
       400: {
         content: {
           "application/json": components["schemas"]["ProblemDetails"];
         };
       };
+      /** @description Agent not found */
       404: {
         content: {
           "application/json": components["schemas"]["ProblemDetails"];
         };
       };
+      /** @description Installation failed */
       500: {
         content: {
           "application/json": components["schemas"]["ProblemDetails"];
@@ -414,6 +659,10 @@ export interface operations {
       };
     };
   };
+  /**
+   * List Agent Models
+   * @description Returns the available LLM models for an agent.
+   */
   get_agent_models: {
     parameters: {
       path: {
@@ -422,18 +671,24 @@ export interface operations {
       };
     };
     responses: {
+      /** @description Available models */
       200: {
         content: {
           "application/json": components["schemas"]["AgentModelsResponse"];
         };
       };
-      400: {
+      /** @description Agent not found */
+      404: {
         content: {
           "application/json": components["schemas"]["ProblemDetails"];
         };
       };
     };
   };
+  /**
+   * List Agent Modes
+   * @description Returns the available interaction modes for an agent.
+   */
   get_agent_modes: {
     parameters: {
       path: {
@@ -442,11 +697,13 @@ export interface operations {
       };
     };
     responses: {
+      /** @description Available modes */
       200: {
         content: {
           "application/json": components["schemas"]["AgentModesResponse"];
         };
       };
+      /** @description Invalid request */
       400: {
         content: {
           "application/json": components["schemas"]["ProblemDetails"];
@@ -454,8 +711,204 @@ export interface operations {
       };
     };
   };
+  /**
+   * List Directory
+   * @description Lists files and directories at the given path.
+   */
+  fs_entries: {
+    parameters: {
+      query?: {
+        /** @description Path to list (relative or absolute) */
+        path?: string | null;
+        /** @description Session id for relative paths */
+        session_id?: string | null;
+      };
+    };
+    responses: {
+      /** @description Directory listing */
+      200: {
+        content: {
+          "application/json": components["schemas"]["FsEntry"][];
+        };
+      };
+    };
+  };
+  /**
+   * Delete Entry
+   * @description Deletes a file or directory.
+   */
+  fs_delete_entry: {
+    parameters: {
+      query: {
+        /** @description File or directory path */
+        path: string;
+        /** @description Session id for relative paths */
+        session_id?: string | null;
+        /** @description Delete directories recursively */
+        recursive?: boolean | null;
+      };
+    };
+    responses: {
+      /** @description Delete result */
+      200: {
+        content: {
+          "application/json": components["schemas"]["FsActionResponse"];
+        };
+      };
+    };
+  };
+  /**
+   * Read File
+   * @description Reads the raw bytes of a file.
+   */
+  fs_read_file: {
+    parameters: {
+      query: {
+        /** @description File path (relative or absolute) */
+        path: string;
+        /** @description Session id for relative paths */
+        session_id?: string | null;
+      };
+    };
+    responses: {
+      /** @description File content */
+      200: {
+        content: {
+          "application/octet-stream": string;
+        };
+      };
+    };
+  };
+  /**
+   * Write File
+   * @description Writes raw bytes to a file, creating it if it doesn't exist.
+   */
+  fs_write_file: {
+    parameters: {
+      query: {
+        /** @description File path (relative or absolute) */
+        path: string;
+        /** @description Session id for relative paths */
+        session_id?: string | null;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/octet-stream": string;
+      };
+    };
+    responses: {
+      /** @description Write result */
+      200: {
+        content: {
+          "application/json": components["schemas"]["FsWriteResponse"];
+        };
+      };
+    };
+  };
+  /**
+   * Create Directory
+   * @description Creates a directory, including any missing parent directories.
+   */
+  fs_mkdir: {
+    parameters: {
+      query: {
+        /** @description Directory path to create */
+        path: string;
+        /** @description Session id for relative paths */
+        session_id?: string | null;
+      };
+    };
+    responses: {
+      /** @description Directory created */
+      200: {
+        content: {
+          "application/json": components["schemas"]["FsActionResponse"];
+        };
+      };
+    };
+  };
+  /**
+   * Move Entry
+   * @description Moves or renames a file or directory.
+   */
+  fs_move: {
+    parameters: {
+      query?: {
+        /** @description Session id for relative paths */
+        session_id?: string | null;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["FsMoveRequest"];
+      };
+    };
+    responses: {
+      /** @description Move result */
+      200: {
+        content: {
+          "application/json": components["schemas"]["FsMoveResponse"];
+        };
+      };
+    };
+  };
+  /**
+   * Get File Info
+   * @description Returns metadata (size, timestamps, type) for a path.
+   */
+  fs_stat: {
+    parameters: {
+      query: {
+        /** @description Path to stat */
+        path: string;
+        /** @description Session id for relative paths */
+        session_id?: string | null;
+      };
+    };
+    responses: {
+      /** @description File metadata */
+      200: {
+        content: {
+          "application/json": components["schemas"]["FsStat"];
+        };
+      };
+    };
+  };
+  /**
+   * Upload Files
+   * @description Uploads a tar.gz archive and extracts it to the destination directory.
+   */
+  fs_upload_batch: {
+    parameters: {
+      query?: {
+        /** @description Destination directory for extraction */
+        path?: string | null;
+        /** @description Session id for relative paths */
+        session_id?: string | null;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/octet-stream": string;
+      };
+    };
+    responses: {
+      /** @description Upload result */
+      200: {
+        content: {
+          "application/json": components["schemas"]["FsUploadBatchResponse"];
+        };
+      };
+    };
+  };
+  /**
+   * Health Check
+   * @description Returns the server health status.
+   */
   get_health: {
     responses: {
+      /** @description Server is healthy */
       200: {
         content: {
           "application/json": components["schemas"]["HealthResponse"];
@@ -463,8 +916,13 @@ export interface operations {
       };
     };
   };
+  /**
+   * List Sessions
+   * @description Returns all active sessions.
+   */
   list_sessions: {
     responses: {
+      /** @description List of active sessions */
       200: {
         content: {
           "application/json": components["schemas"]["SessionListResponse"];
@@ -472,6 +930,10 @@ export interface operations {
       };
     };
   };
+  /**
+   * Create Session
+   * @description Creates a new agent session with the given configuration.
+   */
   create_session: {
     parameters: {
       path: {
@@ -485,16 +947,19 @@ export interface operations {
       };
     };
     responses: {
+      /** @description Session created */
       200: {
         content: {
           "application/json": components["schemas"]["CreateSessionResponse"];
         };
       };
+      /** @description Invalid request */
       400: {
         content: {
           "application/json": components["schemas"]["ProblemDetails"];
         };
       };
+      /** @description Session already exists */
       409: {
         content: {
           "application/json": components["schemas"]["ProblemDetails"];
@@ -502,6 +967,10 @@ export interface operations {
       };
     };
   };
+  /**
+   * Get Events
+   * @description Returns session events with optional offset-based pagination.
+   */
   get_events: {
     parameters: {
       query?: {
@@ -518,11 +987,13 @@ export interface operations {
       };
     };
     responses: {
+      /** @description Session events */
       200: {
         content: {
           "application/json": components["schemas"]["EventsResponse"];
         };
       };
+      /** @description Session not found */
       404: {
         content: {
           "application/json": components["schemas"]["ProblemDetails"];
@@ -530,6 +1001,10 @@ export interface operations {
       };
     };
   };
+  /**
+   * Subscribe to Events (SSE)
+   * @description Opens an SSE stream for real-time session events.
+   */
   get_events_sse: {
     parameters: {
       query?: {
@@ -550,6 +1025,10 @@ export interface operations {
       };
     };
   };
+  /**
+   * Send Message
+   * @description Sends a message to a session and returns immediately.
+   */
   post_message: {
     parameters: {
       path: {
@@ -567,6 +1046,7 @@ export interface operations {
       204: {
         content: never;
       };
+      /** @description Session not found */
       404: {
         content: {
           "application/json": components["schemas"]["ProblemDetails"];
@@ -574,6 +1054,10 @@ export interface operations {
       };
     };
   };
+  /**
+   * Send Message (Streaming)
+   * @description Sends a message and returns an SSE event stream of the agent's response.
+   */
   post_message_stream: {
     parameters: {
       query?: {
@@ -595,6 +1079,7 @@ export interface operations {
       200: {
         content: never;
       };
+      /** @description Session not found */
       404: {
         content: {
           "application/json": components["schemas"]["ProblemDetails"];
@@ -602,6 +1087,10 @@ export interface operations {
       };
     };
   };
+  /**
+   * Reply to Permission
+   * @description Approves or denies a permission request from the agent.
+   */
   reply_permission: {
     parameters: {
       path: {
@@ -621,6 +1110,7 @@ export interface operations {
       204: {
         content: never;
       };
+      /** @description Session or permission not found */
       404: {
         content: {
           "application/json": components["schemas"]["ProblemDetails"];
@@ -628,6 +1118,10 @@ export interface operations {
       };
     };
   };
+  /**
+   * Reject Question
+   * @description Rejects a human-in-the-loop question from the agent.
+   */
   reject_question: {
     parameters: {
       path: {
@@ -642,6 +1136,7 @@ export interface operations {
       204: {
         content: never;
       };
+      /** @description Session or question not found */
       404: {
         content: {
           "application/json": components["schemas"]["ProblemDetails"];
@@ -649,6 +1144,10 @@ export interface operations {
       };
     };
   };
+  /**
+   * Reply to Question
+   * @description Replies to a human-in-the-loop question from the agent.
+   */
   reply_question: {
     parameters: {
       path: {
@@ -668,6 +1167,7 @@ export interface operations {
       204: {
         content: never;
       };
+      /** @description Session or question not found */
       404: {
         content: {
           "application/json": components["schemas"]["ProblemDetails"];
@@ -675,6 +1175,10 @@ export interface operations {
       };
     };
   };
+  /**
+   * Terminate Session
+   * @description Terminates a running session and cleans up resources.
+   */
   terminate_session: {
     parameters: {
       path: {
@@ -687,6 +1191,7 @@ export interface operations {
       204: {
         content: never;
       };
+      /** @description Session not found */
       404: {
         content: {
           "application/json": components["schemas"]["ProblemDetails"];

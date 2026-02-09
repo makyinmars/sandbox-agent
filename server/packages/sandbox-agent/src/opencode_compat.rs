@@ -524,6 +524,8 @@ async fn ensure_backing_session(
         agent_version: None,
         directory,
         title,
+        mcp: None,
+        skills: None,
     };
     let manager = state.inner.session_manager();
     match manager
@@ -4264,7 +4266,7 @@ async fn oc_session_message_create(
         if let Err(err) = state
             .inner
             .session_manager()
-            .send_message(session_id.clone(), prompt_text)
+            .send_message(session_id.clone(), prompt_text, Vec::new())
             .await
         {
             let mut should_emit_idle = false;

@@ -743,7 +743,13 @@ fn parse_version_output(output: &std::process::Output) -> Option<String> {
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
-        .map(|line| line.to_string())
+        .map(|line| {
+            // Strip trailing metadata like " (released ...)" from version strings
+            match line.find(" (") {
+                Some(pos) => line[..pos].to_string(),
+                None => line.to_string(),
+            }
+        })
 }
 
 fn parse_jsonl(text: &str) -> Vec<Value> {

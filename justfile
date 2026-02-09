@@ -27,8 +27,12 @@ release-build-all:
 # =============================================================================
 
 [group('dev')]
-dev:
-	pnpm dev -F @sandbox-agent/inspector
+dev-daemon:
+	SANDBOX_AGENT_SKIP_INSPECTOR=1 cargo run -p sandbox-agent -- daemon start --upgrade
+
+[group('dev')]
+dev: dev-daemon
+	pnpm dev -F @sandbox-agent/inspector -- --host 0.0.0.0
 
 [group('dev')]
 build:
@@ -61,12 +65,16 @@ install-gigacode:
 	cp target/release/gigacode ~/.cargo/bin/gigacode
 
 [group('dev')]
+run-sa *ARGS:
+	SANDBOX_AGENT_SKIP_INSPECTOR=1 cargo run -p sandbox-agent -- {{ ARGS }}
+
+[group('dev')]
 run-gigacode *ARGS:
 	SANDBOX_AGENT_SKIP_INSPECTOR=1 cargo run -p gigacode -- {{ ARGS }}
 
 [group('dev')]
 dev-docs:
-	cd docs && pnpm dlx mintlify dev
+	cd docs && pnpm dlx mintlify dev --host 0.0.0.0
 
 install:
     pnpm install
