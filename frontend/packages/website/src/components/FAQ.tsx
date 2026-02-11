@@ -18,7 +18,7 @@ const faqs = [
   {
     question: 'How is session data persisted?',
     answer:
-      "This SDK does not handle persisting session data. In v2, traffic is ACP JSON-RPC over <code>/v2/rpc</code>; persist envelopes in your own storage if you need replay or auditing.",
+      "This SDK does not handle persisting session data. Events stream in a universal JSON schema that you can persist anywhere. Consider using Postgres or <a href='https://rivet.gg' target='_blank' rel='noopener noreferrer' class='text-orange-400 hover:underline'>Rivet Actors</a> for data persistence.",
   },
   {
     question: 'Can I run this locally or does it require a sandbox provider?',
@@ -61,14 +61,14 @@ function FAQItem({ question, answer }: { question: string; answer: string }) {
   const [isOpen, setIsOpen] = useState(false);
 
   return (
-    <div className="border-t border-white/10 first:border-t-0">
+    <div className="border-b border-white/5">
       <button
         onClick={() => setIsOpen(!isOpen)}
-        className="group flex w-full items-center justify-between py-5 text-left"
+        className="flex w-full items-center justify-between py-5 text-left"
       >
-        <span className="text-base font-normal text-white pr-4 group-hover:text-zinc-300 transition-colors">{question}</span>
+        <span className="text-base font-medium text-white pr-4">{question}</span>
         <ChevronDown
-          className={`h-4 w-4 shrink-0 text-zinc-500 transition-transform duration-200 ${
+          className={`h-5 w-5 shrink-0 text-zinc-500 transition-transform duration-200 ${
             isOpen ? 'rotate-180' : ''
           }`}
         />
@@ -82,7 +82,7 @@ function FAQItem({ question, answer }: { question: string; answer: string }) {
             transition={{ duration: 0.2 }}
             className="overflow-hidden"
           >
-            <p className="pb-5 text-sm leading-relaxed text-zinc-500" dangerouslySetInnerHTML={{ __html: answer }} />
+            <p className="pb-5 text-sm leading-relaxed text-zinc-400" dangerouslySetInnerHTML={{ __html: answer }} />
           </motion.div>
         )}
       </AnimatePresence>
@@ -92,40 +92,22 @@ function FAQItem({ question, answer }: { question: string; answer: string }) {
 
 export function FAQ() {
   return (
-    <section className="border-t border-white/10 py-48">
-      <div className="mx-auto max-w-7xl px-6">
+    <section className="relative overflow-hidden border-t border-white/5 py-24">
+      <div className="mx-auto max-w-3xl px-6">
         <div className="mb-12 text-center">
-          <motion.h2
-            initial={{ opacity: 0, y: 20 }}
-            whileInView={{ opacity: 1, y: 0 }}
-            viewport={{ once: true }}
-            transition={{ duration: 0.5 }}
-            className="mb-2 text-2xl font-normal tracking-tight text-white md:text-4xl"
-          >
+          <h2 className="mb-4 text-3xl font-medium tracking-tight text-white">
             Frequently Asked Questions
-          </motion.h2>
-          <motion.p
-            initial={{ opacity: 0, y: 20 }}
-            whileInView={{ opacity: 1, y: 0 }}
-            viewport={{ once: true }}
-            transition={{ duration: 0.5, delay: 0.1 }}
-            className="mx-auto max-w-xl text-base leading-relaxed text-zinc-500"
-          >
+          </h2>
+          <p className="text-zinc-400">
             Common questions about running agents in sandboxes.
-          </motion.p>
+          </p>
         </div>
 
-        <motion.div
-          initial={{ opacity: 0, y: 20 }}
-          whileInView={{ opacity: 1, y: 0 }}
-          viewport={{ once: true }}
-          transition={{ duration: 0.5, delay: 0.2 }}
-          className="mx-auto max-w-3xl"
-        >
+        <div className="divide-y divide-white/5 rounded-2xl border border-white/5 bg-zinc-900/30 px-6">
           {faqs.map((faq, index) => (
             <FAQItem key={index} question={faq.question} answer={faq.answer} />
           ))}
-        </motion.div>
+        </div>
       </div>
     </section>
   );

@@ -1,7 +1,5 @@
 'use client';
 
-import { motion } from 'framer-motion';
-
 const footer = {
   products: [
     { name: 'Actors', href: 'https://rivet.dev/docs/actors' },
@@ -50,22 +48,16 @@ const footer = {
 
 export function Footer() {
   return (
-    <footer className="border-t border-white/10 bg-black">
-      <div className="mx-auto max-w-6xl px-6 py-16 lg:py-20">
+    <footer className="border-t border-white/10 bg-zinc-950">
+      <div className="mx-auto max-w-7xl px-6 py-12 lg:py-16">
         <div className="xl:grid xl:grid-cols-12 xl:gap-16">
           {/* Logo & Social */}
-          <motion.div
-            initial={{ opacity: 0, y: 20 }}
-            whileInView={{ opacity: 1, y: 0 }}
-            viewport={{ once: true }}
-            transition={{ duration: 0.5 }}
-            className="space-y-6 xl:col-span-4"
-          >
-            <a href="https://rivet.dev" className="inline-block">
-              <img src="/rivet-logo-text-white.svg" alt="Rivet" className="h-6 w-auto opacity-90 hover:opacity-100 transition-opacity" />
+          <div className="space-y-6 xl:col-span-4">
+            <a href="https://rivet.dev">
+              <img src="/rivet-logo-text-white.svg" alt="Rivet" className="h-6 w-auto" />
             </a>
-            <p className="text-sm leading-6 text-zinc-500">
-              Infrastructure for software that thinks
+            <p className="text-sm leading-6 text-zinc-400">
+              Build and scale stateful workloads
             </p>
             <div className="flex space-x-4">
               {footer.social.map((item) => (
@@ -81,87 +73,64 @@ export function Footer() {
                 </a>
               ))}
             </div>
-          </motion.div>
+          </div>
 
           {/* Links */}
           <div className="mt-12 grid grid-cols-2 gap-8 md:grid-cols-3 xl:col-span-8 xl:mt-0">
-            <motion.div
-              initial={{ opacity: 0, y: 20 }}
-              whileInView={{ opacity: 1, y: 0 }}
-              viewport={{ once: true }}
-              transition={{ duration: 0.5, delay: 0.1 }}
-            >
+            <div>
               <h3 className="text-sm font-semibold leading-6 text-white">Products</h3>
               <ul role="list" className="mt-4 space-y-3">
                 {footer.products.map((item) => (
                   <li key={item.name}>
                     <a
                       href={item.href}
-                      className="text-sm leading-6 text-zinc-500 hover:text-white transition-colors"
+                      className="text-sm leading-6 text-zinc-400 hover:text-white transition-colors"
                     >
                       {item.name}
                     </a>
                   </li>
                 ))}
               </ul>
-            </motion.div>
-
-            <motion.div
-              initial={{ opacity: 0, y: 20 }}
-              whileInView={{ opacity: 1, y: 0 }}
-              viewport={{ once: true }}
-              transition={{ duration: 0.5, delay: 0.15 }}
-            >
+            </div>
+            <div>
               <h3 className="text-sm font-semibold leading-6 text-white">Developers</h3>
               <ul role="list" className="mt-4 space-y-3">
                 {footer.developers.map((item) => (
                   <li key={item.name}>
                     <a
                       href={item.href}
-                      className="text-sm leading-6 text-zinc-500 hover:text-white transition-colors"
+                      className="text-sm leading-6 text-zinc-400 hover:text-white transition-colors"
                     >
                       {item.name}
                     </a>
                   </li>
                 ))}
               </ul>
-            </motion.div>
-
-            <motion.div
-              initial={{ opacity: 0, y: 20 }}
-              whileInView={{ opacity: 1, y: 0 }}
-              viewport={{ once: true }}
-              transition={{ duration: 0.5, delay: 0.2 }}
-            >
+            </div>
+            <div>
               <h3 className="text-sm font-semibold leading-6 text-white">Legal</h3>
               <ul role="list" className="mt-4 space-y-3">
                 {footer.legal.map((item) => (
                   <li key={item.name}>
                     <a
                       href={item.href}
-                      className="text-sm leading-6 text-zinc-500 hover:text-white transition-colors"
+                      className="text-sm leading-6 text-zinc-400 hover:text-white transition-colors"
                     >
                       {item.name}
                     </a>
                   </li>
                 ))}
               </ul>
-            </motion.div>
+            </div>
           </div>
         </div>
 
         {/* Bottom */}
-        <motion.div
-          initial={{ opacity: 0 }}
-          whileInView={{ opacity: 1 }}
-          viewport={{ once: true }}
-          transition={{ duration: 0.5, delay: 0.3 }}
-          className="mt-12 border-t border-white/10 pt-8"
-        >
-          <p className="text-xs text-zinc-600 text-center">
+        <div className="mt-12 border-t border-white/10 pt-8">
+          <p className="text-xs text-zinc-500 text-center">
             &copy; {new Date().getFullYear()} Rivet Gaming, Inc. All rights reserved.
           </p>
-        </motion.div>
+        </div>
       </div>
     </footer>
   );
