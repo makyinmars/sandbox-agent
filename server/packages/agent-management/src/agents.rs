@@ -21,6 +21,7 @@ pub enum AgentId {
     Opencode,
     Amp,
     Pi,
+    Cursor,
     Mock,
 }
 
@@ -32,54 +33,20 @@ impl AgentId {
             AgentId::Opencode => "opencode",
             AgentId::Amp => "amp",
             AgentId::Pi => "pi",
+            AgentId::Cursor => "cursor",
             AgentId::Mock => "mock",
         }
     }
 
     pub fn binary_name(self) -> &'static str {
         match self {
-            AgentId::Claude => {
-                if cfg!(windows) {
-                    "claude.exe"
-                } else {
-                    "claude"
-                }
-            }
-            AgentId::Codex => {
-                if cfg!(windows) {
-                    "codex.exe"
-                } else {
-                    "codex"
-                }
-            }
-            AgentId::Opencode => {
-                if cfg!(windows) {
-                    "opencode.exe"
-                } else {
-                    "opencode"
-                }
-            }
-            AgentId::Amp => {
-                if cfg!(windows) {
-                    "amp.exe"
-                } else {
-                    "amp"
-                }
-            }
-            AgentId::Pi => {
-                if cfg!(windows) {
-                    "pi.exe"
-                } else {
-                    "pi"
-                }
-            }
-            AgentId::Mock => {
-                if cfg!(windows) {
-                    "mock.exe"
-                } else {
-                    "mock"
-                }
-            }
+            AgentId::Claude => "claude",
+            AgentId::Codex => "codex",
+            AgentId::Opencode => "opencode",
+            AgentId::Amp => "amp",
+            AgentId::Pi => "pi",
+            AgentId::Cursor => "cursor-agent",
+            AgentId::Mock => "mock",
         }
     }
 
@@ -90,6 +57,7 @@ impl AgentId {
             "opencode" => Some(AgentId::Opencode),
             "amp" => Some(AgentId::Amp),
             "pi" => Some(AgentId::Pi),
+            "cursor" => Some(AgentId::Cursor),
             "mock" => Some(AgentId::Mock),
             _ => None,
         }
@@ -191,6 +159,7 @@ impl AgentManager {
             }
             AgentId::Amp => install_amp(&install_path, self.platform, options.version.as_deref())?,
             AgentId::Pi => install_pi(&install_path, self.platform, options.version.as_deref())?,
+            AgentId::Cursor => install_cursor(&install_path, self.platform, options.version.as_deref())?,
             AgentId::Mock => {
                 if !install_path.exists() {
                     fs::write(&install_path, b"mock")?;
@@ -208,9 +177,7 @@ impl AgentManager {
         if agent == AgentId::Mock {
             return true;
         }
-        self.binary_path(agent).exists()
-            || find_in_path(agent.binary_name()).is_some()
-            || default_install_dir().join(agent.binary_name()).exists()
+        self.binary_path(agent).exists() || find_in_path(agent.binary_name()).is_some()
     }
 
     pub fn binary_path(&self, agent: AgentId) -> PathBuf {
@@ -305,6 +272,21 @@ impl AgentManager {
                 if let Some(variant) = options.variant.as_deref() {
                     command.arg("--variant").arg(variant);
                 }
+                if options.permission_mode.as_deref() == Some("bypass") {
+                    command.arg("--dangerously-skip-permissions");
+                }
+                if let Some(session_id) = options.session_id.as_deref() {
+                    command.arg("-s").arg(session_id);
+                }
+                command.arg(&options.prompt);
+            }
+            AgentId::Cursor => {
+                // cursor-agent typically runs as HTTP server on localhost:32123
+                // For CLI usage similar to opencode
+                command.arg("run").arg("--format").arg("json");
+                if let Some(model) = options.model.as_deref() {
+                    command.arg("-m").arg(model);
+                }
                 if let Some(session_id) = options.session_id.as_deref() {
                     command.arg("-s").arg(session_id);
                 }
@@ -386,6 +368,12 @@ impl AgentManager {
             options.streaming_input = true;
         }
         let mut command = self.build_command(agent, &options)?;
+
+        // Pass environment variables to the agent process (e.g., ANTHROPIC_API_KEY)
+        for (key, value) in &options.env {
+            command.env(key, value);
+        }
+
         if matches!(agent, AgentId::Codex | AgentId::Claude) {
             command.stdin(Stdio::piped());
         }
@@ -687,6 +675,9 @@ impl AgentManager {
                 if let Some(variant) = options.variant.as_deref() {
                     command.arg("--variant").arg(variant);
                 }
+                if options.permission_mode.as_deref() == Some("bypass") {
+                    command.arg("--dangerously-skip-permissions");
+                }
                 if let Some(session_id) = options.session_id.as_deref() {
                     command.arg("-s").arg(session_id);
                 }
@@ -694,6 +685,16 @@ impl AgentManager {
             }
             AgentId::Amp => {
                 return Ok(build_amp_command(&path, &working_dir, options));
+            }
+            AgentId::Cursor => {
+                command.arg("run").arg("--format").arg("json");
+                if let Some(model) = options.model.as_deref() {
+                    command.arg("-m").arg(model);
+                }
+                if let Some(session_id) = options.session_id.as_deref() {
+                    command.arg("-s").arg(session_id);
+                }
+                command.arg(&options.prompt);
             }
             AgentId::Pi => {
                 unreachable!("Pi is handled by router RPC runtime");
@@ -717,10 +718,6 @@ impl AgentManager {
         }
         if let Some(path) = find_in_path(agent.binary_name()) {
             return Ok(path);
-        }
-        let fallback = default_install_dir().join(agent.binary_name());
-        if fallback.exists() {
-            return Ok(fallback);
         }
         Err(AgentError::BinaryNotFound { agent })
     }
@@ -832,7 +829,13 @@ fn parse_version_output(output: &std::process::Output) -> Option<String> {
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
-        .map(|line| line.to_string())
+        .map(|line| {
+            // Strip trailing metadata like " (released ...)" from version strings
+            match line.find(" (") {
+                Some(pos) => line[..pos].to_string(),
+                None => line.to_string(),
+            }
+        })
 }
 
 fn parse_jsonl(text: &str) -> Vec<Value> {
@@ -1042,6 +1045,14 @@ fn extract_session_id(agent: AgentId, events: &[Value]) -> Option<String> {
                     return Some(id);
                 }
             }
+            AgentId::Cursor => {
+                if let Some(id) = event.get("session_id").and_then(Value::as_str) {
+                    return Some(id.to_string());
+                }
+                if let Some(id) = event.get("sessionId").and_then(Value::as_str) {
+                    return Some(id.to_string());
+                }
+            }
             AgentId::Mock => {}
         }
     }
@@ -1125,6 +1136,7 @@ fn extract_result_text(agent: AgentId, events: &[Value]) -> Option<String> {
             }
         }
         AgentId::Pi => extract_pi_result_text(events),
+        AgentId::Cursor => None,
         AgentId::Mock => None,
     }
 }
@@ -1251,26 +1263,21 @@ fn spawn_amp(
     let mut args: Vec<&str> = Vec::new();
     if flags.execute {
         args.push("--execute");
-    } else if flags.print {
-        args.push("--print");
+        args.push(&options.prompt);
     }
     if flags.output_format {
-        args.push("--output-format");
-        args.push("stream-json");
+        args.push("--stream-json");
     }
     if flags.dangerously_skip_permissions && options.permission_mode.as_deref() == Some("bypass") {
-        args.push("--dangerously-skip-permissions");
+        args.push("--dangerously-allow-all");
     }
 
     let mut command = Command::new(path);
     command.current_dir(working_dir);
-    if let Some(model) = options.model.as_deref() {
-        command.arg("--model").arg(model);
-    }
     if let Some(session_id) = options.session_id.as_deref() {
         command.arg("--continue").arg(session_id);
     }
-    command.args(&args).arg(&options.prompt);
+    command.args(&args);
     for (key, value) in &options.env {
         command.env(key, value);
     }
@@ -1294,24 +1301,19 @@ fn build_amp_command(path: &Path, working_dir: &Path, options: &SpawnOptions) ->
     let flags = detect_amp_flags(path, working_dir).unwrap_or_default();
     let mut command = Command::new(path);
     command.current_dir(working_dir);
-    if let Some(model) = options.model.as_deref() {
-        command.arg("--model").arg(model);
-    }
     if let Some(session_id) = options.session_id.as_deref() {
         command.arg("--continue").arg(session_id);
     }
     if flags.execute {
         command.arg("--execute");
-    } else if flags.print {
-        command.arg("--print");
+        command.arg(&options.prompt);
     }
     if flags.output_format {
-        command.arg("--output-format").arg("stream-json");
+        command.arg("--stream-json");
     }
     if flags.dangerously_skip_permissions && options.permission_mode.as_deref() == Some("bypass") {
-        command.arg("--dangerously-skip-permissions");
+        command.arg("--dangerously-allow-all");
     }
-    command.arg(&options.prompt);
     for (key, value) in &options.env {
         command.env(key, value);
     }
@@ -1321,7 +1323,6 @@ fn build_amp_command(path: &Path, working_dir: &Path, options: &SpawnOptions) ->
 #[derive(Debug, Default, Clone, Copy)]
 struct AmpFlags {
     execute: bool,
-    print: bool,
     output_format: bool,
     dangerously_skip_permissions: bool,
 }
@@ -1339,9 +1340,8 @@ fn detect_amp_flags(path: &Path, working_dir: &Path) -> Option<AmpFlags> {
     );
     Some(AmpFlags {
         execute: text.contains("--execute"),
-        print: text.contains("--print"),
-        output_format: text.contains("--output-format"),
-        dangerously_skip_permissions: text.contains("--dangerously-skip-permissions"),
+        output_format: text.contains("--stream-json"),
+        dangerously_skip_permissions: text.contains("--dangerously-allow-all"),
     })
 }
 
@@ -1350,23 +1350,19 @@ fn spawn_amp_fallback(
     working_dir: &Path,
     options: &SpawnOptions,
 ) -> Result<std::process::Output, AgentError> {
-    let mut attempts = vec![
+    let mut attempts: Vec<Vec<&str>> = vec![
         vec!["--execute"],
-        vec!["--print", "--output-format", "stream-json"],
-        vec!["--output-format", "stream-json"],
-        vec!["--dangerously-skip-permissions"],
+        vec!["stream-json"],
+        vec!["--dangerously-allow-all"],
         vec![],
     ];
     if options.permission_mode.as_deref() != Some("bypass") {
-        attempts.retain(|args| !args.contains(&"--dangerously-skip-permissions"));
+        attempts.retain(|args| !args.contains(&"--dangerously-allow-all"));
     }
 
     for args in attempts {
         let mut command = Command::new(path);
         command.current_dir(working_dir);
-        if let Some(model) = options.model.as_deref() {
-            command.arg("--model").arg(model);
-        }
         if let Some(session_id) = options.session_id.as_deref() {
             command.arg("--continue").arg(session_id);
         }
@@ -1385,9 +1381,6 @@ fn spawn_amp_fallback(
 
     let mut command = Command::new(path);
     command.current_dir(working_dir);
-    if let Some(model) = options.model.as_deref() {
-        command.arg("--model").arg(model);
-    }
     if let Some(session_id) = options.session_id.as_deref() {
         command.arg("--continue").arg(session_id);
     }
@@ -1409,10 +1402,28 @@ fn find_in_path(binary_name: &str) -> Option<PathBuf> {
     None
 }
 
-fn default_install_dir() -> PathBuf {
-    dirs::data_dir()
-        .map(|dir| dir.join("sandbox-agent").join("bin"))
-        .unwrap_or_else(|| PathBuf::from(".").join(".sandbox-agent").join("bin"))
+fn install_cursor(path: &Path, platform: Platform, _version: Option<&str>) -> Result<(), AgentError> {
+    // Note: cursor-agent binary URL needs to be verified
+    // Cursor Pro includes cursor-agent, typically installed via: curl -fsS https://cursor.com/install | bash
+    // For sandbox-agent, we need standalone cursor-agent binary
+    // TODO: Determine correct download URL for cursor-agent releases
+
+    let platform_segment = match platform {
+        Platform::LinuxX64 | Platform::LinuxX64Musl => "linux-x64",
+        Platform::LinuxArm64 => "linux-arm64",
+        Platform::MacosArm64 => "darwin-arm64",
+        Platform::MacosX64 => "darwin-x64",
+    };
+
+    // Placeholder URL - needs to be updated with actual cursor-agent release URL
+    let url = Url::parse(&format!(
+        "https://cursor.com/api/v1/releases/latest/download/cursor-agent-{platform_segment}",
+        platform_segment = platform_segment
+    ))?;
+
+    let bytes = download_bytes(&url)?;
+    write_executable(path, &bytes)?;
+    Ok(())
 }
 
 fn download_bytes(url: &Url) -> Result<Vec<u8>, AgentError> {

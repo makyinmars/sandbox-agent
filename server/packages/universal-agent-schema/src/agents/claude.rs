@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::Value;
 
 use crate::{
-    turn_completed_event, ContentPart, EventConversion, ItemDeltaData, ItemEventData, ItemKind,
+    turn_ended_event, ContentPart, EventConversion, ItemDeltaData, ItemEventData, ItemKind,
     ItemRole, ItemStatus, PermissionEventData, PermissionStatus, QuestionEventData, QuestionStatus,
     SessionStartedData, UniversalEventData, UniversalEventType, UniversalItem,
 };
@@ -425,7 +425,7 @@ fn result_event_to_universal(event: &Value, session_id: &str) -> Vec<EventConver
             UniversalEventType::ItemCompleted,
             UniversalEventData::Item(ItemEventData { item: message_item }),
         ),
-        turn_completed_event(),
+        turn_ended_event(None, None).synthetic(),
     ]
 }
 

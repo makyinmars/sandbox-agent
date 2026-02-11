@@ -17,6 +17,25 @@ describe("OpenCode-compatible Event Streaming", () => {
   let handle: SandboxAgentHandle;
   let client: OpencodeClient;
 
+  function uniqueSessionId(prefix: string): string {
+    return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  async function initSessionViaHttp(
+    sessionId: string,
+    body: Record<string, unknown>
+  ): Promise<void> {
+    const response = await fetch(`${handle.baseUrl}/opencode/session/${sessionId}/init`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${handle.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    expect(response.ok).toBe(true);
+  }
+
   beforeAll(async () => {
     await buildSandboxAgent();
   });
@@ -144,6 +163,182 @@ describe("OpenCode-compatible Event Streaming", () => {
 
       expect(response.data).toBeDefined();
     });
+
+    it("should be idle before first prompt and return to idle after prompt completion", async () => {
+      const sessionId = uniqueSessionId("status-idle");
+      await initSessionViaHttp(sessionId, { providerID: "mock", modelID: "mock" });
+
+      const initial = await client.session.status();
+      expect(initial.data?.[sessionId]?.type).toBe("idle");
+
+      const eventStream = await client.event.subscribe();
+      const statuses: string[] = [];
+
+      const collectIdle = new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(
+          () => reject(new Error("Timed out waiting for session.idle")),
+          15_000
+        );
+        (async () => {
+          try {
+            for await (const event of (eventStream as any).stream) {
+              if (event?.properties?.sessionID !== sessionId) continue;
+              if (event.type === "session.status") {
+                const statusType = event?.properties?.status?.type;
+                if (typeof statusType === "string") statuses.push(statusType);
+              }
+              if (event.type === "session.idle") {
+                clearTimeout(timeout);
+                resolve();
+                break;
+              }
+            }
+          } catch {
+            // Stream ended
+          }
+        })();
+      });
+
+      await client.session.prompt({
+        path: { id: sessionId },
+        body: {
+          model: { providerID: "mock", modelID: "mock" },
+          parts: [{ type: "text", text: "Say hello" }],
+        },
+      });
+
+      await collectIdle;
+
+      expect(statuses).toContain("busy");
+      expect(statuses.filter((status) => status === "busy")).toHaveLength(1);
+      const finalStatus = await client.session.status();
+      expect(finalStatus.data?.[sessionId]?.type).toBe("idle");
+    });
+
+    it("should report busy via /session/status while turn is in flight", async () => {
+      const sessionId = uniqueSessionId("status-busy-inflight");
+      await initSessionViaHttp(sessionId, { providerID: "mock", modelID: "mock" });
+
+      const eventStream = await client.event.subscribe();
+      let busySnapshot: string | undefined;
+
+      const waitForIdle = new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(
+          () => reject(new Error("Timed out waiting for busy status snapshot + session.idle")),
+          15_000
+        );
+        (async () => {
+          try {
+            for await (const event of (eventStream as any).stream) {
+              if (event?.properties?.sessionID !== sessionId) continue;
+
+              if (event.type === "session.status" && event?.properties?.status?.type === "busy" && !busySnapshot) {
+                for (let attempt = 0; attempt < 5; attempt += 1) {
+                  const status = await client.session.status();
+                  busySnapshot = status.data?.[sessionId]?.type;
+                  if (busySnapshot === "busy") {
+                    break;
+                  }
+                  await new Promise((resolveAttempt) => setTimeout(resolveAttempt, 20));
+                }
+              }
+
+              if (event.type === "session.idle") {
+                clearTimeout(timeout);
+                resolve();
+                break;
+              }
+            }
+          } catch {
+            // Stream ended
+          }
+        })();
+      });
+
+      await client.session.prompt({
+        path: { id: sessionId },
+        body: {
+          model: { providerID: "mock", modelID: "mock" },
+          parts: [{ type: "text", text: "tool" }],
+        },
+      });
+
+      await waitForIdle;
+      expect(busySnapshot).toBe("busy");
+    });
+
+    it("should emit session.error and return idle for failed turns", async () => {
+      const sessionId = uniqueSessionId("status-error");
+      await initSessionViaHttp(sessionId, { providerID: "mock", modelID: "mock" });
+
+      const eventStream = await client.event.subscribe();
+      const errors: any[] = [];
+      const idles: any[] = [];
+
+      const collectErrorAndIdle = new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(
+          () => reject(new Error("Timed out waiting for session.error + session.idle")),
+          15_000
+        );
+        (async () => {
+          try {
+            for await (const event of (eventStream as any).stream) {
+              if (event?.properties?.sessionID !== sessionId) continue;
+              if (event.type === "session.error") {
+                errors.push(event);
+              }
+              if (event.type === "session.idle") {
+                idles.push(event);
+              }
+              if (errors.length > 0 && idles.length > 0) {
+                clearTimeout(timeout);
+                resolve();
+                break;
+              }
+            }
+          } catch {
+            // Stream ended
+          }
+        })();
+      });
+
+      await client.session.prompt({
+        path: { id: sessionId },
+        body: {
+          model: { providerID: "mock", modelID: "mock" },
+          parts: [{ type: "text", text: "error" }],
+        },
+      });
+
+      await collectErrorAndIdle;
+
+      expect(errors.length).toBeGreaterThan(0);
+      const finalStatus = await client.session.status();
+      expect(finalStatus.data?.[sessionId]?.type).toBe("idle");
+    });
+
+    it("should report idle for newly initialized sessions across connected providers", async () => {
+      const providersResponse = await fetch(`${handle.baseUrl}/opencode/provider`, {
+        headers: { Authorization: `Bearer ${handle.token}` },
+      });
+      expect(providersResponse.ok).toBe(true);
+      const providersData = await providersResponse.json();
+
+      const connected: string[] = providersData.connected ?? [];
+      const defaults: Record<string, string> = providersData.default ?? {};
+
+      for (const providerID of connected) {
+        const modelID = defaults[providerID];
+        if (!modelID) continue;
+
+        const sessionId = uniqueSessionId(`status-${providerID.replace(/[^a-zA-Z0-9_-]/g, "_")}`);
+
+        await initSessionViaHttp(sessionId, { providerID, modelID });
+
+        const status = await client.session.status();
+        expect(status.data?.[sessionId]?.type).toBe("idle");
+      }
+    });
   });
 
   describe("session.idle count", () => {
@@ -237,6 +432,86 @@ describe("OpenCode-compatible Event Streaming", () => {
         (e) => e.type === "message.part.updated" && e.properties?.part?.type === "tool"
       );
       expect(toolParts.length).toBeGreaterThan(0);
+    });
+
+    it("should preserve part order based on first stream appearance", async () => {
+      const session = await client.session.create();
+      const sessionId = session.data?.id!;
+
+      const eventStream = await client.event.subscribe();
+      const seenPartIds: string[] = [];
+      let targetMessageId: string | null = null;
+
+      const collectIdle = new Promise<void>((resolve, reject) => {
+        let lingerTimer: ReturnType<typeof setTimeout> | null = null;
+        const timeout = setTimeout(() => reject(new Error("Timed out waiting for session.idle")), 15_000);
+        (async () => {
+          try {
+            for await (const event of (eventStream as any).stream) {
+              if (event?.properties?.sessionID !== sessionId) {
+                continue;
+              }
+
+              if (event.type === "message.part.updated") {
+                const messageId = event.properties?.messageID;
+                const partId = event.properties?.part?.id;
+                const partType = event.properties?.part?.type;
+                if (!targetMessageId && partType === "tool" && typeof messageId === "string") {
+                  targetMessageId = messageId;
+                }
+                if (
+                  targetMessageId &&
+                  messageId === targetMessageId &&
+                  typeof partId === "string" &&
+                  !seenPartIds.includes(partId)
+                ) {
+                  seenPartIds.push(partId);
+                }
+              }
+
+              if (event.type === "session.idle") {
+                if (!lingerTimer) {
+                  lingerTimer = setTimeout(() => {
+                    clearTimeout(timeout);
+                    resolve();
+                  }, 500);
+                }
+              }
+            }
+          } catch {
+            // Stream ended
+          }
+        })();
+      });
+
+      await client.session.prompt({
+        path: { id: sessionId },
+        body: {
+          model: { providerID: "mock", modelID: "mock" },
+          parts: [{ type: "text", text: "tool" }],
+        },
+      });
+
+      await collectIdle;
+
+      expect(targetMessageId).toBeTruthy();
+      expect(seenPartIds.length).toBeGreaterThan(0);
+
+      const response = await fetch(
+        `${handle.baseUrl}/opencode/session/${sessionId}/message/${targetMessageId}`,
+        {
+          headers: { Authorization: `Bearer ${handle.token}` },
+        }
+      );
+      expect(response.ok).toBe(true);
+      const message = (await response.json()) as any;
+      const returnedPartIds = (message?.parts ?? [])
+        .map((part: any) => part?.id)
+        .filter((id: any) => typeof id === "string");
+
+      const expectedSet = new Set(seenPartIds);
+      const returnedFiltered = returnedPartIds.filter((id: string) => expectedSet.has(id));
+      expect(returnedFiltered).toEqual(seenPartIds);
     });
   });
 });

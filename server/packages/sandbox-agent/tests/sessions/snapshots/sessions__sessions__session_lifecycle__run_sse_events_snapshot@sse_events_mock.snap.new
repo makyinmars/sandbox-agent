@@ -7,20 +7,16 @@ expression: normalized
   seq: 1
   session: started
   type: session.started
+- seq: 2
+  type: turn.started
 - item:
     content_types:
       - text
     kind: message
     role: user
     status: in_progress
-  seq: 2
-  type: item.started
-- delta:
-    delta: "<redacted>"
-    item_id: "<redacted>"
-    native_item_id: "<redacted>"
   seq: 3
-  type: item.delta
+  type: item.started
 - item:
     content_types:
       - text
@@ -42,34 +38,4 @@ expression: normalized
     item_id: "<redacted>"
     native_item_id: "<redacted>"
   seq: 6
-  type: item.delta
-- delta:
-    delta: "<redacted>"
-    item_id: "<redacted>"
-    native_item_id: "<redacted>"
-  seq: 7
-  type: item.delta
-- delta:
-    delta: "<redacted>"
-    item_id: "<redacted>"
-    native_item_id: "<redacted>"
-  seq: 8
-  type: item.delta
-- delta:
-    delta: "<redacted>"
-    item_id: "<redacted>"
-    native_item_id: "<redacted>"
-  seq: 9
-  type: item.delta
-- delta:
-    delta: "<redacted>"
-    item_id: "<redacted>"
-    native_item_id: "<redacted>"
-  seq: 10
-  type: item.delta
-- delta:
-    delta: "<redacted>"
-    item_id: "<redacted>"
-    native_item_id: "<redacted>"
-  seq: 11
   type: item.delta

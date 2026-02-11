@@ -20,6 +20,90 @@ describe("OpenCode-compatible Session API", () => {
   let handle: SandboxAgentHandle;
   let client: OpencodeClient;
 
+  async function createSessionViaHttp(body: Record<string, unknown>) {
+    const response = await fetch(`${handle.baseUrl}/opencode/session`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${handle.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    expect(response.ok).toBe(true);
+    return response.json();
+  }
+
+  async function getBackingSessionPermissionMode(sessionId: string) {
+    const response = await fetch(`${handle.baseUrl}/v1/sessions`, {
+      headers: { Authorization: `Bearer ${handle.token}` },
+    });
+    expect(response.ok).toBe(true);
+    const data = await response.json();
+    const session = (data.sessions ?? []).find((item: any) => item.sessionId === sessionId);
+    return session?.permissionMode;
+  }
+
+  async function getBackingSession(sessionId: string) {
+    const response = await fetch(`${handle.baseUrl}/v1/sessions`, {
+      headers: { Authorization: `Bearer ${handle.token}` },
+    });
+    expect(response.ok).toBe(true);
+    const data = await response.json();
+    return (data.sessions ?? []).find((item: any) => item.sessionId === sessionId);
+  }
+
+  async function initSessionViaHttp(
+    sessionId: string,
+    body: Record<string, unknown> = {}
+  ): Promise<{ response: Response; data: any }> {
+    const response = await fetch(`${handle.baseUrl}/opencode/session/${sessionId}/init`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${handle.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    const data = await response.json();
+    return { response, data };
+  }
+
+  async function listMessagesViaHttp(sessionId: string): Promise<any[]> {
+    const response = await fetch(`${handle.baseUrl}/opencode/session/${sessionId}/message`, {
+      headers: { Authorization: `Bearer ${handle.token}` },
+    });
+    expect(response.ok).toBe(true);
+    return response.json();
+  }
+
+  async function getProvidersViaHttp(): Promise<{
+    connected: string[];
+    default: Record<string, string>;
+  }> {
+    const response = await fetch(`${handle.baseUrl}/opencode/provider`, {
+      headers: { Authorization: `Bearer ${handle.token}` },
+    });
+    expect(response.ok).toBe(true);
+    const data = await response.json();
+    return {
+      connected: data.connected ?? [],
+      default: data.default ?? {},
+    };
+  }
+
+  async function waitForAssistantMessage(sessionId: string, timeoutMs = 10_000): Promise<any> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const messages = await listMessagesViaHttp(sessionId);
+      const assistant = messages.find((message) => message?.info?.role === "assistant");
+      if (assistant) {
+        return assistant;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error("Timed out waiting for assistant message");
+  }
+
   beforeAll(async () => {
     // Build the binary if needed
     await buildSandboxAgent();
@@ -63,6 +147,42 @@ describe("OpenCode-compatible Session API", () => {
 
       expect(session1.data?.id).not.toBe(session2.data?.id);
     });
+
+    it("should pass permissionMode bypass to backing session", async () => {
+      const session = await createSessionViaHttp({ permissionMode: "bypass" });
+      const sessionId = session.id as string;
+      expect(sessionId).toBeDefined();
+
+      const prompt = await client.session.prompt({
+        path: { id: sessionId },
+        body: {
+          model: { providerID: "mock", modelID: "mock" },
+          parts: [{ type: "text", text: "hello" }],
+        },
+      });
+      expect(prompt.error).toBeUndefined();
+
+      const permissionMode = await getBackingSessionPermissionMode(sessionId);
+      expect(permissionMode).toBe("bypass");
+    });
+
+    it("should accept permission_mode alias and pass bypass to backing session", async () => {
+      const session = await createSessionViaHttp({ permission_mode: "bypass" });
+      const sessionId = session.id as string;
+      expect(sessionId).toBeDefined();
+
+      const prompt = await client.session.prompt({
+        path: { id: sessionId },
+        body: {
+          model: { providerID: "mock", modelID: "mock" },
+          parts: [{ type: "text", text: "hello" }],
+        },
+      });
+      expect(prompt.error).toBeUndefined();
+
+      const permissionMode = await getBackingSessionPermissionMode(sessionId);
+      expect(permissionMode).toBe("bypass");
+    });
   });
 
   describe("session.list", () => {
@@ -86,6 +206,78 @@ describe("OpenCode-compatible Session API", () => {
     });
   });
 
+  describe("session.init", () => {
+    it("should accept empty init body and keep message flow working", async () => {
+      const session = await client.session.create();
+      const sessionId = session.data?.id!;
+      expect(sessionId).toBeDefined();
+
+      const initialized = await initSessionViaHttp(sessionId, {});
+      expect(initialized.response.ok).toBe(true);
+      expect(initialized.data).toBe(true);
+
+      const prompt = await client.session.prompt({
+        path: { id: sessionId },
+        body: {
+          parts: [{ type: "text", text: "hello after init" }],
+        } as any,
+      });
+      expect(prompt.error).toBeUndefined();
+
+      const assistant = await waitForAssistantMessage(sessionId);
+      expect(assistant?.info?.role).toBe("assistant");
+    });
+
+    it("should apply explicit init model selection to the backing session", async () => {
+      const session = await client.session.create();
+      const sessionId = session.data?.id!;
+      expect(sessionId).toBeDefined();
+
+      const initialized = await initSessionViaHttp(sessionId, {
+        providerID: "codex",
+        modelID: "gpt-5",
+        messageID: "msg_init",
+      });
+      expect(initialized.response.ok).toBe(true);
+      expect(initialized.data).toBe(true);
+
+      const backingSession = await getBackingSession(sessionId);
+      expect(backingSession?.agent).toBe("codex");
+      expect(backingSession?.model).toBe("gpt-5");
+    });
+
+    it("should accept first prompt after codex init without session-not-found", async () => {
+      const providers = await getProvidersViaHttp();
+      if (!providers.connected.includes("codex")) {
+        return;
+      }
+      const codexDefaultModel = providers.default?.codex;
+      if (!codexDefaultModel) {
+        return;
+      }
+
+      const session = await client.session.create();
+      const sessionId = session.data?.id!;
+      expect(sessionId).toBeDefined();
+
+      const initialized = await initSessionViaHttp(sessionId, {
+        providerID: "codex",
+        modelID: codexDefaultModel,
+      });
+      expect(initialized.response.ok).toBe(true);
+      expect(initialized.data).toBe(true);
+
+      const prompt = await client.session.prompt({
+        path: { id: sessionId },
+        body: {
+          model: { providerID: "codex", modelID: codexDefaultModel },
+          parts: [{ type: "text", text: "hello after codex init" }],
+        },
+      });
+      expect(prompt.error).toBeUndefined();
+    });
+  });
+
   describe("session.get", () => {
     it("should retrieve session by ID", async () => {
       const created = await client.session.create({ body: { title: "Test" } });
@@ -97,6 +289,41 @@ describe("OpenCode-compatible Session API", () => {
       expect(response.data).toBeDefined();
       expect(response.data?.id).toBe(sessionId);
       expect(response.data?.title).toBe("Test");
+    });
+
+    it("should keep session.get available during first prompt after /new-style creation", async () => {
+      const providers = await getProvidersViaHttp();
+      const providerId = providers.connected.find(
+        (provider) => provider !== "mock" && typeof providers.default?.[provider] === "string"
+      );
+      if (!providerId) {
+        return;
+      }
+      const modelId = providers.default?.[providerId];
+      if (!modelId) {
+        return;
+      }
+
+      const created = await client.session.create({ body: { title: "Race Repro" } });
+      const sessionId = created.data?.id!;
+      expect(sessionId).toBeDefined();
+
+      const promptPromise = client.session.prompt({
+        path: { id: sessionId },
+        body: {
+          model: { providerID: providerId, modelID: modelId },
+          parts: [{ type: "text", text: "hello after /new" }],
+        },
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 25));
+
+      const getDuringPrompt = await client.session.get({ path: { id: sessionId } });
+      expect(getDuringPrompt.error).toBeUndefined();
+      expect(getDuringPrompt.data?.id).toBe(sessionId);
+
+      // Best-effort settle; this assertion focuses on availability during the in-flight turn.
+      await promptPromise;
     });
 
     it("should return error for non-existent session", async () => {
@@ -120,6 +347,34 @@ describe("OpenCode-compatible Session API", () => {
 
       const response = await client.session.get({ path: { id: sessionId } });
       expect(response.data?.title).toBe("Updated");
+    });
+
+    it("should reject model changes after session creation", async () => {
+      const created = await client.session.create({ body: { title: "Original" } });
+      const sessionId = created.data?.id!;
+
+      const payloads = [
+        { providerID: "codex", modelID: "gpt-5" },
+        { provider_id: "codex", model_id: "gpt-5" },
+        { providerId: "codex", modelId: "gpt-5" },
+      ];
+
+      for (const payload of payloads) {
+        const response = await fetch(`${handle.baseUrl}/opencode/session/${sessionId}`, {
+          method: "PATCH",
+          headers: {
+            Authorization: `Bearer ${handle.token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(payload),
+        });
+        const data = await response.json();
+
+        expect(response.status).toBe(400);
+        expect(data?.errors?.[0]?.message).toBe(
+          "OpenCode compatibility currently does not support changing the model after creating a session. Export with /export and load in to a new session."
+        );
+      }
     });
   });
 

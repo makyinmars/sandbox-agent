@@ -3,11 +3,13 @@ import {
   SandboxAgentError,
   SandboxAgent,
   type AgentInfo,
+  type CreateSessionRequest,
   type AgentModelInfo,
   type AgentModeInfo,
   type PermissionEventData,
   type QuestionEventData,
   type SessionInfo,
+  type SkillSource,
   type UniversalEvent,
   type UniversalItem
 } from "sandbox-agent";
@@ -32,6 +34,41 @@ type ItemDeltaEventData = {
   delta: string;
 };
 
+export type McpServerEntry = {
+  name: string;
+  configJson: string;
+  error: string | null;
+};
+
+type ParsedMcpConfig = {
+  value: NonNullable<CreateSessionRequest["mcp"]>;
+  count: number;
+  error: string | null;
+};
+
+const buildMcpConfig = (entries: McpServerEntry[]): ParsedMcpConfig => {
+  if (entries.length === 0) {
+    return { value: {}, count: 0, error: null };
+  }
+  const firstError = entries.find((e) => e.error);
+  if (firstError) {
+    return { value: {}, count: entries.length, error: `${firstError.name}: ${firstError.error}` };
+  }
+  const value: NonNullable<CreateSessionRequest["mcp"]> = {};
+  for (const entry of entries) {
+    try {
+      value[entry.name] = JSON.parse(entry.configJson);
+    } catch {
+      return { value: {}, count: entries.length, error: `${entry.name}: Invalid JSON` };
+    }
+  }
+  return { value, count: entries.length, error: null };
+};
+
+const buildSkillsConfig = (sources: SkillSource[]): NonNullable<CreateSessionRequest["skills"]> => {
+  return { sources };
+};
+
 const buildStubItem = (itemId: string, nativeItemId?: string | null): UniversalItem => {
   return {
     item_id: itemId,
@@ -51,6 +88,23 @@ const getCurrentOriginEndpoint = () => {
     return null;
   }
   return window.location.origin;
+};
+
+const getSessionIdFromPath = (): string => {
+  const basePath = import.meta.env.BASE_URL;
+  const path = window.location.pathname;
+  const relative = path.startsWith(basePath) ? path.slice(basePath.length) : path;
+  const match = relative.match(/^sessions\/(.+)/);
+  return match ? match[1] : "";
+};
+
+const updateSessionPath = (id: string) => {
+  const basePath = import.meta.env.BASE_URL;
+  const params = window.location.search;
+  const newPath = id ? `${basePath}sessions/${id}${params}` : `${basePath}${params}`;
+  if (window.location.pathname + window.location.search !== newPath) {
+    window.history.replaceState(null, "", newPath);
+  }
 };
 
 const getInitialConnection = () => {
@@ -103,11 +157,7 @@ export default function App() {
   const [modelsErrorByAgent, setModelsErrorByAgent] = useState<Record<string, string | null>>({});
 
   const [agentId, setAgentId] = useState("claude");
-  const [agentMode, setAgentMode] = useState("");
-  const [permissionMode, setPermissionMode] = useState("default");
-  const [model, setModel] = useState("");
-  const [variant, setVariant] = useState("");
-  const [sessionId, setSessionId] = useState("");
+  const [sessionId, setSessionId] = useState(getSessionIdFromPath());
   const [sessionError, setSessionError] = useState<string | null>(null);
 
   const [message, setMessage] = useState("");
@@ -115,6 +165,8 @@ export default function App() {
   const [offset, setOffset] = useState(0);
   const offsetRef = useRef(0);
   const [eventsLoading, setEventsLoading] = useState(false);
+  const [mcpServers, setMcpServers] = useState<McpServerEntry[]>([]);
+  const [skillSources, setSkillSources] = useState<SkillSource[]>([]);
 
   const [polling, setPolling] = useState(false);
   const pollTimerRef = useRef<number | null>(null);
@@ -377,50 +429,52 @@ export default function App() {
     stopSse();
     stopTurnStream();
     setSessionId(session.sessionId);
+    updateSessionPath(session.sessionId);
     setAgentId(session.agent);
-    setAgentMode(session.agentMode);
-    setPermissionMode(session.permissionMode);
-    setModel(session.model ?? "");
-    setVariant(session.variant ?? "");
     setEvents([]);
     setOffset(0);
     offsetRef.current = 0;
     setSessionError(null);
   };
 
-  const createNewSession = async (nextAgentId?: string) => {
+  const createNewSession = async (
+    nextAgentId: string,
+    config: { model: string; agentMode: string; permissionMode: string; variant: string }
+  ) => {
     stopPolling();
     stopSse();
     stopTurnStream();
-    const selectedAgent = nextAgentId ?? agentId;
-    if (nextAgentId) {
-      setAgentId(nextAgentId);
+    setAgentId(nextAgentId);
+    if (parsedMcpConfig.error) {
+      setSessionError(parsedMcpConfig.error);
+      return;
     }
     const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
     let id = "session-";
     for (let i = 0; i < 8; i++) {
       id += chars[Math.floor(Math.random() * chars.length)];
     }
-    setSessionId(id);
-    setEvents([]);
-    setOffset(0);
-    offsetRef.current = 0;
     setSessionError(null);
 
     try {
-      const body: {
-        agent: string;
-        agentMode?: string;
-        permissionMode?: string;
-        model?: string;
-        variant?: string;
-      } = { agent: selectedAgent };
-      if (agentMode) body.agentMode = agentMode;
-      if (permissionMode) body.permissionMode = permissionMode;
-      if (model) body.model = model;
-      if (variant) body.variant = variant;
+      const body: CreateSessionRequest = { agent: nextAgentId };
+      if (config.agentMode) body.agentMode = config.agentMode;
+      if (config.permissionMode) body.permissionMode = config.permissionMode;
+      if (config.model) body.model = config.model;
+      if (config.variant) body.variant = config.variant;
+      if (parsedMcpConfig.count > 0) {
+        body.mcp = parsedMcpConfig.value;
+      }
+      if (parsedSkillsConfig.sources.length > 0) {
+        body.skills = parsedSkillsConfig;
+      }
 
       await getClient().createSession(id, body);
+      setSessionId(id);
+      updateSessionPath(id);
+      setEvents([]);
+      setOffset(0);
+      offsetRef.current = 0;
       await fetchSessions();
     } catch (error) {
       setSessionError(getErrorMessage(error, "Unable to create session"));
@@ -762,6 +816,30 @@ export default function App() {
           });
           break;
         }
+        case "turn.started": {
+          entries.push({
+            id: event.event_id,
+            kind: "meta",
+            time: event.time,
+            meta: {
+              title: "Turn started",
+              severity: "info"
+            }
+          });
+          break;
+        }
+        case "turn.ended": {
+          entries.push({
+            id: event.event_id,
+            kind: "meta",
+            time: event.time,
+            meta: {
+              title: "Turn ended",
+              severity: "info"
+            }
+          });
+          break;
+        }
         default:
           break;
       }
@@ -852,38 +930,10 @@ export default function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [transcriptEntries]);
 
-  useEffect(() => {
-    if (connected && agentId && !modesByAgent[agentId]) {
-      loadModes(agentId);
-    }
-  }, [connected, agentId]);
-
-  useEffect(() => {
-    if (connected && agentId && !modelsByAgent[agentId]) {
-      loadModels(agentId);
-    }
-  }, [connected, agentId]);
-
-  useEffect(() => {
-    const modes = modesByAgent[agentId];
-    if (modes && modes.length > 0 && !agentMode) {
-      setAgentMode(modes[0].id);
-    }
-  }, [modesByAgent, agentId]);
-
   const currentAgent = agents.find((agent) => agent.id === agentId);
-  const activeModes = modesByAgent[agentId] ?? [];
-  const modesLoading = modesLoadingByAgent[agentId] ?? false;
-  const modesError = modesErrorByAgent[agentId] ?? null;
-  const modelOptions = modelsByAgent[agentId] ?? [];
-  const modelsLoading = modelsLoadingByAgent[agentId] ?? false;
-  const modelsError = modelsErrorByAgent[agentId] ?? null;
-  const defaultModel = defaultModelByAgent[agentId] ?? "";
-  const selectedModelId = model || defaultModel;
-  const selectedModel = modelOptions.find((entry) => entry.id === selectedModelId);
-  const variantOptions = selectedModel?.variants ?? [];
-  const defaultVariant = selectedModel?.defaultVariant ?? "";
-  const supportsVariants = Boolean(currentAgent?.capabilities?.variants);
+  const currentSessionInfo = sessions.find((s) => s.sessionId === sessionId);
+  const parsedMcpConfig = useMemo(() => buildMcpConfig(mcpServers), [mcpServers]);
+  const parsedSkillsConfig = useMemo(() => buildSkillsConfig(skillSources), [skillSources]);
   const agentDisplayNames: Record<string, string> = {
     claude: "Claude Code",
     codex: "Codex",
@@ -893,6 +943,15 @@ export default function App() {
     mock: "Mock"
   };
   const agentLabel = agentDisplayNames[agentId] ?? agentId;
+
+  const handleSelectAgent = useCallback((targetAgentId: string) => {
+    if (connected && !modesByAgent[targetAgentId]) {
+      loadModes(targetAgentId);
+    }
+    if (connected && !modelsByAgent[targetAgentId]) {
+      loadModels(targetAgentId);
+    }
+  }, [connected, modesByAgent, modelsByAgent]);
 
   const handleKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Enter" && !event.shiftKey) {
@@ -957,17 +1016,28 @@ export default function App() {
           onSelectSession={selectSession}
           onRefresh={fetchSessions}
           onCreateSession={createNewSession}
+          onSelectAgent={handleSelectAgent}
           agents={agents.length ? agents : defaultAgents.map((id) => ({ id, installed: false, capabilities: {} }) as AgentInfo)}
           agentsLoading={agentsLoading}
           agentsError={agentsError}
           sessionsLoading={sessionsLoading}
           sessionsError={sessionsError}
+          modesByAgent={modesByAgent}
+          modelsByAgent={modelsByAgent}
+          defaultModelByAgent={defaultModelByAgent}
+          modesLoadingByAgent={modesLoadingByAgent}
+          modelsLoadingByAgent={modelsLoadingByAgent}
+          modesErrorByAgent={modesErrorByAgent}
+          modelsErrorByAgent={modelsErrorByAgent}
+          mcpServers={mcpServers}
+          onMcpServersChange={setMcpServers}
+          mcpConfigError={parsedMcpConfig.error}
+          skillSources={skillSources}
+          onSkillSourcesChange={setSkillSources}
         />
 
         <ChatPanel
           sessionId={sessionId}
-          polling={polling}
-          turnStreaming={turnStreaming}
           transcriptEntries={transcriptEntries}
           sessionError={sessionError}
           message={message}
@@ -975,36 +1045,19 @@ export default function App() {
           onSendMessage={sendMessage}
           onKeyDown={handleKeyDown}
           onCreateSession={createNewSession}
+          onSelectAgent={handleSelectAgent}
           agents={agents.length ? agents : defaultAgents.map((id) => ({ id, installed: false, capabilities: {} }) as AgentInfo)}
           agentsLoading={agentsLoading}
           agentsError={agentsError}
           messagesEndRef={messagesEndRef}
-          agentId={agentId}
           agentLabel={agentLabel}
-          agentMode={agentMode}
-          permissionMode={permissionMode}
-          model={model}
-          variant={variant}
-          modelOptions={modelOptions}
-          defaultModel={defaultModel}
-          modelsLoading={modelsLoading}
-          modelsError={modelsError}
-          variantOptions={variantOptions}
-          defaultVariant={defaultVariant}
-          supportsVariants={supportsVariants}
-          streamMode={streamMode}
-          activeModes={activeModes}
           currentAgentVersion={currentAgent?.version ?? null}
-          modesLoading={modesLoading}
-          modesError={modesError}
-          onAgentModeChange={setAgentMode}
-          onPermissionModeChange={setPermissionMode}
-          onModelChange={setModel}
-          onVariantChange={setVariant}
-          onStreamModeChange={setStreamMode}
-          onToggleStream={toggleStream}
+          sessionModel={currentSessionInfo?.model ?? null}
+          sessionVariant={currentSessionInfo?.variant ?? null}
+          sessionPermissionMode={currentSessionInfo?.permissionMode ?? null}
+          sessionMcpServerCount={currentSessionInfo?.mcp ? Object.keys(currentSessionInfo.mcp).length : 0}
+          sessionSkillSourceCount={currentSessionInfo?.skills?.sources?.length ?? 0}
           onEndSession={endSession}
-          hasSession={Boolean(sessionId)}
           eventError={eventError}
           questionRequests={questionRequests}
           permissionRequests={permissionRequests}
@@ -1013,6 +1066,18 @@ export default function App() {
           onAnswerQuestion={answerQuestion}
           onRejectQuestion={rejectQuestion}
           onReplyPermission={replyPermission}
+          modesByAgent={modesByAgent}
+          modelsByAgent={modelsByAgent}
+          defaultModelByAgent={defaultModelByAgent}
+          modesLoadingByAgent={modesLoadingByAgent}
+          modelsLoadingByAgent={modelsLoadingByAgent}
+          modesErrorByAgent={modesErrorByAgent}
+          modelsErrorByAgent={modelsErrorByAgent}
+          mcpServers={mcpServers}
+          onMcpServersChange={setMcpServers}
+          mcpConfigError={parsedMcpConfig.error}
+          skillSources={skillSources}
+          onSkillSourcesChange={setSkillSources}
         />
 
         <DebugPanel

@@ -3,8 +3,9 @@ use serde_json::Value;
 use crate::opencode as schema;
 use crate::{
     ContentPart, EventConversion, ItemDeltaData, ItemEventData, ItemKind, ItemRole, ItemStatus,
-    PermissionEventData, PermissionStatus, QuestionEventData, QuestionStatus, SessionStartedData,
-    UniversalEventData, UniversalEventType, UniversalItem,
+    PermissionEventData, PermissionStatus, QuestionEventData, QuestionStatus, ReasoningVisibility,
+    SessionStartedData, TurnEventData, TurnPhase, UniversalEventData, UniversalEventType,
+    UniversalItem,
 };
 
 pub fn event_to_universal(event: &schema::Event) -> Result<Vec<EventConversion>, String> {
@@ -69,27 +70,37 @@ pub fn event_to_universal(event: &schema::Event) -> Result<Vec<EventConversion>,
                     );
                 }
                 schema::Part::ReasoningPart(reasoning_part) => {
-                    let delta_text = delta
+                    let reasoning_text = delta
                         .as_ref()
                         .cloned()
                         .unwrap_or_else(|| reasoning_part.text.clone());
-                    let stub = stub_message_item(&message_id, ItemRole::Assistant);
+                    let reasoning_id = reasoning_part.id.clone();
+                    let mut started = stub_message_item(&reasoning_id, ItemRole::Assistant);
+                    started.parent_id = Some(message_id.clone());
+                    let completed = UniversalItem {
+                        item_id: String::new(),
+                        native_item_id: Some(reasoning_id),
+                        parent_id: Some(message_id.clone()),
+                        kind: ItemKind::Message,
+                        role: Some(ItemRole::Assistant),
+                        content: vec![ContentPart::Reasoning {
+                            text: reasoning_text,
+                            visibility: ReasoningVisibility::Public,
+                        }],
+                        status: ItemStatus::Completed,
+                    };
                     events.push(
                         EventConversion::new(
                             UniversalEventType::ItemStarted,
-                            UniversalEventData::Item(ItemEventData { item: stub }),
+                            UniversalEventData::Item(ItemEventData { item: started }),
                         )
                         .synthetic()
                         .with_raw(raw.clone()),
                     );
                     events.push(
                         EventConversion::new(
-                            UniversalEventType::ItemDelta,
-                            UniversalEventData::ItemDelta(ItemDeltaData {
-                                item_id: String::new(),
-                                native_item_id: Some(message_id.clone()),
-                                delta: delta_text,
-                            }),
+                            UniversalEventType::ItemCompleted,
+                            UniversalEventData::Item(ItemEventData { item: completed }),
                         )
                         .with_native_session(session_id.clone())
                         .with_raw(raw.clone()),
@@ -207,26 +218,59 @@ pub fn event_to_universal(event: &schema::Event) -> Result<Vec<EventConversion>,
                 properties,
                 type_: _,
             } = status;
+            let status_type = serde_json::to_value(&properties.status)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                });
             let detail =
                 serde_json::to_string(&properties.status).unwrap_or_else(|_| "status".to_string());
             let item = status_item("session.status", Some(detail));
-            let conversion = EventConversion::new(
+            let mut events = vec![EventConversion::new(
                 UniversalEventType::ItemCompleted,
                 UniversalEventData::Item(ItemEventData { item }),
             )
             .with_native_session(Some(properties.session_id.clone()))
-            .with_raw(raw);
-            Ok(vec![conversion])
+            .with_raw(raw.clone())];
+
+            if matches!(status_type.as_deref(), Some("busy" | "idle")) {
+                let (event_type, phase) = if status_type.as_deref() == Some("busy") {
+                    (UniversalEventType::TurnStarted, TurnPhase::Started)
+                } else {
+                    (UniversalEventType::TurnEnded, TurnPhase::Ended)
+                };
+                events.push(
+                    EventConversion::new(
+                        event_type,
+                        UniversalEventData::Turn(TurnEventData {
+                            phase,
+                            turn_id: None,
+                            metadata: Some(
+                                serde_json::to_value(&properties.status).unwrap_or(Value::Null),
+                            ),
+                        }),
+                    )
+                    .with_native_session(Some(properties.session_id.clone()))
+                    .with_raw(raw),
+                );
+            }
+            Ok(events)
         }
         schema::Event::SessionIdle(idle) => {
             let schema::EventSessionIdle {
                 properties,
                 type_: _,
             } = idle;
-            let item = status_item("session.idle", None);
             let conversion = EventConversion::new(
-                UniversalEventType::ItemCompleted,
-                UniversalEventData::Item(ItemEventData { item }),
+                UniversalEventType::TurnEnded,
+                UniversalEventData::Turn(TurnEventData {
+                    phase: TurnPhase::Ended,
+                    turn_id: None,
+                    metadata: None,
+                }),
             )
             .with_native_session(Some(properties.session_id.clone()))
             .with_raw(raw);
@@ -526,5 +570,52 @@ fn permission_from_opencode(request: &schema::PermissionRequest) -> PermissionEv
         action: request.permission.clone(),
         status: PermissionStatus::Requested,
         metadata: serde_json::to_value(request).ok(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_part_updates_stay_typed_not_text_delta() {
+        let event = schema::Event::MessagePartUpdated(schema::EventMessagePartUpdated {
+            properties: schema::EventMessagePartUpdatedProperties {
+                delta: Some("Preparing friendly brief response".to_string()),
+                part: schema::Part::ReasoningPart(schema::ReasoningPart {
+                    id: "part_reason_1".to_string(),
+                    message_id: "msg_1".to_string(),
+                    metadata: serde_json::Map::new(),
+                    session_id: "ses_1".to_string(),
+                    text: "Preparing".to_string(),
+                    time: schema::ReasoningPartTime {
+                        end: None,
+                        start: 0.0,
+                    },
+                    type_: "reasoning".to_string(),
+                }),
+            },
+            type_: "message.part.updated".to_string(),
+        });
+
+        let converted = event_to_universal(&event).expect("conversion succeeds");
+        assert_eq!(converted.len(), 2);
+        assert!(converted
+            .iter()
+            .all(|entry| entry.event_type != UniversalEventType::ItemDelta));
+
+        let completed = converted
+            .iter()
+            .find(|entry| entry.event_type == UniversalEventType::ItemCompleted)
+            .expect("item.completed exists");
+        let UniversalEventData::Item(ItemEventData { item }) = &completed.data else {
+            panic!("expected item payload");
+        };
+        assert_eq!(item.native_item_id.as_deref(), Some("part_reason_1"));
+        assert!(matches!(
+            item.content.first(),
+            Some(ContentPart::Reasoning { text, .. })
+                if text == "Preparing friendly brief response"
+        ));
     }
 }

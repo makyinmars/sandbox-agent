@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
@@ -13,12 +14,14 @@ mod build_version {
 }
 use crate::router::{build_router_with_state, shutdown_servers};
 use crate::router::{
-    AgentInstallRequest, AppState, AuthConfig, BrandingMode, CreateSessionRequest, MessageRequest,
-    PermissionReply, PermissionReplyRequest, QuestionReplyRequest,
+    AgentInstallRequest, AppState, AuthConfig, BrandingMode, CreateSessionRequest, McpServerConfig,
+    MessageRequest, PermissionReply, PermissionReplyRequest, QuestionReplyRequest, SkillSource,
+    SkillsConfig,
 };
 use crate::router::{
     AgentListResponse, AgentModelsResponse, AgentModesResponse, CreateSessionResponse,
-    EventsResponse, SessionListResponse,
+    EventsResponse, FsActionResponse, FsEntry, FsMoveRequest, FsMoveResponse, FsStat,
+    FsUploadBatchResponse, FsWriteResponse, SessionListResponse,
 };
 use crate::server_logs::ServerLogs;
 use crate::telemetry;
@@ -68,6 +71,10 @@ pub struct GigacodeCli {
 
     #[arg(long, short = 'n', global = true)]
     pub no_token: bool,
+
+    /// Bypass all permission checks (auto-approve tool calls).
+    #[arg(long, global = true)]
+    pub yolo: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -127,8 +134,9 @@ pub struct OpencodeArgs {
     #[arg(long)]
     session_title: Option<String>,
 
+    /// Bypass all permission checks (auto-approve tool calls).
     #[arg(long)]
-    opencode_bin: Option<PathBuf>,
+    pub yolo: bool,
 }
 
 impl Default for OpencodeArgs {
@@ -137,7 +145,7 @@ impl Default for OpencodeArgs {
             host: DEFAULT_HOST.to_string(),
             port: DEFAULT_PORT,
             session_title: None,
-            opencode_bin: None,
+            yolo: false,
         }
     }
 }
@@ -171,6 +179,10 @@ pub struct DaemonStartArgs {
 
     #[arg(long, short = 'p', default_value_t = DEFAULT_PORT)]
     port: u16,
+
+    /// If the daemon is already running but outdated, stop and restart it.
+    #[arg(long, default_value_t = false)]
+    upgrade: bool,
 }
 
 #[derive(Args, Debug)]
@@ -197,6 +209,8 @@ pub enum ApiCommand {
     Agents(AgentsArgs),
     /// Create sessions and interact with session events.
     Sessions(SessionsArgs),
+    /// Manage filesystem entries.
+    Fs(FsArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -218,6 +232,12 @@ pub struct AgentsArgs {
 pub struct SessionsArgs {
     #[command(subcommand)]
     command: SessionsCommand,
+}
+
+#[derive(Args, Debug)]
+pub struct FsArgs {
+    #[command(subcommand)]
+    command: FsCommand,
 }
 
 #[derive(Subcommand, Debug)]
@@ -265,6 +285,27 @@ pub enum SessionsCommand {
     #[command(name = "reply-permission")]
     /// Reply to a permission request.
     ReplyPermission(PermissionReplyArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum FsCommand {
+    /// List directory entries.
+    Entries(FsEntriesArgs),
+    /// Read a file.
+    Read(FsReadArgs),
+    /// Write a file.
+    Write(FsWriteArgs),
+    /// Delete a file or directory.
+    Delete(FsDeleteArgs),
+    /// Create a directory.
+    Mkdir(FsMkdirArgs),
+    /// Move a file or directory.
+    Move(FsMoveArgs),
+    /// Stat a file or directory.
+    Stat(FsStatArgs),
+    /// Upload a tar archive and extract it.
+    #[command(name = "upload-batch")]
+    UploadBatch(FsUploadBatchArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -318,6 +359,10 @@ pub struct CreateSessionArgs {
     variant: Option<String>,
     #[arg(long, short = 'A')]
     agent_version: Option<String>,
+    #[arg(long)]
+    mcp_config: Option<PathBuf>,
+    #[arg(long)]
+    skill: Vec<PathBuf>,
     #[command(flatten)]
     client: ClientArgs,
 }
@@ -402,6 +447,91 @@ pub struct PermissionReplyArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct FsEntriesArgs {
+    #[arg(long)]
+    path: Option<String>,
+    #[arg(long)]
+    session_id: Option<String>,
+    #[command(flatten)]
+    client: ClientArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct FsReadArgs {
+    path: String,
+    #[arg(long)]
+    session_id: Option<String>,
+    #[command(flatten)]
+    client: ClientArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct FsWriteArgs {
+    path: String,
+    #[arg(long)]
+    content: Option<String>,
+    #[arg(long = "from-file")]
+    from_file: Option<PathBuf>,
+    #[arg(long)]
+    session_id: Option<String>,
+    #[command(flatten)]
+    client: ClientArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct FsDeleteArgs {
+    path: String,
+    #[arg(long)]
+    recursive: bool,
+    #[arg(long)]
+    session_id: Option<String>,
+    #[command(flatten)]
+    client: ClientArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct FsMkdirArgs {
+    path: String,
+    #[arg(long)]
+    session_id: Option<String>,
+    #[command(flatten)]
+    client: ClientArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct FsMoveArgs {
+    from: String,
+    to: String,
+    #[arg(long)]
+    overwrite: bool,
+    #[arg(long)]
+    session_id: Option<String>,
+    #[command(flatten)]
+    client: ClientArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct FsStatArgs {
+    path: String,
+    #[arg(long)]
+    session_id: Option<String>,
+    #[command(flatten)]
+    client: ClientArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct FsUploadBatchArgs {
+    #[arg(long = "tar")]
+    tar_path: PathBuf,
+    #[arg(long)]
+    path: Option<String>,
+    #[arg(long)]
+    session_id: Option<String>,
+    #[command(flatten)]
+    client: ClientArgs,
+}
+
+#[derive(Args, Debug)]
 pub struct CredentialsExtractArgs {
     #[arg(long, short = 'a', value_enum)]
     agent: Option<CredentialAgent>,
@@ -428,6 +558,8 @@ pub struct CredentialsExtractEnvArgs {
 
 #[derive(Debug, Error)]
 pub enum CliError {
+    #[error("missing --token or --no-token for server mode")]
+    MissingToken,
     #[error("invalid cors origin: {0}")]
     InvalidCorsOrigin(String),
     #[error("invalid cors method: {0}")]
@@ -585,6 +717,7 @@ fn run_api(command: &ApiCommand, cli: &CliConfig) -> Result<(), CliError> {
     match command {
         ApiCommand::Agents(subcommand) => run_agents(&subcommand.command, cli),
         ApiCommand::Sessions(subcommand) => run_sessions(&subcommand.command, cli),
+        ApiCommand::Fs(subcommand) => run_fs(&subcommand.command, cli),
     }
 }
 
@@ -596,26 +729,57 @@ fn run_opencode(cli: &CliConfig, args: &OpencodeArgs) -> Result<(), CliError> {
     };
     write_stderr_line(&format!("\nEXPERIMENTAL: Please report bugs to:\n- GitHub: https://github.com/rivet-dev/sandbox-agent/issues\n- Discord: https://rivet.dev/discord\n\n{name} is powered by:\n- OpenCode (TUI): https://opencode.ai/\n- Sandbox Agent SDK (multi-agent compatibility): https://sandboxagent.dev/\n\n"))?;
 
+    let yolo = args.yolo;
     let token = cli.token.clone();
 
     let base_url = format!("http://{}:{}", args.host, args.port);
+    let has_proxy_env = std::env::var_os("HTTP_PROXY").is_some()
+        || std::env::var_os("http_proxy").is_some()
+        || std::env::var_os("HTTPS_PROXY").is_some()
+        || std::env::var_os("https_proxy").is_some();
+    let has_no_proxy_env =
+        std::env::var_os("NO_PROXY").is_some() || std::env::var_os("no_proxy").is_some();
+    write_stderr_line(&format!(
+        "gigacode startup: ensuring daemon at {base_url} (token: {}, proxy env: {}, no_proxy env: {})",
+        if token.is_some() { "set" } else { "unset" },
+        if has_proxy_env { "set" } else { "unset" },
+        if has_no_proxy_env { "set" } else { "unset" }
+    ))?;
     crate::daemon::ensure_running(cli, &args.host, args.port, token.as_deref())?;
+    write_stderr_line("gigacode startup: daemon is healthy")?;
 
-    let session_id =
-        create_opencode_session(&base_url, token.as_deref(), args.session_title.as_deref())?;
-    write_stdout_line(&format!("OpenCode session: {session_id}"))?;
+    let attach_session_id = if args.session_title.is_some() || yolo {
+        write_stderr_line("gigacode startup: creating OpenCode session via /opencode/session")?;
+        let session_id = create_opencode_session(
+            &base_url,
+            token.as_deref(),
+            args.session_title.as_deref(),
+            yolo,
+        )?;
+        write_stdout_line(&format!("OpenCode session: {session_id}"))?;
+        Some(session_id)
+    } else {
+        write_stderr_line("gigacode startup: attaching OpenCode without precreating a session")?;
+        None
+    };
 
     let attach_url = format!("{base_url}/opencode");
-    let opencode_bin = resolve_opencode_bin(args.opencode_bin.as_ref())?;
+    write_stderr_line("gigacode startup: resolving OpenCode binary (installing if needed)")?;
+    let opencode_bin = resolve_opencode_bin()?;
+    write_stderr_line(&format!(
+        "gigacode startup: launching OpenCode attach using {}",
+        opencode_bin.display()
+    ))?;
     let mut opencode_cmd = ProcessCommand::new(opencode_bin);
     opencode_cmd
         .arg("attach")
         .arg(&attach_url)
-        .arg("--session")
-        .arg(&session_id)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    if let Some(session_id) = attach_session_id.as_deref() {
+        opencode_cmd.arg("--session").arg(session_id);
+    }
     if let Some(token) = token.as_deref() {
         opencode_cmd.arg("--password").arg(token);
     }
@@ -636,6 +800,9 @@ fn run_opencode(cli: &CliConfig, args: &OpencodeArgs) -> Result<(), CliError> {
 fn run_daemon(command: &DaemonCommand, cli: &CliConfig) -> Result<(), CliError> {
     let token = cli.token.as_deref();
     match command {
+        DaemonCommand::Start(args) if args.upgrade => {
+            crate::daemon::ensure_running(cli, &args.host, args.port, token)
+        }
         DaemonCommand::Start(args) => crate::daemon::start(cli, &args.host, args.port, token),
         DaemonCommand::Stop(args) => crate::daemon::stop(&args.host, args.port),
         DaemonCommand::Status(args) => {
@@ -686,6 +853,32 @@ fn run_sessions(command: &SessionsCommand, cli: &CliConfig) -> Result<(), CliErr
         }
         SessionsCommand::Create(args) => {
             let ctx = ClientContext::new(cli, &args.client)?;
+            let mcp = if let Some(path) = &args.mcp_config {
+                let text = std::fs::read_to_string(path)?;
+                let parsed = serde_json::from_str::<
+                    std::collections::BTreeMap<String, McpServerConfig>,
+                >(&text)?;
+                Some(parsed)
+            } else {
+                None
+            };
+            let skills = if args.skill.is_empty() {
+                None
+            } else {
+                Some(SkillsConfig {
+                    sources: args
+                        .skill
+                        .iter()
+                        .map(|path| SkillSource {
+                            source_type: "local".to_string(),
+                            source: path.to_string_lossy().to_string(),
+                            skills: None,
+                            git_ref: None,
+                            subpath: None,
+                        })
+                        .collect(),
+                })
+            };
             let body = CreateSessionRequest {
                 agent: args.agent.clone(),
                 agent_mode: args.agent_mode.clone(),
@@ -693,6 +886,10 @@ fn run_sessions(command: &SessionsCommand, cli: &CliConfig) -> Result<(), CliErr
                 model: args.model.clone(),
                 variant: args.variant.clone(),
                 agent_version: args.agent_version.clone(),
+                directory: None,
+                title: None,
+                mcp,
+                skills,
             };
             let path = format!("{API_PREFIX}/sessions/{}", args.session_id);
             let response = ctx.post(&path, &body)?;
@@ -702,6 +899,7 @@ fn run_sessions(command: &SessionsCommand, cli: &CliConfig) -> Result<(), CliErr
             let ctx = ClientContext::new(cli, &args.client)?;
             let body = MessageRequest {
                 message: args.message.clone(),
+                attachments: Vec::new(),
             };
             let path = format!("{API_PREFIX}/sessions/{}/messages", args.session_id);
             let response = ctx.post(&path, &body)?;
@@ -711,6 +909,7 @@ fn run_sessions(command: &SessionsCommand, cli: &CliConfig) -> Result<(), CliErr
             let ctx = ClientContext::new(cli, &args.client)?;
             let body = MessageRequest {
                 message: args.message.clone(),
+                attachments: Vec::new(),
             };
             let path = format!("{API_PREFIX}/sessions/{}/messages/stream", args.session_id);
             let response = ctx.post_with_query(
@@ -807,18 +1006,145 @@ fn run_sessions(command: &SessionsCommand, cli: &CliConfig) -> Result<(), CliErr
     }
 }
 
+fn run_fs(command: &FsCommand, cli: &CliConfig) -> Result<(), CliError> {
+    match command {
+        FsCommand::Entries(args) => {
+            let ctx = ClientContext::new(cli, &args.client)?;
+            let response = ctx.get_with_query(
+                &format!("{API_PREFIX}/fs/entries"),
+                &[
+                    ("path", args.path.clone()),
+                    ("session_id", args.session_id.clone()),
+                ],
+            )?;
+            print_json_response::<Vec<FsEntry>>(response)
+        }
+        FsCommand::Read(args) => {
+            let ctx = ClientContext::new(cli, &args.client)?;
+            let response = ctx.get_with_query(
+                &format!("{API_PREFIX}/fs/file"),
+                &[
+                    ("path", Some(args.path.clone())),
+                    ("session_id", args.session_id.clone()),
+                ],
+            )?;
+            print_binary_response(response)
+        }
+        FsCommand::Write(args) => {
+            let ctx = ClientContext::new(cli, &args.client)?;
+            let body = match (&args.content, &args.from_file) {
+                (Some(_), Some(_)) => {
+                    return Err(CliError::Server(
+                        "use --content or --from-file, not both".to_string(),
+                    ))
+                }
+                (None, None) => {
+                    return Err(CliError::Server(
+                        "write requires --content or --from-file".to_string(),
+                    ))
+                }
+                (Some(content), None) => content.clone().into_bytes(),
+                (None, Some(path)) => std::fs::read(path)?,
+            };
+            let response = ctx.put_raw_with_query(
+                &format!("{API_PREFIX}/fs/file"),
+                body,
+                "application/octet-stream",
+                &[
+                    ("path", Some(args.path.clone())),
+                    ("session_id", args.session_id.clone()),
+                ],
+            )?;
+            print_json_response::<FsWriteResponse>(response)
+        }
+        FsCommand::Delete(args) => {
+            let ctx = ClientContext::new(cli, &args.client)?;
+            let response = ctx.delete_with_query(
+                &format!("{API_PREFIX}/fs/entry"),
+                &[
+                    ("path", Some(args.path.clone())),
+                    ("session_id", args.session_id.clone()),
+                    (
+                        "recursive",
+                        if args.recursive {
+                            Some("true".to_string())
+                        } else {
+                            None
+                        },
+                    ),
+                ],
+            )?;
+            print_json_response::<FsActionResponse>(response)
+        }
+        FsCommand::Mkdir(args) => {
+            let ctx = ClientContext::new(cli, &args.client)?;
+            let response = ctx.post_empty_with_query(
+                &format!("{API_PREFIX}/fs/mkdir"),
+                &[
+                    ("path", Some(args.path.clone())),
+                    ("session_id", args.session_id.clone()),
+                ],
+            )?;
+            print_json_response::<FsActionResponse>(response)
+        }
+        FsCommand::Move(args) => {
+            let ctx = ClientContext::new(cli, &args.client)?;
+            let body = FsMoveRequest {
+                from: args.from.clone(),
+                to: args.to.clone(),
+                overwrite: if args.overwrite { Some(true) } else { None },
+            };
+            let response = ctx.post_with_query(
+                &format!("{API_PREFIX}/fs/move"),
+                &body,
+                &[("session_id", args.session_id.clone())],
+            )?;
+            print_json_response::<FsMoveResponse>(response)
+        }
+        FsCommand::Stat(args) => {
+            let ctx = ClientContext::new(cli, &args.client)?;
+            let response = ctx.get_with_query(
+                &format!("{API_PREFIX}/fs/stat"),
+                &[
+                    ("path", Some(args.path.clone())),
+                    ("session_id", args.session_id.clone()),
+                ],
+            )?;
+            print_json_response::<FsStat>(response)
+        }
+        FsCommand::UploadBatch(args) => {
+            let ctx = ClientContext::new(cli, &args.client)?;
+            let file = File::open(&args.tar_path)?;
+            let response = ctx.post_raw_with_query(
+                &format!("{API_PREFIX}/fs/upload-batch"),
+                file,
+                "application/x-tar",
+                &[
+                    ("path", args.path.clone()),
+                    ("session_id", args.session_id.clone()),
+                ],
+            )?;
+            print_json_response::<FsUploadBatchResponse>(response)
+        }
+    }
+}
+
 fn create_opencode_session(
     base_url: &str,
     token: Option<&str>,
     title: Option<&str>,
+    yolo: bool,
 ) -> Result<String, CliError> {
     let client = HttpClient::builder().build()?;
     let url = format!("{base_url}/opencode/session");
-    let body = if let Some(title) = title {
+    let mut body = if let Some(title) = title {
         json!({ "title": title })
     } else {
         json!({})
     };
+    if yolo {
+        body["permissionMode"] = json!("bypass");
+    }
     let mut request = client.post(&url).json(&body);
     if let Ok(directory) = std::env::current_dir() {
         request = request.header(
@@ -844,50 +1170,19 @@ fn create_opencode_session(
     Ok(session_id.to_string())
 }
 
-fn resolve_opencode_bin(explicit: Option<&PathBuf>) -> Result<PathBuf, CliError> {
-    if let Some(path) = explicit {
-        return Ok(path.clone());
-    }
-    if let Ok(path) = std::env::var("OPENCODE_BIN") {
-        return Ok(PathBuf::from(path));
-    }
-    if let Some(path) = find_in_path("opencode") {
-        write_stderr_line(&format!(
-            "using opencode binary from PATH: {}",
-            path.display()
-        ))?;
-        return Ok(path);
-    }
-
+fn resolve_opencode_bin() -> Result<PathBuf, CliError> {
     let manager = AgentManager::new(default_install_dir())
         .map_err(|err| CliError::Server(err.to_string()))?;
-    match manager.resolve_binary(AgentId::Opencode) {
-        Ok(path) => Ok(path),
-        Err(_) => {
-            write_stderr_line("opencode not found; installing...")?;
-            let result = manager
-                .install(
-                    AgentId::Opencode,
-                    InstallOptions {
-                        reinstall: false,
-                        version: None,
-                    },
-                )
-                .map_err(|err| CliError::Server(err.to_string()))?;
-            Ok(result.path)
-        }
+    match manager.install(
+        AgentId::Opencode,
+        InstallOptions {
+            reinstall: false,
+            version: None,
+        },
+    ) {
+        Ok(result) => Ok(result.path),
+        Err(err) => Err(CliError::Server(err.to_string())),
     }
-}
-
-fn find_in_path(binary_name: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    for path in std::env::split_paths(&path_var) {
-        let candidate = path.join(binary_name);
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
 }
 
 fn run_credentials(command: &CredentialsCommand) -> Result<(), CliError> {
@@ -1290,8 +1585,74 @@ impl ClientContext {
         Ok(request.send()?)
     }
 
+    fn put_raw_with_query<B: Into<reqwest::blocking::Body>>(
+        &self,
+        path: &str,
+        body: B,
+        content_type: &str,
+        query: &[(&str, Option<String>)],
+    ) -> Result<reqwest::blocking::Response, CliError> {
+        let mut request = self
+            .request(Method::PUT, path)
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .header(reqwest::header::ACCEPT, "application/json");
+        for (key, value) in query {
+            if let Some(value) = value {
+                request = request.query(&[(key, value)]);
+            }
+        }
+        Ok(request.body(body).send()?)
+    }
+
     fn post_empty(&self, path: &str) -> Result<reqwest::blocking::Response, CliError> {
         Ok(self.request(Method::POST, path).send()?)
+    }
+
+    fn post_empty_with_query(
+        &self,
+        path: &str,
+        query: &[(&str, Option<String>)],
+    ) -> Result<reqwest::blocking::Response, CliError> {
+        let mut request = self.request(Method::POST, path);
+        for (key, value) in query {
+            if let Some(value) = value {
+                request = request.query(&[(key, value)]);
+            }
+        }
+        Ok(request.send()?)
+    }
+
+    fn delete_with_query(
+        &self,
+        path: &str,
+        query: &[(&str, Option<String>)],
+    ) -> Result<reqwest::blocking::Response, CliError> {
+        let mut request = self.request(Method::DELETE, path);
+        for (key, value) in query {
+            if let Some(value) = value {
+                request = request.query(&[(key, value)]);
+            }
+        }
+        Ok(request.send()?)
+    }
+
+    fn post_raw_with_query<B: Into<reqwest::blocking::Body>>(
+        &self,
+        path: &str,
+        body: B,
+        content_type: &str,
+        query: &[(&str, Option<String>)],
+    ) -> Result<reqwest::blocking::Response, CliError> {
+        let mut request = self
+            .request(Method::POST, path)
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .header(reqwest::header::ACCEPT, "application/json");
+        for (key, value) in query {
+            if let Some(value) = value {
+                request = request.query(&[(key, value)]);
+            }
+        }
+        Ok(request.body(body).send()?)
     }
 }
 
@@ -1322,6 +1683,25 @@ fn print_text_response(response: reqwest::blocking::Response) -> Result<(), CliE
     }
 
     write_stdout(&text)?;
+    Ok(())
+}
+
+fn print_binary_response(response: reqwest::blocking::Response) -> Result<(), CliError> {
+    let status = response.status();
+    let bytes = response.bytes()?;
+
+    if !status.is_success() {
+        if let Ok(text) = std::str::from_utf8(&bytes) {
+            print_error_body(text)?;
+        } else {
+            write_stderr_line("Request failed with non-text response body")?;
+        }
+        return Err(CliError::HttpStatus(status));
+    }
+
+    let mut out = std::io::stdout();
+    out.write_all(&bytes)?;
+    out.flush()?;
     Ok(())
 }
 

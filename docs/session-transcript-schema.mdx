@@ -1,7 +1,6 @@
 ---
 title: "Session Transcript Schema"
 description: "Universal event schema for session transcripts across all agents."
-icon: "brackets-curly"
 ---
 
 Each coding agent outputs events in its own native format. The sandbox-agent converts these into a universal event schema, giving you a consistent session transcript regardless of which agent you use.
@@ -27,7 +26,7 @@ This table shows which agent feature coverage appears in the universal event str
 | Reasoning/Thinking |   -    |   ✓   |      -       |      -       |      ✓       |
 | Command Execution  |   -    |   ✓   |      -       |      -       |              |
 | File Changes       |   -    |   ✓   |      -       |      -       |              |
-| MCP Tools          |   -    |   ✓   |      -       |      -       |              |
+| MCP Tools          |   ✓    |   ✓   |      ✓       |      ✓       |              |
 | Streaming Deltas   |   ✓    |   ✓   |      ✓       |      -       |      ✓       |
 | Variants           |        |   ✓   |      ✓       |      ✓       |      ✓       |
 
@@ -125,6 +124,13 @@ Every event from the API is wrapped in a `UniversalEvent` envelope.
 | `session.started` | Session has started | `{ metadata?: any }` |
 | `session.ended` | Session has ended | `{ reason, terminated_by, message?, exit_code? }` |
 
+### Turn Lifecycle
+
+| Type | Description | Data |
+|------|-------------|------|
+| `turn.started` | Turn has started | `{ phase: "started", turn_id?, metadata? }` |
+| `turn.ended` | Turn has ended | `{ phase: "ended", turn_id?, metadata? }` |
+
 **SessionEndedData**
 
 | Field | Type | Values |
@@ -159,7 +165,7 @@ Items follow a consistent lifecycle: `item.started` → `item.delta` (0 or more)
 | Type | Description | Data |
 |------|-------------|------|
 | `permission.requested` | Permission request pending | `{ permission_id, action, status, metadata? }` |
-| `permission.resolved` | Permission granted or denied | `{ permission_id, action, status, metadata? }` |
+| `permission.resolved` | Permission decision recorded | `{ permission_id, action, status, metadata? }` |
 | `question.requested` | Question pending user input | `{ question_id, prompt, options, status }` |
 | `question.resolved` | Question answered or rejected | `{ question_id, prompt, options, status, response? }` |
 
@@ -169,7 +175,7 @@ Items follow a consistent lifecycle: `item.started` → `item.delta` (0 or more)
 |-------|------|-------------|
 | `permission_id` | string | Identifier for the permission request |
 | `action` | string | What the agent wants to do |
-| `status` | string | `requested`, `approved`, `denied` |
+| `status` | string | `requested`, `accept`, `accept_for_session`, `reject` |
 | `metadata` | any? | Additional context |
 
 **QuestionEventData**
@@ -366,6 +372,8 @@ The daemon emits synthetic events (`synthetic: true`, `source: "daemon"`) to pro
 |-----------|------|
 | `session.started` | Agent doesn't emit explicit session start |
 | `session.ended` | Agent doesn't emit explicit session end |
+| `turn.started` | Agent doesn't emit explicit turn start |
+| `turn.ended` | Agent doesn't emit explicit turn end |
 | `item.started` | Agent doesn't emit item start events |
 | `item.delta` | Agent doesn't stream deltas natively |
 | `question.*` | Claude Code plan mode (from ExitPlanMode tool) |

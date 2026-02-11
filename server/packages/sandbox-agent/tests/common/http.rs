@@ -1048,6 +1048,13 @@ async fn run_turn_stream_check(app: &Router, config: &TestAgentConfig) {
     create_session(app, config.agent, &session_id, test_permission_mode(config.agent)).await;
 
     let events = read_turn_stream_events(app, &session_id, Duration::from_secs(120)).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| event.get("type").and_then(Value::as_str) == Some("turn.ended")),
+        "turn stream did not include turn.ended for {}",
+        config.agent
+    );
     let events = truncate_after_first_stop(&events);
     assert!(
         !events.is_empty(),

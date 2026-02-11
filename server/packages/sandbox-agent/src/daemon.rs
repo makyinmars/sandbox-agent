@@ -10,10 +10,11 @@ use crate::cli::{CliConfig, CliError};
 mod build_id {
     include!(concat!(env!("OUT_DIR"), "/build_id.rs"));
 }
-
 pub use build_id::BUILD_ID;
 
 const DAEMON_HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
+const HEALTH_CHECK_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const HEALTH_CHECK_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -144,16 +145,40 @@ pub fn is_process_running(pid: u32) -> bool {
 // ---------------------------------------------------------------------------
 
 pub fn check_health(base_url: &str, token: Option<&str>) -> Result<bool, CliError> {
-    let client = HttpClient::builder().build()?;
     let url = format!("{base_url}/v1/health");
+    let started_at = Instant::now();
+    let client = HttpClient::builder()
+        .connect_timeout(HEALTH_CHECK_CONNECT_TIMEOUT)
+        .timeout(HEALTH_CHECK_REQUEST_TIMEOUT)
+        .build()?;
     let mut request = client.get(url);
     if let Some(token) = token {
         request = request.bearer_auth(token);
     }
     match request.send() {
-        Ok(response) if response.status().is_success() => Ok(true),
-        Ok(_) => Ok(false),
-        Err(_) => Ok(false),
+        Ok(response) if response.status().is_success() => {
+            tracing::info!(
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "daemon health check succeeded"
+            );
+            Ok(true)
+        }
+        Ok(response) => {
+            tracing::warn!(
+                status = %response.status(),
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "daemon health check returned non-success status"
+            );
+            Ok(false)
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "daemon health check request failed"
+            );
+            Ok(false)
+        }
     }
 }
 
@@ -163,10 +188,15 @@ pub fn wait_for_health(
     token: Option<&str>,
     timeout: Duration,
 ) -> Result<(), CliError> {
-    let client = HttpClient::builder().build()?;
+    let client = HttpClient::builder()
+        .connect_timeout(HEALTH_CHECK_CONNECT_TIMEOUT)
+        .timeout(HEALTH_CHECK_REQUEST_TIMEOUT)
+        .build()?;
     let deadline = Instant::now() + timeout;
+    let mut attempts: u32 = 0;
 
     while Instant::now() < deadline {
+        attempts += 1;
         if let Some(child) = server_child.as_mut() {
             if let Some(status) = child.try_wait()? {
                 return Err(CliError::Server(format!(
@@ -181,13 +211,43 @@ pub fn wait_for_health(
             request = request.bearer_auth(token);
         }
         match request.send() {
-            Ok(response) if response.status().is_success() => return Ok(()),
-            _ => {
+            Ok(response) if response.status().is_success() => {
+                tracing::info!(
+                    attempts,
+                    elapsed_ms =
+                        (timeout - deadline.saturating_duration_since(Instant::now())).as_millis(),
+                    "daemon became healthy while waiting"
+                );
+                return Ok(());
+            }
+            Ok(response) => {
+                if attempts % 10 == 0 {
+                    tracing::info!(
+                        attempts,
+                        status = %response.status(),
+                        "daemon still not healthy; waiting"
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(err) => {
+                if attempts % 10 == 0 {
+                    tracing::warn!(
+                        attempts,
+                        error = %err,
+                        "daemon health poll request failed; still waiting"
+                    );
+                }
                 std::thread::sleep(Duration::from_millis(200));
             }
         }
     }
 
+    tracing::error!(
+        attempts,
+        timeout_ms = timeout.as_millis(),
+        "timed out waiting for daemon health"
+    );
     Err(CliError::Server(
         "timed out waiting for sandbox-agent health".to_string(),
     ))
@@ -198,7 +258,7 @@ pub fn wait_for_health(
 // ---------------------------------------------------------------------------
 
 pub fn spawn_sandbox_agent_daemon(
-    cli: &CliConfig,
+    _cli: &CliConfig,
     host: &str,
     port: u16,
     token: Option<&str>,
@@ -350,25 +410,26 @@ pub fn start(cli: &CliConfig, host: &str, port: u16, token: Option<&str>) -> Res
     Ok(())
 }
 
+/// Find the PID of a process listening on the given port using lsof.
 #[cfg(unix)]
-pub fn stop(host: &str, port: u16) -> Result<(), CliError> {
-    let pid_path = daemon_pid_path(host, port);
+fn find_process_on_port(port: u16) -> Option<u32> {
+    let output = std::process::Command::new("lsof")
+        .args(["-i", &format!(":{port}"), "-t", "-sTCP:LISTEN"])
+        .output()
+        .ok()?;
 
-    let pid = match read_pid(&pid_path) {
-        Some(pid) => pid,
-        None => {
-            eprintln!("daemon is not running (no PID file)");
-            return Ok(());
-        }
-    };
-
-    if !is_process_running(pid) {
-        eprintln!("daemon is not running (stale PID file)");
-        let _ = remove_pid(&pid_path);
-        let _ = remove_version_file(host, port);
-        return Ok(());
+    if !output.status.success() {
+        return None;
     }
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // lsof -t returns just the PID(s), one per line
+    stdout.lines().next()?.trim().parse::<u32>().ok()
+}
+
+/// Stop a process by PID with SIGTERM then SIGKILL if needed.
+#[cfg(unix)]
+fn stop_process(pid: u32, host: &str, port: u16, pid_path: &Path) -> Result<(), CliError> {
     eprintln!("stopping daemon (PID {pid})...");
 
     // SIGTERM
@@ -380,7 +441,7 @@ pub fn stop(host: &str, port: u16) -> Result<(), CliError> {
     for _ in 0..50 {
         std::thread::sleep(Duration::from_millis(100));
         if !is_process_running(pid) {
-            let _ = remove_pid(&pid_path);
+            let _ = remove_pid(pid_path);
             let _ = remove_version_file(host, port);
             eprintln!("daemon stopped");
             return Ok(());
@@ -393,10 +454,48 @@ pub fn stop(host: &str, port: u16) -> Result<(), CliError> {
         libc::kill(pid as i32, libc::SIGKILL);
     }
     std::thread::sleep(Duration::from_millis(100));
-    let _ = remove_pid(&pid_path);
+    let _ = remove_pid(pid_path);
     let _ = remove_version_file(host, port);
     eprintln!("daemon killed");
     Ok(())
+}
+
+#[cfg(unix)]
+pub fn stop(host: &str, port: u16) -> Result<(), CliError> {
+    let base_url = format!("http://{host}:{port}");
+    let pid_path = daemon_pid_path(host, port);
+
+    let pid = match read_pid(&pid_path) {
+        Some(pid) => pid,
+        None => {
+            // No PID file - but check if daemon is actually running via health check
+            // This can happen if PID file was deleted but daemon is still running
+            if check_health(&base_url, None)? {
+                eprintln!(
+                    "daemon is running but PID file missing; finding process on port {port}..."
+                );
+                if let Some(pid) = find_process_on_port(port) {
+                    eprintln!("found daemon process {pid}");
+                    return stop_process(pid, host, port, &pid_path);
+                } else {
+                    return Err(CliError::Server(format!(
+                        "daemon is running on port {port} but cannot find PID"
+                    )));
+                }
+            }
+            eprintln!("daemon is not running (no PID file)");
+            return Ok(());
+        }
+    };
+
+    if !is_process_running(pid) {
+        eprintln!("daemon is not running (stale PID file)");
+        let _ = remove_pid(&pid_path);
+        let _ = remove_version_file(host, port);
+        return Ok(());
+    }
+
+    stop_process(pid, host, port, &pid_path)
 }
 
 #[cfg(windows)]
@@ -440,13 +539,20 @@ pub fn ensure_running(
 ) -> Result<(), CliError> {
     let base_url = format!("http://{host}:{port}");
     let pid_path = daemon_pid_path(host, port);
+    eprintln!(
+        "checking daemon health at {base_url} (token: {})...",
+        if token.is_some() { "set" } else { "unset" }
+    );
 
     // Check if daemon is already healthy
     if check_health(&base_url, token)? {
         // Check build version
         if !is_version_current(host, port) {
             let old = read_daemon_version(host, port).unwrap_or_else(|| "unknown".to_string());
-            eprintln!("daemon outdated (build {old} -> {BUILD_ID}), restarting...");
+            eprintln!(
+                "daemon outdated (build {old} -> {}), restarting...",
+                BUILD_ID
+            );
             stop(host, port)?;
             return start(cli, host, port, token);
         }

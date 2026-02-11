@@ -4,28 +4,38 @@
 //! stubbed responses with deterministic helpers for snapshot testing. A minimal
 //! in-memory state tracks sessions/messages/ptys to keep behavior coherent.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive};
-use axum::response::{IntoResponse, Sse};
+use axum::response::{IntoResponse, Response, Sse};
 use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use futures::stream;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, Mutex};
 use tokio::time::interval;
+use tracing::{info, warn};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
-use crate::router::{AgentModelInfo, AppState, CreateSessionRequest, PermissionReply};
+use crate::router::{
+    is_question_tool_action, AgentModelInfo, AppState, CreateSessionRequest, PermissionReply,
+    SessionInfo,
+};
 use sandbox_agent_agent_management::agents::AgentId;
+use sandbox_agent_agent_management::credentials::{
+    extract_all_credentials, CredentialExtractionOptions, ExtractedCredentials,
+};
 use sandbox_agent_error::SandboxError;
 use sandbox_agent_universal_agent_schema::{
     ContentPart, FileAction, ItemDeltaData, ItemEventData, ItemKind, ItemRole, ItemStatus,
@@ -38,10 +48,19 @@ static MESSAGE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static PART_COUNTER: AtomicU64 = AtomicU64::new(1);
 static PTY_COUNTER: AtomicU64 = AtomicU64::new(1);
 static PROJECT_COUNTER: AtomicU64 = AtomicU64::new(1);
+const OPENCODE_EVENT_CHANNEL_SIZE: usize = 2048;
+const OPENCODE_EVENT_LOG_SIZE: usize = 4096;
 const OPENCODE_DEFAULT_MODEL_ID: &str = "mock";
 const OPENCODE_DEFAULT_PROVIDER_ID: &str = "mock";
 const OPENCODE_DEFAULT_AGENT_MODE: &str = "build";
 const OPENCODE_MODEL_CACHE_TTL: Duration = Duration::from_secs(30);
+const OPENCODE_MODEL_CHANGE_AFTER_SESSION_CREATE_ERROR: &str = "OpenCode compatibility currently does not support changing the model after creating a session. Export with /export and load in to a new session.";
+
+#[derive(Clone, Debug)]
+struct OpenCodeStreamEvent {
+    id: u64,
+    payload: Value,
+}
 
 #[derive(Clone, Debug)]
 struct OpenCodeCompatConfig {
@@ -52,6 +71,7 @@ struct OpenCodeCompatConfig {
     fixed_state: Option<String>,
     fixed_config: Option<String>,
     fixed_branch: Option<String>,
+    proxy_base_url: Option<String>,
 }
 
 impl OpenCodeCompatConfig {
@@ -66,6 +86,9 @@ impl OpenCodeCompatConfig {
             fixed_state: std::env::var("OPENCODE_COMPAT_STATE").ok(),
             fixed_config: std::env::var("OPENCODE_COMPAT_CONFIG").ok(),
             fixed_branch: std::env::var("OPENCODE_COMPAT_BRANCH").ok(),
+            proxy_base_url: std::env::var("OPENCODE_COMPAT_PROXY_URL")
+                .ok()
+                .and_then(normalize_proxy_base_url),
         }
     }
 
@@ -77,6 +100,19 @@ impl OpenCodeCompatConfig {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0)
+    }
+}
+
+fn normalize_proxy_base_url(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = trimmed.trim_end_matches('/').to_string();
+    if normalized.starts_with("http://") || normalized.starts_with("https://") {
+        Some(normalized)
+    } else {
+        None
     }
 }
 
@@ -92,6 +128,7 @@ struct OpenCodeSessionRecord {
     created_at: i64,
     updated_at: i64,
     share_url: Option<String>,
+    permission_mode: Option<String>,
 }
 
 impl OpenCodeSessionRecord {
@@ -118,6 +155,27 @@ impl OpenCodeSessionRecord {
         }
         Value::Object(map)
     }
+}
+
+/// Convert a v1 `SessionInfo` to the OpenCode session JSON format.
+fn session_info_to_opencode_value(info: &SessionInfo, default_project_id: &str) -> Value {
+    let title = info
+        .title
+        .clone()
+        .unwrap_or_else(|| format!("Session {}", info.session_id));
+    let directory = info.directory.clone().unwrap_or_default();
+    json!({
+        "id": info.session_id,
+        "slug": format!("session-{}", info.session_id),
+        "projectID": default_project_id,
+        "directory": directory,
+        "title": title,
+        "version": "0",
+        "time": {
+            "created": info.created_at,
+            "updated": info.updated_at,
+        }
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -201,7 +259,9 @@ impl OpenCodeQuestionRecord {
 
 #[derive(Default, Clone)]
 struct OpenCodeSessionRuntime {
+    turn_in_progress: bool,
     last_user_message_id: Option<String>,
+    active_assistant_message_id: Option<String>,
     last_agent: Option<String>,
     last_model_provider: Option<String>,
     last_model_id: Option<String>,
@@ -217,6 +277,14 @@ struct OpenCodeSessionRuntime {
     tool_name_by_call: HashMap<String, String>,
     /// Tool arguments by call_id, persisted from ToolCall for use in ToolResult events
     tool_args_by_call: HashMap<String, String>,
+    /// Tool calls that have been requested but not yet resolved.
+    open_tool_calls: HashSet<String>,
+    /// Assistant messages that have streamed text deltas.
+    messages_with_text_deltas: HashSet<String>,
+    /// Item IDs (native and normalized) known to be user messages.
+    user_item_ids: HashSet<String>,
+    /// Item IDs (native and normalized) that should not emit text deltas.
+    non_text_item_ids: HashSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -237,6 +305,8 @@ struct OpenCodeModelCache {
     default_model: String,
     cached_at: Instant,
     had_discovery_errors: bool,
+    /// Group IDs that have valid credentials available
+    connected: Vec<String>,
 }
 
 pub struct OpenCodeState {
@@ -249,13 +319,15 @@ pub struct OpenCodeState {
     questions: Mutex<HashMap<String, OpenCodeQuestionRecord>>,
     session_runtime: Mutex<HashMap<String, OpenCodeSessionRuntime>>,
     session_streams: Mutex<HashMap<String, bool>>,
-    event_broadcaster: broadcast::Sender<Value>,
+    event_broadcaster: broadcast::Sender<OpenCodeStreamEvent>,
+    event_log: StdMutex<VecDeque<OpenCodeStreamEvent>>,
+    next_event_id: AtomicU64,
     model_cache: Mutex<Option<OpenCodeModelCache>>,
 }
 
 impl OpenCodeState {
     pub fn new() -> Self {
-        let (event_broadcaster, _) = broadcast::channel(256);
+        let (event_broadcaster, _) = broadcast::channel(OPENCODE_EVENT_CHANNEL_SIZE);
         let project_id = format!("proj_{}", PROJECT_COUNTER.fetch_add(1, Ordering::Relaxed));
         Self {
             config: OpenCodeCompatConfig::from_env(),
@@ -268,16 +340,44 @@ impl OpenCodeState {
             session_runtime: Mutex::new(HashMap::new()),
             session_streams: Mutex::new(HashMap::new()),
             event_broadcaster,
+            event_log: StdMutex::new(VecDeque::new()),
+            next_event_id: AtomicU64::new(1),
             model_cache: Mutex::new(None),
         }
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<Value> {
+    fn subscribe(&self) -> broadcast::Receiver<OpenCodeStreamEvent> {
         self.event_broadcaster.subscribe()
     }
 
     pub fn emit_event(&self, event: Value) {
-        let _ = self.event_broadcaster.send(event);
+        let stream_event = OpenCodeStreamEvent {
+            id: self.next_event_id.fetch_add(1, Ordering::Relaxed),
+            payload: event,
+        };
+        if let Ok(mut log) = self.event_log.lock() {
+            log.push_back(stream_event.clone());
+            if log.len() > OPENCODE_EVENT_LOG_SIZE {
+                let overflow = log.len() - OPENCODE_EVENT_LOG_SIZE;
+                for _ in 0..overflow {
+                    let _ = log.pop_front();
+                }
+            }
+        }
+        let _ = self.event_broadcaster.send(stream_event);
+    }
+
+    fn buffered_events_after(&self, last_event_id: Option<u64>) -> Vec<OpenCodeStreamEvent> {
+        let Some(last_event_id) = last_event_id else {
+            return Vec::new();
+        };
+        let Ok(log) = self.event_log.lock() else {
+            return Vec::new();
+        };
+        log.iter()
+            .filter(|event| event.id > last_event_id)
+            .cloned()
+            .collect()
     }
 
     fn now_ms(&self) -> i64 {
@@ -342,6 +442,7 @@ impl OpenCodeState {
             created_at: now,
             updated_at: now,
             share_url: None,
+            permission_mode: None,
         };
         let value = record.to_value();
         sessions.insert(session_id.to_string(), record);
@@ -365,6 +466,10 @@ impl OpenCodeState {
             .unwrap_or_else(|| "main".to_string())
     }
 
+    fn proxy_base_url(&self) -> Option<&str> {
+        self.config.proxy_base_url.as_deref()
+    }
+
     async fn update_runtime(
         &self,
         session_id: &str,
@@ -383,6 +488,7 @@ impl OpenCodeState {
 pub struct OpenCodeAppState {
     pub inner: Arc<AppState>,
     pub opencode: Arc<OpenCodeState>,
+    proxy_http_client: Client,
 }
 
 impl OpenCodeAppState {
@@ -390,6 +496,7 @@ impl OpenCodeAppState {
         Arc::new(Self {
             inner,
             opencode: Arc::new(OpenCodeState::new()),
+            proxy_http_client: Client::new(),
         })
     }
 }
@@ -400,33 +507,100 @@ async fn ensure_backing_session(
     agent: &str,
     model: Option<String>,
     variant: Option<String>,
+    permission_mode: Option<String>,
 ) -> Result<(), SandboxError> {
     let model = model.filter(|value| !value.trim().is_empty());
     let variant = variant.filter(|value| !value.trim().is_empty());
+    // Pull directory and title from the OpenCode session record if available.
+    let (directory, title) = {
+        let sessions = state.opencode.sessions.lock().await;
+        sessions
+            .get(session_id)
+            .map(|s| (Some(s.directory.clone()), Some(s.title.clone())))
+            .unwrap_or((None, None))
+    };
     let request = CreateSessionRequest {
         agent: agent.to_string(),
         agent_mode: None,
-        permission_mode: None,
+        permission_mode: permission_mode.clone(),
         model: model.clone(),
         variant: variant.clone(),
         agent_version: None,
+        directory,
+        title,
+        mcp: None,
+        skills: None,
     };
-    match state
-        .inner
-        .session_manager()
-        .create_session(session_id.to_string(), request)
+    let manager = state.inner.session_manager();
+    match manager
+        .create_session(session_id.to_string(), request.clone())
         .await
     {
         Ok(_) => Ok(()),
-        Err(SandboxError::SessionAlreadyExists { .. }) => state
-            .inner
-            .session_manager()
-            .set_session_overrides(session_id, model, variant)
-            .await
-            .or_else(|err| match err {
-                SandboxError::SessionNotFound { .. } => Ok(()),
-                other => Err(other),
-            }),
+        Err(SandboxError::SessionAlreadyExists { .. }) => {
+            let should_recreate = manager
+                .get_session_info(session_id)
+                .await
+                .map(|info| info.agent != agent && info.event_count <= 1)
+                .unwrap_or(false);
+            if should_recreate {
+                manager.delete_session(session_id).await?;
+                match manager
+                    .create_session(session_id.to_string(), request.clone())
+                    .await
+                {
+                    Ok(_) => Ok(()),
+                    Err(SandboxError::SessionAlreadyExists { .. }) => {
+                        match manager
+                            .set_session_overrides(session_id, model.clone(), variant.clone())
+                            .await
+                        {
+                            Ok(()) => Ok(()),
+                            Err(SandboxError::SessionNotFound { .. }) => {
+                                tracing::warn!(
+                                    target = "sandbox_agent::opencode",
+                                    session_id,
+                                    "backing session vanished while applying overrides; retrying create_session"
+                                );
+                                match manager
+                                    .create_session(session_id.to_string(), request.clone())
+                                    .await
+                                {
+                                    Ok(_) | Err(SandboxError::SessionAlreadyExists { .. }) => {
+                                        Ok(())
+                                    }
+                                    Err(err) => Err(err),
+                                }
+                            }
+                            Err(other) => Err(other),
+                        }
+                    }
+                    Err(err) => Err(err),
+                }
+            } else {
+                match manager
+                    .set_session_overrides(session_id, model.clone(), variant.clone())
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(SandboxError::SessionNotFound { .. }) => {
+                        tracing::warn!(
+                            target = "sandbox_agent::opencode",
+                            session_id,
+                            "backing session missing while setting overrides; retrying create_session"
+                        );
+                        match manager
+                            .create_session(session_id.to_string(), request.clone())
+                            .await
+                        {
+                            Ok(_) | Err(SandboxError::SessionAlreadyExists { .. }) => Ok(()),
+                            Err(err) => Err(err),
+                        }
+                    }
+                    Err(other) => Err(other),
+                }
+            }
+        }
         Err(err) => Err(err),
     }
 }
@@ -486,12 +660,31 @@ struct OpenCodeCreateSessionRequest {
     parent_id: Option<String>,
     #[schema(value_type = String)]
     permission: Option<Value>,
+    #[serde(alias = "permission_mode")]
+    permission_mode: Option<String>,
+    #[schema(value_type = String)]
+    model: Option<Value>,
+    #[serde(rename = "providerID")]
+    provider_id: Option<String>,
+    #[serde(rename = "modelID")]
+    model_id: Option<String>,
+    variant: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct OpenCodeUpdateSessionRequest {
     title: Option<String>,
+    #[schema(value_type = String)]
+    model: Option<Value>,
+    #[serde(rename = "providerID", alias = "provider_id", alias = "providerId")]
+    provider_id: Option<String>,
+    #[serde(rename = "modelID", alias = "model_id", alias = "modelId")]
+    model_id: Option<String>,
+}
+
+fn update_requests_model_change(update: &OpenCodeUpdateSessionRequest) -> bool {
+    update.model.is_some() || update.provider_id.is_some() || update.model_id.is_some()
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -578,6 +771,17 @@ struct SessionSummarizeRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct SessionInitRequest {
+    #[serde(rename = "providerID")]
+    provider_id: Option<String>,
+    #[serde(rename = "modelID")]
+    model_id: Option<String>,
+    #[serde(rename = "messageID")]
+    message_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 struct PermissionReplyRequest {
     response: Option<String>,
 }
@@ -615,6 +819,7 @@ fn available_agent_ids() -> Vec<AgentId> {
         AgentId::Opencode,
         AgentId::Amp,
         AgentId::Pi,
+        AgentId::Cursor,
         AgentId::Mock,
     ]
 }
@@ -628,18 +833,25 @@ fn default_agent_mode() -> &'static str {
 }
 
 async fn opencode_model_cache(state: &OpenCodeAppState) -> OpenCodeModelCache {
-    let previous_cache = {
-        let cache = state.opencode.model_cache.lock().await;
-        if let Some(cache) = cache.as_ref() {
-            if cache.cached_at.elapsed() < OPENCODE_MODEL_CACHE_TTL {
-                return cache.clone();
-            }
-            Some(cache.clone())
-        } else {
-            None
+    // Keep this lock for the full build to enforce singleflight behavior.
+    // Concurrent requests wait for the same in-flight build instead of
+    // spawning duplicate provider/model fetches.
+    let mut slot = state.opencode.model_cache.lock().await;
+    if let Some(cache) = slot.as_ref() {
+        if cache.cached_at.elapsed() < OPENCODE_MODEL_CACHE_TTL {
+            info!(
+                entries = cache.entries.len(),
+                groups = cache.group_names.len(),
+                connected = cache.connected.len(),
+                "opencode model cache hit"
+            );
+            return cache.clone();
         }
-    };
+    }
+    let previous_cache = slot.clone();
 
+    let started = std::time::Instant::now();
+    info!("opencode model cache miss; building cache");
     let mut cache = build_opencode_model_cache(state).await;
     if let Some(previous_cache) = previous_cache {
         if cache.had_discovery_errors
@@ -650,12 +862,39 @@ async fn opencode_model_cache(state: &OpenCodeAppState) -> OpenCodeModelCache {
             cache.cached_at = Instant::now();
         }
     }
-    let mut slot = state.opencode.model_cache.lock().await;
+    info!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        entries = cache.entries.len(),
+        groups = cache.group_names.len(),
+        connected = cache.connected.len(),
+        "opencode model cache built"
+    );
     *slot = Some(cache.clone());
     cache
 }
 
 async fn build_opencode_model_cache(state: &OpenCodeAppState) -> OpenCodeModelCache {
+    let started = std::time::Instant::now();
+    // Check credentials upfront
+    let creds_started = std::time::Instant::now();
+    let credentials = match tokio::task::spawn_blocking(|| {
+        extract_all_credentials(&CredentialExtractionOptions::new())
+    })
+    .await
+    {
+        Ok(creds) => creds,
+        Err(err) => {
+            warn!("Failed to extract credentials for model cache: {err}");
+            ExtractedCredentials::default()
+        }
+    };
+    let has_anthropic = credentials.anthropic.is_some();
+    let has_openai = credentials.openai.is_some();
+    info!(
+        elapsed_ms = creds_started.elapsed().as_millis() as u64,
+        has_anthropic, has_openai, "opencode model cache credential scan complete"
+    );
+
     let mut entries = Vec::new();
     let mut model_lookup = HashMap::new();
     let mut ambiguous_models = HashSet::new();
@@ -665,23 +904,42 @@ async fn build_opencode_model_cache(state: &OpenCodeAppState) -> OpenCodeModelCa
     let mut default_model: Option<String> = None;
     let mut had_discovery_errors = false;
 
-    for agent in available_agent_ids() {
-        let response = match state.inner.session_manager().agent_models(agent).await {
+    let agents = available_agent_ids();
+    let manager = state.inner.session_manager();
+    let fetches = agents.iter().copied().map(|agent| {
+        let manager = manager.clone();
+        async move {
+            let agent_started = std::time::Instant::now();
+            let response = manager.agent_models(agent).await;
+            (agent, agent_started.elapsed(), response)
+        }
+    });
+    let fetch_results = futures::future::join_all(fetches).await;
+
+    for (agent, elapsed, response) in fetch_results {
+        let response = match response {
             Ok(response) => response,
             Err(err) => {
                 had_discovery_errors = true;
                 let (group_id, group_name) = fallback_group_for_agent(agent);
                 group_agents.entry(group_id.clone()).or_insert(agent);
                 group_names.entry(group_id).or_insert(group_name);
-                tracing::warn!(
-                    target = "sandbox_agent::opencode",
-                    ?agent,
+                warn!(
+                    agent = agent.as_str(),
+                    elapsed_ms = elapsed.as_millis() as u64,
                     ?err,
-                    "failed to discover models for OpenCode provider"
+                    "opencode model cache failed fetching agent models"
                 );
                 continue;
             }
         };
+        info!(
+            agent = agent.as_str(),
+            elapsed_ms = elapsed.as_millis() as u64,
+            model_count = response.models.len(),
+            has_default = response.default_model.is_some(),
+            "opencode model cache fetched agent models"
+        );
 
         if response.models.is_empty() {
             let (group_id, group_name) = fallback_group_for_agent(agent);
@@ -773,7 +1031,31 @@ async fn build_opencode_model_cache(state: &OpenCodeAppState) -> OpenCodeModelCa
         }
     }
 
-    OpenCodeModelCache {
+    // Build connected list based on credential availability
+    let mut connected = Vec::new();
+    for group_id in group_names.keys() {
+        let is_connected = match group_agents.get(group_id) {
+            Some(AgentId::Claude) | Some(AgentId::Amp) => has_anthropic,
+            Some(AgentId::Codex) => has_openai,
+            Some(AgentId::Opencode) => {
+                // Check the specific provider for opencode groups (e.g., "opencode:anthropic")
+                match opencode_group_provider(group_id) {
+                    Some("anthropic") => has_anthropic,
+                    Some("openai") => has_openai,
+                    _ => has_anthropic || has_openai,
+                }
+            }
+            Some(AgentId::Pi) => true,
+            Some(AgentId::Cursor) => true,
+            Some(AgentId::Mock) => true,
+            None => false,
+        };
+        if is_connected {
+            connected.push(group_id.clone());
+        }
+    }
+
+    let cache = OpenCodeModelCache {
         entries,
         model_lookup,
         group_defaults,
@@ -783,7 +1065,18 @@ async fn build_opencode_model_cache(state: &OpenCodeAppState) -> OpenCodeModelCa
         default_model,
         cached_at: Instant::now(),
         had_discovery_errors,
-    }
+        connected,
+    };
+    info!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        entries = cache.entries.len(),
+        groups = cache.group_names.len(),
+        connected = cache.connected.len(),
+        default_group = cache.default_group.as_str(),
+        default_model = cache.default_model.as_str(),
+        "opencode model cache build complete"
+    );
+    cache
 }
 
 fn fallback_group_for_agent(agent: AgentId) -> (String, String) {
@@ -845,13 +1138,16 @@ async fn resolve_session_agent(
 ) -> (String, String, String) {
     let cache = opencode_model_cache(state).await;
     let default_model_id = cache.default_model.clone();
-    let mut provider_id = requested_provider
+    let requested_provider = requested_provider
         .filter(|value| !value.is_empty())
         .filter(|value| *value != "sandbox-agent")
         .map(|value| value.to_string());
-    let model_id = requested_model
+    let requested_model = requested_model
         .filter(|value| !value.is_empty())
         .map(|value| value.to_string());
+    let explicit_selection = requested_provider.is_some() || requested_model.is_some();
+    let mut provider_id = requested_provider.clone();
+    let model_id = requested_model.clone();
     if provider_id.is_none() {
         if let Some(model_value) = model_id.as_deref() {
             if let Some(entry) = cache
@@ -884,7 +1180,7 @@ async fn resolve_session_agent(
     state
         .opencode
         .update_runtime(session_id, |runtime| {
-            if runtime.session_agent_id.is_none() {
+            if runtime.session_agent_id.is_none() || explicit_selection {
                 let agent = resolved_agent.unwrap_or_else(default_agent_id);
                 runtime.session_agent_id = Some(agent.as_str().to_string());
                 runtime.session_provider_id = Some(provider_id.clone());
@@ -909,8 +1205,9 @@ fn agent_display_name(agent: AgentId) -> &'static str {
         AgentId::Codex => "Codex",
         AgentId::Opencode => "OpenCode",
         AgentId::Amp => "Amp",
-        AgentId::Mock => "Mock",
         AgentId::Pi => "Pi",
+        AgentId::Cursor => "Cursor",
+        AgentId::Mock => "Mock",
     }
 }
 
@@ -1099,6 +1396,99 @@ fn bool_ok(value: bool) -> (StatusCode, Json<Value>) {
     (StatusCode::OK, Json(json!(value)))
 }
 
+async fn proxy_native_opencode(
+    state: &Arc<OpenCodeAppState>,
+    method: reqwest::Method,
+    path: &str,
+    headers: &HeaderMap,
+    body: Option<Value>,
+) -> Option<Response> {
+    let base_url = if let Some(base_url) = state.opencode.proxy_base_url() {
+        base_url.to_string()
+    } else {
+        match state.inner.ensure_opencode_server().await {
+            Ok(base_url) => base_url,
+            Err(err) => {
+                warn!(path, ?err, "failed to lazily start native opencode server");
+                return None;
+            }
+        }
+    };
+
+    let mut request = state
+        .proxy_http_client
+        .request(method, format!("{base_url}{path}"));
+
+    for header_name in [
+        header::AUTHORIZATION,
+        header::ACCEPT,
+        HeaderName::from_static("x-opencode-directory"),
+    ] {
+        if let Some(value) = headers.get(&header_name) {
+            request = request.header(header_name.as_str(), value.as_bytes());
+        }
+    }
+
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(err) => {
+            warn!(path, ?err, "failed proxy request to native opencode");
+            return Some(
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "data": {},
+                        "errors": [{"message": format!("failed to proxy to native opencode: {err}")}],
+                        "success": false,
+                    })),
+                )
+                    .into_response(),
+            );
+        }
+    };
+
+    let status =
+        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    let body_bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            warn!(path, ?err, "failed to read proxied response body");
+            return Some(
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "data": {},
+                        "errors": [{"message": format!("failed to read proxied response: {err}")}],
+                        "success": false,
+                    })),
+                )
+                    .into_response(),
+            );
+        }
+    };
+
+    let mut proxied = Response::new(Body::from(body_bytes));
+    *proxied.status_mut() = status;
+    if let Some(content_type) = content_type {
+        if let Ok(header_value) = HeaderValue::from_str(&content_type) {
+            proxied
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, header_value);
+        }
+    }
+
+    Some(proxied)
+}
+
 fn build_user_message(
     session_id: &str,
     message_id: &str,
@@ -1278,6 +1668,61 @@ fn unique_assistant_message_id(
     }
 }
 
+fn set_item_text_delta_capability(
+    runtime: &mut OpenCodeSessionRuntime,
+    item_id: Option<&str>,
+    native_item_id: Option<&str>,
+    supports_text_deltas: bool,
+) {
+    for key in [item_id, native_item_id].into_iter().flatten() {
+        if supports_text_deltas {
+            runtime.non_text_item_ids.remove(key);
+        } else {
+            runtime.non_text_item_ids.insert(key.to_string());
+        }
+    }
+}
+
+fn item_delta_is_non_text(
+    runtime: &OpenCodeSessionRuntime,
+    item_id: Option<&str>,
+    native_item_id: Option<&str>,
+) -> bool {
+    [item_id, native_item_id]
+        .into_iter()
+        .flatten()
+        .any(|key| runtime.non_text_item_ids.contains(key))
+}
+
+fn item_supports_text_deltas(item: &UniversalItem) -> bool {
+    if item.kind != ItemKind::Message {
+        return false;
+    }
+    if !matches!(item.role.as_ref(), Some(ItemRole::Assistant)) {
+        return false;
+    }
+    if item.content.is_empty() {
+        return true;
+    }
+    item.content
+        .iter()
+        .any(|part| matches!(part, ContentPart::Text { .. }))
+}
+
+fn extract_message_text_from_content(parts: &[ContentPart]) -> Option<String> {
+    let mut text = String::new();
+    for part in parts {
+        if let ContentPart::Text { text: chunk } = part {
+            text.push_str(chunk);
+        }
+    }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 fn extract_text_from_content(parts: &[ContentPart]) -> Option<String> {
     let mut text = String::new();
     for part in parts {
@@ -1446,6 +1891,38 @@ fn emit_file_edited(state: &OpenCodeState, path: &str) {
     }));
 }
 
+fn emit_session_idle(state: &OpenCodeState, session_id: &str) {
+    state.emit_event(json!({
+        "type": "session.status",
+        "properties": {"sessionID": session_id, "status": {"type": "idle"}}
+    }));
+    state.emit_event(json!({
+        "type": "session.idle",
+        "properties": {"sessionID": session_id}
+    }));
+}
+
+fn emit_session_error(
+    state: &OpenCodeState,
+    session_id: &str,
+    message: &str,
+    code: Option<&str>,
+    details: Option<Value>,
+) {
+    let mut error = serde_json::Map::new();
+    error.insert("data".to_string(), json!({"message": message}));
+    if let Some(code) = code {
+        error.insert("code".to_string(), json!(code));
+    }
+    if let Some(details) = details {
+        error.insert("details".to_string(), details);
+    }
+    state.emit_event(json!({
+        "type": "session.error",
+        "properties": {"sessionID": session_id, "error": Value::Object(error)}
+    }));
+}
+
 fn permission_event(event_type: &str, permission: &Value) -> Value {
     json!({
         "type": event_type,
@@ -1521,11 +1998,8 @@ async fn upsert_message_part(
     } else {
         record.parts.push(part);
     }
-    record.parts.sort_by(|a, b| {
-        let a_id = a.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        let b_id = b.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        a_id.cmp(b_id)
-    });
+    // Preserve insertion order so UI rendering matches stream chronology.
+    // Sorting by synthetic part IDs can reorder text/tool parts unexpectedly.
 }
 
 async fn session_directory(state: &OpenCodeState, session_id: &str) -> String {
@@ -1612,31 +2086,61 @@ fn patterns_from_metadata(metadata: &Option<Value>) -> Vec<String> {
     patterns
 }
 
+fn turn_error_from_metadata(metadata: &Option<Value>) -> Option<(String, Option<Value>)> {
+    let error = metadata.as_ref()?.get("error")?;
+    let message = error
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Turn failed")
+        .to_string();
+    Some((message, Some(error.clone())))
+}
+
 async fn apply_universal_event(state: Arc<OpenCodeAppState>, event: UniversalEvent) {
     match event.event_type {
         UniversalEventType::ItemStarted | UniversalEventType::ItemCompleted => {
             if let UniversalEventData::Item(ItemEventData { item }) = &event.data {
-                // turn.completed or session.idle status → emit session.idle
-                if event.event_type == UniversalEventType::ItemCompleted
-                    && item.kind == ItemKind::Status
-                {
-                    if let Some(ContentPart::Status { label, .. }) = item.content.first() {
-                        if label == "turn.completed" || label == "session.idle" {
-                            let session_id = event.session_id.clone();
-                            state.opencode.emit_event(json!({
-                                "type": "session.status",
-                                "properties": {"sessionID": session_id, "status": {"type": "idle"}}
-                            }));
-                            state.opencode.emit_event(json!({
-                                "type": "session.idle",
-                                "properties": {"sessionID": session_id}
-                            }));
-                            return;
-                        }
-                    }
-                }
                 apply_item_event(state, event.clone(), item.clone()).await;
             }
+        }
+        UniversalEventType::TurnStarted => {
+            state
+                .opencode
+                .update_runtime(&event.session_id, |runtime| {
+                    runtime.turn_in_progress = true;
+                })
+                .await;
+            let session_id = event.session_id.clone();
+            state.opencode.emit_event(json!({
+                "type": "session.status",
+                "properties": {"sessionID": session_id, "status": {"type": "busy"}}
+            }));
+        }
+        UniversalEventType::TurnEnded => {
+            let turn_data = match &event.data {
+                UniversalEventData::Turn(data) => Some(data.clone()),
+                _ => None,
+            };
+            let mut should_emit_idle = false;
+            state
+                .opencode
+                .update_runtime(&event.session_id, |runtime| {
+                    let was_turn_in_progress = runtime.turn_in_progress;
+                    runtime.active_assistant_message_id = None;
+                    runtime.turn_in_progress = false;
+                    runtime.open_tool_calls.clear();
+                    should_emit_idle = was_turn_in_progress;
+                })
+                .await;
+            if let Some(turn_data) = turn_data {
+                if let Some((message, details)) = turn_error_from_metadata(&turn_data.metadata) {
+                    emit_session_error(&state.opencode, &event.session_id, &message, None, details);
+                }
+            }
+            if !should_emit_idle {
+                return;
+            }
+            emit_session_idle(&state.opencode, &event.session_id);
         }
         UniversalEventType::ItemDelta => {
             if let UniversalEventData::ItemDelta(ItemDeltaData {
@@ -1656,15 +2160,19 @@ async fn apply_universal_event(state: Arc<OpenCodeAppState>, event: UniversalEve
             }
         }
         UniversalEventType::SessionEnded => {
-            let session_id = event.session_id.clone();
-            state.opencode.emit_event(json!({
-                "type": "session.status",
-                "properties": {"sessionID": session_id, "status": {"type": "idle"}}
-            }));
-            state.opencode.emit_event(json!({
-                "type": "session.idle",
-                "properties": {"sessionID": event.session_id}
-            }));
+            let mut should_emit_idle = false;
+            state
+                .opencode
+                .update_runtime(&event.session_id, |runtime| {
+                    should_emit_idle = runtime.turn_in_progress;
+                    runtime.turn_in_progress = false;
+                    runtime.active_assistant_message_id = None;
+                    runtime.open_tool_calls.clear();
+                })
+                .await;
+            if should_emit_idle {
+                emit_session_idle(&state.opencode, &event.session_id);
+            }
         }
         UniversalEventType::PermissionRequested | UniversalEventType::PermissionResolved => {
             if let UniversalEventData::Permission(permission) = &event.data {
@@ -1678,17 +2186,27 @@ async fn apply_universal_event(state: Arc<OpenCodeAppState>, event: UniversalEve
         }
         UniversalEventType::Error => {
             if let UniversalEventData::Error(error) = &event.data {
-                state.opencode.emit_event(json!({
-                    "type": "session.error",
-                    "properties": {
-                        "sessionID": event.session_id,
-                        "error": {
-                            "data": {"message": error.message},
-                            "code": error.code,
-                            "details": error.details,
-                        }
-                    }
-                }));
+                let session_id = event.session_id.clone();
+                let mut should_emit_idle = false;
+                state
+                    .opencode
+                    .update_runtime(&session_id, |runtime| {
+                        let was_turn_in_progress = runtime.turn_in_progress;
+                        runtime.turn_in_progress = false;
+                        runtime.active_assistant_message_id = None;
+                        should_emit_idle = was_turn_in_progress;
+                    })
+                    .await;
+                emit_session_error(
+                    &state.opencode,
+                    &session_id,
+                    &error.message,
+                    error.code.as_deref(),
+                    error.details.clone(),
+                );
+                if should_emit_idle {
+                    emit_session_idle(&state.opencode, &session_id);
+                }
             }
         }
         _ => {}
@@ -1700,6 +2218,11 @@ async fn apply_permission_event(
     event: UniversalEvent,
     permission: PermissionEventData,
 ) {
+    // Suppress question-tool permissions (AskUserQuestion/ExitPlanMode) — these are
+    // handled internally via reply_question/reject_question, not exposed as permissions.
+    if is_question_tool_action(&permission.action) {
+        return;
+    }
     let session_id = event.session_id.clone();
     match permission.status {
         PermissionStatus::Requested => {
@@ -1720,10 +2243,13 @@ async fn apply_permission_event(
                 .opencode
                 .emit_event(permission_event("permission.asked", &value));
         }
-        PermissionStatus::Approved | PermissionStatus::Denied => {
+        PermissionStatus::Accept
+        | PermissionStatus::AcceptForSession
+        | PermissionStatus::Reject => {
             let reply = match permission.status {
-                PermissionStatus::Approved => "once",
-                PermissionStatus::Denied => "reject",
+                PermissionStatus::Accept => "once",
+                PermissionStatus::AcceptForSession => "always",
+                PermissionStatus::Reject => "reject",
                 PermissionStatus::Requested => "once",
             };
             let event_value = json!({
@@ -1816,16 +2342,6 @@ async fn apply_item_event(
     event: UniversalEvent,
     item: UniversalItem,
 ) {
-    if matches!(item.kind, ItemKind::ToolCall | ItemKind::ToolResult) {
-        apply_tool_item_event(state, event, item).await;
-        return;
-    }
-    if item.kind != ItemKind::Message {
-        return;
-    }
-    if matches!(item.role, Some(ItemRole::User)) {
-        return;
-    }
     let session_id = event.session_id.clone();
     let item_id_key = if item.item_id.is_empty() {
         None
@@ -1833,6 +2349,38 @@ async fn apply_item_event(
         Some(item.item_id.clone())
     };
     let native_id_key = item.native_item_id.clone();
+    let supports_text_deltas = item_supports_text_deltas(&item);
+    let is_user_item = matches!(item.role.as_ref(), Some(ItemRole::User));
+    let _ = state
+        .opencode
+        .update_runtime(&session_id, |runtime| {
+            set_item_text_delta_capability(
+                runtime,
+                item_id_key.as_deref(),
+                native_id_key.as_deref(),
+                supports_text_deltas,
+            );
+            if is_user_item {
+                if let Some(item_key) = item_id_key.as_ref() {
+                    runtime.user_item_ids.insert(item_key.clone());
+                }
+                if let Some(native_key) = native_id_key.as_ref() {
+                    runtime.user_item_ids.insert(native_key.clone());
+                }
+            }
+        })
+        .await;
+
+    if matches!(item.kind, ItemKind::ToolCall | ItemKind::ToolResult) {
+        apply_tool_item_event(state, event, item).await;
+        return;
+    }
+    if item.kind != ItemKind::Message {
+        return;
+    }
+    if is_user_item {
+        return;
+    }
     let mut message_id: Option<String> = None;
     let mut parent_id: Option<String> = None;
     let runtime = state
@@ -1851,6 +2399,7 @@ async fn apply_item_event(
                         .clone()
                         .and_then(|key| runtime.message_id_for_item.get(&key).cloned())
                 })
+                .or_else(|| runtime.active_assistant_message_id.clone())
             {
                 message_id = Some(existing);
             } else {
@@ -1917,56 +2466,54 @@ async fn apply_item_event(
             if runtime.last_user_message_id.is_none() {
                 runtime.last_user_message_id = parent_id.clone();
             }
+            runtime.active_assistant_message_id = Some(message_id.clone());
         })
         .await;
 
-    if let Some(text) = extract_text_from_content(&item.content) {
-        let part_id = runtime
-            .part_id_by_message
-            .entry(message_id.clone())
-            .or_insert_with(|| format!("{}_text", message_id))
-            .clone();
+    if let Some(text) = extract_message_text_from_content(&item.content) {
         if event.event_type == UniversalEventType::ItemStarted {
-            // For ItemStarted, only store the text in runtime as the initial value
-            // without emitting a part event. Deltas will handle streaming, and
-            // ItemCompleted will emit the final text part.
+            // Reset streaming text state for a new assistant item.
             let _ = state
                 .opencode
                 .update_runtime(&session_id, |runtime| {
-                    runtime
-                        .text_by_message
-                        .insert(message_id.clone(), String::new());
-                    runtime
-                        .part_id_by_message
-                        .insert(message_id.clone(), part_id.clone());
+                    runtime.text_by_message.remove(&message_id);
+                    runtime.part_id_by_message.remove(&message_id);
+                    runtime.messages_with_text_deltas.remove(&message_id);
                 })
                 .await;
         } else {
-            // For ItemCompleted, emit the final text part with the complete text.
-            // Use the accumulated text from deltas if available, otherwise use
-            // the text from the completed event.
-            let final_text = runtime
-                .text_by_message
-                .get(&message_id)
-                .filter(|t| !t.is_empty())
-                .cloned()
-                .unwrap_or_else(|| text.clone());
-            let part = build_text_part_with_id(&session_id, &message_id, &part_id, &final_text);
-            upsert_message_part(&state.opencode, &session_id, &message_id, part.clone()).await;
-            state
-                .opencode
-                .emit_event(part_event("message.part.updated", &part));
-            let _ = state
-                .opencode
-                .update_runtime(&session_id, |runtime| {
-                    runtime
-                        .text_by_message
-                        .insert(message_id.clone(), final_text.clone());
-                    runtime
-                        .part_id_by_message
-                        .insert(message_id.clone(), part_id.clone());
-                })
-                .await;
+            // If text was streamed via deltas, keep segment ordering as emitted and
+            // avoid replacing the latest segment with full completed text.
+            let has_streamed_text = runtime.messages_with_text_deltas.contains(&message_id);
+            if !has_streamed_text {
+                let part_id = runtime
+                    .part_id_by_message
+                    .get(&message_id)
+                    .cloned()
+                    .unwrap_or_else(|| next_id("part_", &PART_COUNTER));
+                let final_text = runtime
+                    .text_by_message
+                    .get(&message_id)
+                    .filter(|t| !t.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| text.clone());
+                let part = build_text_part_with_id(&session_id, &message_id, &part_id, &final_text);
+                upsert_message_part(&state.opencode, &session_id, &message_id, part.clone()).await;
+                state
+                    .opencode
+                    .emit_event(part_event("message.part.updated", &part));
+                let _ = state
+                    .opencode
+                    .update_runtime(&session_id, |runtime| {
+                        runtime
+                            .text_by_message
+                            .insert(message_id.clone(), final_text.clone());
+                        runtime
+                            .part_id_by_message
+                            .insert(message_id.clone(), part_id.clone());
+                    })
+                    .await;
+            }
         }
     }
 
@@ -2031,6 +2578,10 @@ async fn apply_item_event(
                         runtime
                             .tool_args_by_call
                             .insert(call_id.clone(), arguments.clone());
+                        runtime.open_tool_calls.insert(call_id.clone());
+                        // Start a new text segment after tool activity.
+                        runtime.part_id_by_message.remove(&message_id);
+                        runtime.text_by_message.remove(&message_id);
                     })
                     .await;
             }
@@ -2088,6 +2639,10 @@ async fn apply_item_event(
                         runtime
                             .tool_message_by_call
                             .insert(call_id.clone(), message_id.clone());
+                        runtime.open_tool_calls.remove(call_id);
+                        // Start a new text segment after tool activity.
+                        runtime.part_id_by_message.remove(&message_id);
+                        runtime.text_by_message.remove(&message_id);
                     })
                     .await;
             }
@@ -2161,6 +2716,7 @@ async fn apply_tool_item_event(
                         .and_then(|key| runtime.message_id_for_item.get(&key).cloned())
                 })
                 .or_else(|| runtime.tool_message_by_call.get(&call_id).cloned())
+                .or_else(|| runtime.active_assistant_message_id.clone())
             {
                 message_id = Some(existing);
             } else {
@@ -2202,7 +2758,7 @@ async fn apply_tool_item_event(
     let worktree = state.opencode.worktree_for(&directory);
     let now = state.opencode.now_ms();
 
-    let mut info = build_assistant_message(
+    let info = build_assistant_message(
         &session_id,
         &message_id,
         parent_id.as_deref().unwrap_or(""),
@@ -2213,13 +2769,6 @@ async fn apply_tool_item_event(
         &provider_id,
         &model_id,
     );
-    if event.event_type == UniversalEventType::ItemCompleted {
-        if let Some(obj) = info.as_object_mut() {
-            if let Some(time) = obj.get_mut("time").and_then(|v| v.as_object_mut()) {
-                time.insert("completed".to_string(), json!(now));
-            }
-        }
-    }
     upsert_message_info(&state.opencode, &session_id, info.clone()).await;
     state
         .opencode
@@ -2353,6 +2902,17 @@ async fn apply_tool_item_event(
                     .tool_args_by_call
                     .insert(call_id.clone(), args.clone());
             }
+            if item.kind == ItemKind::ToolCall {
+                runtime.open_tool_calls.insert(call_id.clone());
+            }
+            if item.kind == ItemKind::ToolResult
+                && event.event_type == UniversalEventType::ItemCompleted
+            {
+                runtime.open_tool_calls.remove(&call_id);
+            }
+            // Start a new text segment after tool activity.
+            runtime.part_id_by_message.remove(&message_id);
+            runtime.text_by_message.remove(&message_id);
         })
         .await;
 }
@@ -2371,22 +2931,35 @@ async fn apply_item_delta(
         Some(item_id)
     };
     let native_id_key = native_item_id;
-    let is_user_delta = item_id_key
-        .as_ref()
-        .map(|value| value.starts_with("user_"))
-        .unwrap_or(false)
-        || native_id_key
-            .as_ref()
-            .map(|value| value.starts_with("user_"))
-            .unwrap_or(false);
-    if is_user_delta {
-        return;
-    }
     let mut message_id: Option<String> = None;
     let mut parent_id: Option<String> = None;
+    let mut is_user_delta = false;
+    let mut suppress_non_text_delta = false;
     let runtime = state
         .opencode
         .update_runtime(&session_id, |runtime| {
+            if item_delta_is_non_text(runtime, item_id_key.as_deref(), native_id_key.as_deref()) {
+                suppress_non_text_delta = true;
+                return;
+            }
+            let is_user_from_runtime = item_id_key
+                .as_ref()
+                .is_some_and(|value| runtime.user_item_ids.contains(value))
+                || native_id_key
+                    .as_ref()
+                    .is_some_and(|value| runtime.user_item_ids.contains(value));
+            let is_user_from_prefix = item_id_key
+                .as_ref()
+                .map(|value| value.starts_with("user_"))
+                .unwrap_or(false)
+                || native_id_key
+                    .as_ref()
+                    .map(|value| value.starts_with("user_"))
+                    .unwrap_or(false);
+            if is_user_from_runtime || is_user_from_prefix {
+                is_user_delta = true;
+                return;
+            }
             parent_id = runtime.last_user_message_id.clone();
             if let Some(existing) = item_id_key
                 .clone()
@@ -2396,6 +2969,7 @@ async fn apply_item_delta(
                         .clone()
                         .and_then(|key| runtime.message_id_for_item.get(&key).cloned())
                 })
+                .or_else(|| runtime.active_assistant_message_id.clone())
             {
                 message_id = Some(existing);
             } else {
@@ -2413,6 +2987,9 @@ async fn apply_item_delta(
             }
         })
         .await;
+    if is_user_delta || suppress_non_text_delta {
+        return;
+    }
     let message_id = message_id.unwrap_or_else(|| {
         unique_assistant_message_id(&runtime, parent_id.as_ref(), event.sequence)
     });
@@ -2457,7 +3034,7 @@ async fn apply_item_delta(
         .part_id_by_message
         .get(&message_id)
         .cloned()
-        .unwrap_or_else(|| format!("{}_text", message_id));
+        .unwrap_or_else(|| next_id("part_", &PART_COUNTER));
     let part = build_text_part_with_id(&session_id, &message_id, &part_id, &text);
     upsert_message_part(&state.opencode, &session_id, &message_id, part.clone()).await;
     state.opencode.emit_event(part_event_with_delta(
@@ -2472,6 +3049,7 @@ async fn apply_item_delta(
             runtime
                 .part_id_by_message
                 .insert(message_id.clone(), part_id.clone());
+            runtime.messages_with_text_deltas.insert(message_id.clone());
         })
         .await;
 }
@@ -2649,8 +3227,16 @@ async fn oc_agent_list(State(state): State<Arc<OpenCodeAppState>>) -> impl IntoR
     responses((status = 200)),
     tag = "opencode"
 )]
-async fn oc_command_list() -> impl IntoResponse {
-    (StatusCode::OK, Json(json!([])))
+async fn oc_command_list(
+    State(state): State<Arc<OpenCodeAppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) =
+        proxy_native_opencode(&state, reqwest::Method::GET, "/command", &headers, None).await
+    {
+        return response;
+    }
+    (StatusCode::OK, Json(json!([]))).into_response()
 }
 
 #[utoipa::path(
@@ -2659,8 +3245,13 @@ async fn oc_command_list() -> impl IntoResponse {
     responses((status = 200)),
     tag = "opencode"
 )]
-async fn oc_config_get() -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({})))
+async fn oc_config_get(State(state): State<Arc<OpenCodeAppState>>, headers: HeaderMap) -> Response {
+    if let Some(response) =
+        proxy_native_opencode(&state, reqwest::Method::GET, "/config", &headers, None).await
+    {
+        return response;
+    }
+    (StatusCode::OK, Json(json!({}))).into_response()
 }
 
 #[utoipa::path(
@@ -2670,8 +3261,23 @@ async fn oc_config_get() -> impl IntoResponse {
     responses((status = 200)),
     tag = "opencode"
 )]
-async fn oc_config_patch(Json(body): Json<Value>) -> impl IntoResponse {
-    (StatusCode::OK, Json(body))
+async fn oc_config_patch(
+    State(state): State<Arc<OpenCodeAppState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Some(response) = proxy_native_opencode(
+        &state,
+        reqwest::Method::PATCH,
+        "/config",
+        &headers,
+        Some(body.clone()),
+    )
+    .await
+    {
+        return response;
+    }
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 #[utoipa::path(
@@ -2724,6 +3330,13 @@ async fn oc_config_providers(State(state): State<Arc<OpenCodeAppState>>) -> impl
     (StatusCode::OK, Json(providers))
 }
 
+fn parse_last_event_id(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
 #[utoipa::path(
     get,
     path = "/event",
@@ -2735,6 +3348,7 @@ async fn oc_event_subscribe(
     headers: HeaderMap,
     Query(query): Query<DirectoryQuery>,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let last_event_id = parse_last_event_id(&headers);
     let receiver = state.opencode.subscribe();
     let directory = state
         .opencode
@@ -2751,35 +3365,61 @@ async fn oc_event_subscribe(
             "branch": branch,
         }
     }));
+    let replay_events = state.opencode.buffered_events_after(last_event_id);
+    let replay_cursor = replay_events
+        .last()
+        .map(|event| event.id)
+        .or(last_event_id)
+        .unwrap_or(0);
 
     let heartbeat_payload = json!({
         "type": "server.heartbeat",
         "properties": {}
     });
     let stream = stream::unfold(
-        (receiver, interval(std::time::Duration::from_secs(30))),
-        move |(mut rx, mut ticker)| {
+        (
+            receiver,
+            interval(std::time::Duration::from_secs(30)),
+            VecDeque::from(replay_events),
+            replay_cursor,
+        ),
+        move |(mut rx, mut ticker, mut replay, replay_cursor)| {
             let heartbeat = heartbeat_payload.clone();
             async move {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        let sse_event = Event::default()
-                            .json_data(&heartbeat)
-                            .unwrap_or_else(|_| Event::default().data("{}"));
-                        Some((Ok(sse_event), (rx, ticker)))
-                    }
-                    event = rx.recv() => {
-                        match event {
-                            Ok(event) => {
-                                let sse_event = Event::default()
-                                    .json_data(&event)
-                                    .unwrap_or_else(|_| Event::default().data("{}"));
-                                Some((Ok(sse_event), (rx, ticker)))
+                if let Some(event) = replay.pop_front() {
+                    let sse_event = Event::default()
+                        .id(event.id.to_string())
+                        .json_data(&event.payload)
+                        .unwrap_or_else(|_| Event::default().data("{}"));
+                    return Some((Ok(sse_event), (rx, ticker, replay, replay_cursor)));
+                }
+
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => {
+                            let sse_event = Event::default()
+                                .json_data(&heartbeat)
+                                .unwrap_or_else(|_| Event::default().data("{}"));
+                            return Some((Ok(sse_event), (rx, ticker, replay, replay_cursor)));
+                        }
+                        event = rx.recv() => {
+                            match event {
+                                Ok(event) => {
+                                    if event.id <= replay_cursor {
+                                        continue;
+                                    }
+                                    let sse_event = Event::default()
+                                        .id(event.id.to_string())
+                                        .json_data(&event.payload)
+                                        .unwrap_or_else(|_| Event::default().data("{}"));
+                                    return Some((Ok(sse_event), (rx, ticker, replay, replay_cursor)));
+                                }
+                                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                    warn!(skipped, "opencode event stream lagged");
+                                    return Some((Ok(Event::default().comment("lagged")), (rx, ticker, replay, replay_cursor)));
+                                }
+                                Err(broadcast::error::RecvError::Closed) => return None,
                             }
-                            Err(broadcast::error::RecvError::Lagged(_)) => {
-                                Some((Ok(Event::default().comment("lagged")), (rx, ticker)))
-                            }
-                            Err(broadcast::error::RecvError::Closed) => None,
                         }
                     }
                 }
@@ -2801,6 +3441,7 @@ async fn oc_global_event(
     headers: HeaderMap,
     Query(query): Query<DirectoryQuery>,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let last_event_id = parse_last_event_id(&headers);
     let receiver = state.opencode.subscribe();
     let directory = state
         .opencode
@@ -2817,6 +3458,12 @@ async fn oc_global_event(
             "branch": branch,
         }
     }));
+    let replay_events = state.opencode.buffered_events_after(last_event_id);
+    let replay_cursor = replay_events
+        .last()
+        .map(|event| event.id)
+        .or(last_event_id)
+        .unwrap_or(0);
 
     let heartbeat_payload = json!({
         "payload": {
@@ -2825,31 +3472,52 @@ async fn oc_global_event(
         }
     });
     let stream = stream::unfold(
-        (receiver, interval(std::time::Duration::from_secs(30))),
-        move |(mut rx, mut ticker)| {
+        (
+            receiver,
+            interval(std::time::Duration::from_secs(30)),
+            VecDeque::from(replay_events),
+            replay_cursor,
+        ),
+        move |(mut rx, mut ticker, mut replay, replay_cursor)| {
             let directory = directory.clone();
             let heartbeat = heartbeat_payload.clone();
             async move {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        let sse_event = Event::default()
-                            .json_data(&heartbeat)
-                            .unwrap_or_else(|_| Event::default().data("{}"));
-                        Some((Ok(sse_event), (rx, ticker)))
-                    }
-                    event = rx.recv() => {
-                        match event {
-                            Ok(event) => {
-                                let payload = json!({"directory": directory, "payload": event});
-                                let sse_event = Event::default()
-                                    .json_data(&payload)
-                                    .unwrap_or_else(|_| Event::default().data("{}"));
-                                Some((Ok(sse_event), (rx, ticker)))
+                if let Some(event) = replay.pop_front() {
+                    let payload = json!({"directory": directory, "payload": event.payload});
+                    let sse_event = Event::default()
+                        .id(event.id.to_string())
+                        .json_data(&payload)
+                        .unwrap_or_else(|_| Event::default().data("{}"));
+                    return Some((Ok(sse_event), (rx, ticker, replay, replay_cursor)));
+                }
+
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => {
+                            let sse_event = Event::default()
+                                .json_data(&heartbeat)
+                                .unwrap_or_else(|_| Event::default().data("{}"));
+                            return Some((Ok(sse_event), (rx, ticker, replay, replay_cursor)));
+                        }
+                        event = rx.recv() => {
+                            match event {
+                                Ok(event) => {
+                                    if event.id <= replay_cursor {
+                                        continue;
+                                    }
+                                    let payload = json!({"directory": directory, "payload": event.payload});
+                                    let sse_event = Event::default()
+                                        .id(event.id.to_string())
+                                        .json_data(&payload)
+                                        .unwrap_or_else(|_| Event::default().data("{}"));
+                                    return Some((Ok(sse_event), (rx, ticker, replay, replay_cursor)));
+                                }
+                                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                    warn!(skipped, "opencode global event stream lagged");
+                                    return Some((Ok(Event::default().comment("lagged")), (rx, ticker, replay, replay_cursor)));
+                                }
+                                Err(broadcast::error::RecvError::Closed) => return None,
                             }
-                            Err(broadcast::error::RecvError::Lagged(_)) => {
-                                Some((Ok(Event::default().comment("lagged")), (rx, ticker)))
-                            }
-                            Err(broadcast::error::RecvError::Closed) => None,
                         }
                     }
                 }
@@ -2882,8 +3550,22 @@ async fn oc_global_health() -> impl IntoResponse {
     responses((status = 200)),
     tag = "opencode"
 )]
-async fn oc_global_config_get() -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({})))
+async fn oc_global_config_get(
+    State(state): State<Arc<OpenCodeAppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = proxy_native_opencode(
+        &state,
+        reqwest::Method::GET,
+        "/global/config",
+        &headers,
+        None,
+    )
+    .await
+    {
+        return response;
+    }
+    (StatusCode::OK, Json(json!({}))).into_response()
 }
 
 #[utoipa::path(
@@ -2893,8 +3575,23 @@ async fn oc_global_config_get() -> impl IntoResponse {
     responses((status = 200)),
     tag = "opencode"
 )]
-async fn oc_global_config_patch(Json(body): Json<Value>) -> impl IntoResponse {
-    (StatusCode::OK, Json(body))
+async fn oc_global_config_patch(
+    State(state): State<Arc<OpenCodeAppState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Some(response) = proxy_native_opencode(
+        &state,
+        reqwest::Method::PATCH,
+        "/global/config",
+        &headers,
+        Some(body.clone()),
+    )
+    .await
+    {
+        return response;
+    }
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 #[utoipa::path(
@@ -3069,6 +3766,11 @@ async fn oc_session_create(
         title: None,
         parent_id: None,
         permission: None,
+        permission_mode: None,
+        model: None,
+        provider_id: None,
+        model_id: None,
+        variant: None,
     });
     let directory = state
         .opencode
@@ -3077,6 +3779,19 @@ async fn oc_session_create(
     let id = next_id("ses_", &SESSION_COUNTER);
     let slug = format!("session-{}", id);
     let title = body.title.unwrap_or_else(|| format!("Session {}", id));
+    let permission_mode = body.permission_mode.clone();
+    let requested_provider = body
+        .model
+        .as_ref()
+        .and_then(|v| v.get("providerID"))
+        .and_then(|v| v.as_str())
+        .or(body.provider_id.as_deref());
+    let requested_model = body
+        .model
+        .as_ref()
+        .and_then(|v| v.get("modelID"))
+        .and_then(|v| v.as_str())
+        .or(body.model_id.as_deref());
     let record = OpenCodeSessionRecord {
         id: id.clone(),
         slug,
@@ -3088,6 +3803,7 @@ async fn oc_session_create(
         created_at: now,
         updated_at: now,
         share_url: None,
+        permission_mode: permission_mode.clone(),
     };
 
     let session_value = record.to_value();
@@ -3096,11 +3812,32 @@ async fn oc_session_create(
     sessions.insert(id.clone(), record);
     drop(sessions);
 
+    let (session_agent, provider_id, model_id) =
+        resolve_session_agent(&state, &id, requested_provider, requested_model).await;
+    let session_agent_id = AgentId::parse(&session_agent).unwrap_or_else(default_agent_id);
+    let backing_model = backing_model_for_agent(session_agent_id, &provider_id, &model_id);
+    let backing_variant = body.variant.clone();
+    if let Err(err) = ensure_backing_session(
+        &state,
+        &id,
+        &session_agent,
+        backing_model,
+        backing_variant,
+        permission_mode,
+    )
+    .await
+    {
+        let mut sessions = state.opencode.sessions.lock().await;
+        sessions.remove(&id);
+        drop(sessions);
+        return sandbox_error_response(err).into_response();
+    }
+
     state
         .opencode
         .emit_event(session_event("session.created", &session_value));
 
-    (StatusCode::OK, Json(session_value))
+    (StatusCode::OK, Json(session_value)).into_response()
 }
 
 #[utoipa::path(
@@ -3110,8 +3847,22 @@ async fn oc_session_create(
     tag = "opencode"
 )]
 async fn oc_session_list(State(state): State<Arc<OpenCodeAppState>>) -> impl IntoResponse {
-    let sessions = state.opencode.sessions.lock().await;
-    let values: Vec<Value> = sessions.values().map(|s| s.to_value()).collect();
+    let sessions = state.inner.session_manager().list_sessions().await;
+    let project_id = &state.opencode.default_project_id;
+    let mut values: Vec<Value> = sessions
+        .iter()
+        .map(|s| session_info_to_opencode_value(s, project_id))
+        .collect();
+    let mut seen_session_ids: HashSet<String> = sessions
+        .iter()
+        .map(|session| session.session_id.clone())
+        .collect();
+    let compat_sessions = state.opencode.sessions.lock().await;
+    for (session_id, session) in compat_sessions.iter() {
+        if seen_session_ids.insert(session_id.clone()) {
+            values.push(session.to_value());
+        }
+    }
     (StatusCode::OK, Json(json!(values)))
 }
 
@@ -3128,6 +3879,19 @@ async fn oc_session_get(
     _headers: HeaderMap,
     _query: Query<DirectoryQuery>,
 ) -> impl IntoResponse {
+    let project_id = &state.opencode.default_project_id;
+    if let Some(info) = state
+        .inner
+        .session_manager()
+        .get_session_info(&session_id)
+        .await
+    {
+        return (
+            StatusCode::OK,
+            Json(session_info_to_opencode_value(&info, project_id)),
+        )
+            .into_response();
+    }
     let sessions = state.opencode.sessions.lock().await;
     if let Some(session) = sessions.get(&session_id) {
         return (StatusCode::OK, Json(session.to_value())).into_response();
@@ -3150,7 +3914,18 @@ async fn oc_session_update(
 ) -> impl IntoResponse {
     let mut sessions = state.opencode.sessions.lock().await;
     if let Some(session) = sessions.get_mut(&session_id) {
+        if update_requests_model_change(&body) {
+            return bad_request(OPENCODE_MODEL_CHANGE_AFTER_SESSION_CREATE_ERROR).into_response();
+        }
         if let Some(title) = body.title {
+            if let Err(err) = state
+                .inner
+                .session_manager()
+                .set_session_title(&session_id, title.clone())
+                .await
+            {
+                return sandbox_error_response(err).into_response();
+            }
             session.title = title;
             session.updated_at = state.opencode.now_ms();
         }
@@ -3176,6 +3951,15 @@ async fn oc_session_delete(
 ) -> impl IntoResponse {
     let mut sessions = state.opencode.sessions.lock().await;
     if let Some(session) = sessions.remove(&session_id) {
+        drop(sessions);
+        if let Err(err) = state
+            .inner
+            .session_manager()
+            .delete_session(&session_id)
+            .await
+        {
+            return sandbox_error_response(err).into_response();
+        }
         state
             .opencode
             .emit_event(session_event("session.deleted", &session.to_value()));
@@ -3191,10 +3975,20 @@ async fn oc_session_delete(
     tag = "opencode"
 )]
 async fn oc_session_status(State(state): State<Arc<OpenCodeAppState>>) -> impl IntoResponse {
-    let sessions = state.opencode.sessions.lock().await;
+    let sessions = state.inner.session_manager().list_sessions().await;
+    let runtimes = state.opencode.session_runtime.lock().await;
     let mut status_map = serde_json::Map::new();
-    for id in sessions.keys() {
-        status_map.insert(id.clone(), json!({"type": "idle"}));
+    for s in &sessions {
+        let status = if runtimes
+            .get(&s.session_id)
+            .map(|runtime| runtime.turn_in_progress)
+            .unwrap_or(false)
+        {
+            "busy"
+        } else {
+            "idle"
+        };
+        status_map.insert(s.session_id.clone(), json!({"type": status}));
     }
     (StatusCode::OK, Json(Value::Object(status_map)))
 }
@@ -3228,11 +4022,61 @@ async fn oc_session_children() -> impl IntoResponse {
     post,
     path = "/session/{sessionID}/init",
     params(("sessionID" = String, Path, description = "Session ID")),
+    request_body = SessionInitRequest,
     responses((status = 200)),
     tag = "opencode"
 )]
-async fn oc_session_init() -> impl IntoResponse {
-    bool_ok(true)
+async fn oc_session_init(
+    State(state): State<Arc<OpenCodeAppState>>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<DirectoryQuery>,
+    body: Option<Json<SessionInitRequest>>,
+) -> impl IntoResponse {
+    let directory = state
+        .opencode
+        .directory_for(&headers, query.directory.as_ref());
+    let _ = state.opencode.ensure_session(&session_id, directory).await;
+    let body = body.map(|json| json.0).unwrap_or(SessionInitRequest {
+        provider_id: None,
+        model_id: None,
+        message_id: None,
+    });
+    let requested_provider = body
+        .provider_id
+        .as_deref()
+        .filter(|value| !value.is_empty());
+    let requested_model = body.model_id.as_deref().filter(|value| !value.is_empty());
+    if requested_provider.is_none() && requested_model.is_none() {
+        return bool_ok(true).into_response();
+    }
+    if requested_provider.is_none() || requested_model.is_none() {
+        return bad_request("providerID and modelID are required when selecting a model")
+            .into_response();
+    }
+    let (session_agent, provider_id, model_id) =
+        resolve_session_agent(&state, &session_id, requested_provider, requested_model).await;
+    let session_agent_id = AgentId::parse(&session_agent).unwrap_or_else(default_agent_id);
+    let backing_model = backing_model_for_agent(session_agent_id, &provider_id, &model_id);
+    let session_permission_mode = {
+        let sessions = state.opencode.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .and_then(|s| s.permission_mode.clone())
+    };
+    if let Err(err) = ensure_backing_session(
+        &state,
+        &session_id,
+        &session_agent,
+        backing_model,
+        None,
+        session_permission_mode,
+    )
+    .await
+    {
+        return sandbox_error_response(err).into_response();
+    }
+    bool_ok(true).into_response()
 }
 
 #[utoipa::path(
@@ -3256,6 +4100,12 @@ async fn oc_session_fork(
     let id = next_id("ses_", &SESSION_COUNTER);
     let slug = format!("session-{}", id);
     let title = format!("Fork of {}", session_id);
+    let parent_permission_mode = {
+        let sessions = state.opencode.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .and_then(|s| s.permission_mode.clone())
+    };
     let record = OpenCodeSessionRecord {
         id: id.clone(),
         slug,
@@ -3267,6 +4117,7 @@ async fn oc_session_fork(
         created_at: now,
         updated_at: now,
         share_url: None,
+        permission_mode: parent_permission_mode,
     };
 
     let value = record.to_value();
@@ -3385,14 +4236,6 @@ async fn oc_session_message_create(
         .clone()
         .unwrap_or_else(|| next_id("msg_", &MESSAGE_COUNTER));
 
-    state.opencode.emit_event(json!({
-        "type": "session.status",
-        "properties": {
-            "sessionID": session_id,
-            "status": {"type": "busy"}
-        }
-    }));
-
     let mut user_message = build_user_message(
         &session_id,
         &user_message_id,
@@ -3430,11 +4273,19 @@ async fn oc_session_message_create(
         .opencode
         .update_runtime(&session_id, |runtime| {
             runtime.last_user_message_id = Some(user_message_id.clone());
+            runtime.active_assistant_message_id = None;
             runtime.last_agent = Some(agent_mode.clone());
             runtime.last_model_provider = Some(provider_id.clone());
             runtime.last_model_id = Some(model_id.clone());
         })
         .await;
+
+    let session_permission_mode = {
+        let sessions = state.opencode.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .and_then(|s| s.permission_mode.clone())
+    };
 
     if let Err(err) = ensure_backing_session(
         &state,
@@ -3442,6 +4293,7 @@ async fn oc_session_message_create(
         &session_agent,
         backing_model,
         backing_variant,
+        session_permission_mode,
     )
     .await
     {
@@ -3450,6 +4302,8 @@ async fn oc_session_message_create(
             ?err,
             "failed to ensure backing session"
         );
+        emit_session_error(&state.opencode, &session_id, &err.to_string(), None, None);
+        return sandbox_error_response(err).into_response();
     } else {
         ensure_session_stream(state.clone(), session_id.clone()).await;
     }
@@ -3463,14 +4317,29 @@ async fn oc_session_message_create(
         if let Err(err) = state
             .inner
             .session_manager()
-            .send_message(session_id.clone(), prompt_text)
+            .send_message(session_id.clone(), prompt_text, Vec::new())
             .await
         {
+            let mut should_emit_idle = false;
+            let _ = state
+                .opencode
+                .update_runtime(&session_id, |runtime| {
+                    should_emit_idle = runtime.turn_in_progress;
+                    runtime.turn_in_progress = false;
+                    runtime.active_assistant_message_id = None;
+                    runtime.open_tool_calls.clear();
+                })
+                .await;
             tracing::warn!(
                 target = "sandbox_agent::opencode",
                 ?err,
                 "failed to send message to backing agent"
             );
+            emit_session_error(&state.opencode, &session_id, &err.to_string(), None, None);
+            if should_emit_idle {
+                emit_session_idle(&state.opencode, &session_id);
+            }
+            return sandbox_error_response(err).into_response();
         }
     }
 
@@ -4022,7 +4891,6 @@ async fn oc_provider_list(State(state): State<Arc<OpenCodeAppState>>) -> impl In
     }
     let mut providers = Vec::new();
     let mut defaults = serde_json::Map::new();
-    let mut connected = Vec::new();
     for (group_id, entries) in grouped {
         let mut models = serde_json::Map::new();
         for entry in entries {
@@ -4042,12 +4910,12 @@ async fn oc_provider_list(State(state): State<Arc<OpenCodeAppState>>) -> impl In
         if let Some(default_model) = cache.group_defaults.get(&group_id) {
             defaults.insert(group_id.clone(), Value::String(default_model.clone()));
         }
-        connected.push(group_id);
     }
+    // Use the connected list from cache (based on credential availability)
     let providers = json!({
         "all": providers,
         "default": Value::Object(defaults),
-        "connected": connected
+        "connected": cache.connected
     });
     (StatusCode::OK, Json(providers))
 }
@@ -4537,8 +5405,19 @@ async fn oc_skill_list() -> impl IntoResponse {
     responses((status = 200)),
     tag = "opencode"
 )]
-async fn oc_tui_next() -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({"path": "", "body": {}})))
+async fn oc_tui_next(State(state): State<Arc<OpenCodeAppState>>, headers: HeaderMap) -> Response {
+    if let Some(response) = proxy_native_opencode(
+        &state,
+        reqwest::Method::GET,
+        "/tui/control/next",
+        &headers,
+        None,
+    )
+    .await
+    {
+        return response;
+    }
+    (StatusCode::OK, Json(json!({"path": "", "body": {}}))).into_response()
 }
 
 #[utoipa::path(
@@ -4548,8 +5427,23 @@ async fn oc_tui_next() -> impl IntoResponse {
     responses((status = 200)),
     tag = "opencode"
 )]
-async fn oc_tui_response() -> impl IntoResponse {
-    bool_ok(true)
+async fn oc_tui_response(
+    State(state): State<Arc<OpenCodeAppState>>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    if let Some(response) = proxy_native_opencode(
+        &state,
+        reqwest::Method::POST,
+        "/tui/control/response",
+        &headers,
+        body.map(|json| json.0),
+    )
+    .await
+    {
+        return response;
+    }
+    bool_ok(true).into_response()
 }
 
 #[utoipa::path(
@@ -4559,8 +5453,23 @@ async fn oc_tui_response() -> impl IntoResponse {
     responses((status = 200)),
     tag = "opencode"
 )]
-async fn oc_tui_append_prompt() -> impl IntoResponse {
-    bool_ok(true)
+async fn oc_tui_append_prompt(
+    State(state): State<Arc<OpenCodeAppState>>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    if let Some(response) = proxy_native_opencode(
+        &state,
+        reqwest::Method::POST,
+        "/tui/append-prompt",
+        &headers,
+        body.map(|json| json.0),
+    )
+    .await
+    {
+        return response;
+    }
+    bool_ok(true).into_response()
 }
 
 #[utoipa::path(
@@ -4569,8 +5478,22 @@ async fn oc_tui_append_prompt() -> impl IntoResponse {
     responses((status = 200)),
     tag = "opencode"
 )]
-async fn oc_tui_open_help() -> impl IntoResponse {
-    bool_ok(true)
+async fn oc_tui_open_help(
+    State(state): State<Arc<OpenCodeAppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = proxy_native_opencode(
+        &state,
+        reqwest::Method::POST,
+        "/tui/open-help",
+        &headers,
+        None,
+    )
+    .await
+    {
+        return response;
+    }
+    bool_ok(true).into_response()
 }
 
 #[utoipa::path(
@@ -4579,8 +5502,11 @@ async fn oc_tui_open_help() -> impl IntoResponse {
     responses((status = 200)),
     tag = "opencode"
 )]
-async fn oc_tui_open_sessions() -> impl IntoResponse {
-    bool_ok(true)
+async fn oc_tui_open_sessions(
+    State(_state): State<Arc<OpenCodeAppState>>,
+    _headers: HeaderMap,
+) -> Response {
+    bool_ok(true).into_response()
 }
 
 #[utoipa::path(
@@ -4589,8 +5515,22 @@ async fn oc_tui_open_sessions() -> impl IntoResponse {
     responses((status = 200)),
     tag = "opencode"
 )]
-async fn oc_tui_open_themes() -> impl IntoResponse {
-    bool_ok(true)
+async fn oc_tui_open_themes(
+    State(state): State<Arc<OpenCodeAppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = proxy_native_opencode(
+        &state,
+        reqwest::Method::POST,
+        "/tui/open-themes",
+        &headers,
+        None,
+    )
+    .await
+    {
+        return response;
+    }
+    bool_ok(true).into_response()
 }
 
 #[utoipa::path(
@@ -4599,8 +5539,22 @@ async fn oc_tui_open_themes() -> impl IntoResponse {
     responses((status = 200)),
     tag = "opencode"
 )]
-async fn oc_tui_open_models() -> impl IntoResponse {
-    bool_ok(true)
+async fn oc_tui_open_models(
+    State(state): State<Arc<OpenCodeAppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = proxy_native_opencode(
+        &state,
+        reqwest::Method::POST,
+        "/tui/open-models",
+        &headers,
+        None,
+    )
+    .await
+    {
+        return response;
+    }
+    bool_ok(true).into_response()
 }
 
 #[utoipa::path(
@@ -4610,8 +5564,23 @@ async fn oc_tui_open_models() -> impl IntoResponse {
     responses((status = 200)),
     tag = "opencode"
 )]
-async fn oc_tui_submit_prompt() -> impl IntoResponse {
-    bool_ok(true)
+async fn oc_tui_submit_prompt(
+    State(state): State<Arc<OpenCodeAppState>>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    if let Some(response) = proxy_native_opencode(
+        &state,
+        reqwest::Method::POST,
+        "/tui/submit-prompt",
+        &headers,
+        body.map(|json| json.0),
+    )
+    .await
+    {
+        return response;
+    }
+    bool_ok(true).into_response()
 }
 
 #[utoipa::path(
@@ -4620,8 +5589,22 @@ async fn oc_tui_submit_prompt() -> impl IntoResponse {
     responses((status = 200)),
     tag = "opencode"
 )]
-async fn oc_tui_clear_prompt() -> impl IntoResponse {
-    bool_ok(true)
+async fn oc_tui_clear_prompt(
+    State(state): State<Arc<OpenCodeAppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = proxy_native_opencode(
+        &state,
+        reqwest::Method::POST,
+        "/tui/clear-prompt",
+        &headers,
+        None,
+    )
+    .await
+    {
+        return response;
+    }
+    bool_ok(true).into_response()
 }
 
 #[utoipa::path(
@@ -4631,8 +5614,23 @@ async fn oc_tui_clear_prompt() -> impl IntoResponse {
     responses((status = 200)),
     tag = "opencode"
 )]
-async fn oc_tui_execute_command() -> impl IntoResponse {
-    bool_ok(true)
+async fn oc_tui_execute_command(
+    State(state): State<Arc<OpenCodeAppState>>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    if let Some(response) = proxy_native_opencode(
+        &state,
+        reqwest::Method::POST,
+        "/tui/execute-command",
+        &headers,
+        body.map(|json| json.0),
+    )
+    .await
+    {
+        return response;
+    }
+    bool_ok(true).into_response()
 }
 
 #[utoipa::path(
@@ -4642,8 +5640,23 @@ async fn oc_tui_execute_command() -> impl IntoResponse {
     responses((status = 200)),
     tag = "opencode"
 )]
-async fn oc_tui_show_toast() -> impl IntoResponse {
-    bool_ok(true)
+async fn oc_tui_show_toast(
+    State(state): State<Arc<OpenCodeAppState>>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    if let Some(response) = proxy_native_opencode(
+        &state,
+        reqwest::Method::POST,
+        "/tui/show-toast",
+        &headers,
+        body.map(|json| json.0),
+    )
+    .await
+    {
+        return response;
+    }
+    bool_ok(true).into_response()
 }
 
 #[utoipa::path(
@@ -4653,8 +5666,23 @@ async fn oc_tui_show_toast() -> impl IntoResponse {
     responses((status = 200)),
     tag = "opencode"
 )]
-async fn oc_tui_publish() -> impl IntoResponse {
-    bool_ok(true)
+async fn oc_tui_publish(
+    State(state): State<Arc<OpenCodeAppState>>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    if let Some(response) = proxy_native_opencode(
+        &state,
+        reqwest::Method::POST,
+        "/tui/publish",
+        &headers,
+        body.map(|json| json.0),
+    )
+    .await
+    {
+        return response;
+    }
+    bool_ok(true).into_response()
 }
 
 #[utoipa::path(
@@ -4664,8 +5692,25 @@ async fn oc_tui_publish() -> impl IntoResponse {
     responses((status = 200)),
     tag = "opencode"
 )]
-async fn oc_tui_select_session() -> impl IntoResponse {
-    bool_ok(true)
+async fn oc_tui_select_session(
+    State(state): State<Arc<OpenCodeAppState>>,
+    _headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    if let Some(Json(body)) = body {
+        // Emit a tui.session.select event so the TUI navigates to the session.
+        let session_id = body
+            .get("sessionID")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        state.opencode.emit_event(json!({
+            "type": "tui.session.select",
+            "properties": {
+                "sessionID": session_id
+            }
+        }));
+    }
+    bool_ok(true).into_response()
 }
 
 #[derive(OpenApi)]
@@ -4785,3 +5830,107 @@ async fn oc_tui_select_session() -> impl IntoResponse {
     tags((name = "opencode", description = "OpenCode compatibility API"))
 )]
 pub struct OpenCodeApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sandbox_agent_universal_agent_schema::ReasoningVisibility;
+
+    fn assistant_item(content: Vec<ContentPart>) -> UniversalItem {
+        UniversalItem {
+            item_id: "itm_assistant".to_string(),
+            native_item_id: Some("native_assistant".to_string()),
+            parent_id: None,
+            kind: ItemKind::Message,
+            role: Some(ItemRole::Assistant),
+            content,
+            status: ItemStatus::InProgress,
+        }
+    }
+
+    #[test]
+    fn extract_message_text_ignores_non_text_parts() {
+        let parts = vec![
+            ContentPart::Status {
+                label: "Thinking".to_string(),
+                detail: Some("Preparing friendly brief response".to_string()),
+            },
+            ContentPart::Reasoning {
+                text: "Preparing friendly brief response".to_string(),
+                visibility: ReasoningVisibility::Public,
+            },
+            ContentPart::Text {
+                text: "Hey! How can I help?".to_string(),
+            },
+            ContentPart::Json {
+                json: serde_json::json!({"ignored": true}),
+            },
+        ];
+
+        assert_eq!(
+            extract_message_text_from_content(&parts),
+            Some("Hey! How can I help?".to_string())
+        );
+    }
+
+    #[test]
+    fn item_supports_text_deltas_only_for_assistant_text_messages() {
+        assert!(item_supports_text_deltas(&assistant_item(Vec::new())));
+        assert!(item_supports_text_deltas(&assistant_item(vec![
+            ContentPart::Text {
+                text: "hello".to_string(),
+            }
+        ])));
+        assert!(!item_supports_text_deltas(&assistant_item(vec![
+            ContentPart::Reasoning {
+                text: "internal".to_string(),
+                visibility: ReasoningVisibility::Private,
+            }
+        ])));
+
+        let user = UniversalItem {
+            item_id: "itm_user".to_string(),
+            native_item_id: Some("native_user".to_string()),
+            parent_id: None,
+            kind: ItemKind::Message,
+            role: Some(ItemRole::User),
+            content: vec![ContentPart::Text {
+                text: "hello".to_string(),
+            }],
+            status: ItemStatus::InProgress,
+        };
+        assert!(!item_supports_text_deltas(&user));
+
+        let status = UniversalItem {
+            item_id: "itm_status".to_string(),
+            native_item_id: Some("native_status".to_string()),
+            parent_id: None,
+            kind: ItemKind::Status,
+            role: Some(ItemRole::Assistant),
+            content: vec![ContentPart::Status {
+                label: "thinking".to_string(),
+                detail: None,
+            }],
+            status: ItemStatus::InProgress,
+        };
+        assert!(!item_supports_text_deltas(&status));
+    }
+
+    #[test]
+    fn text_delta_capability_blocks_non_text_item_ids() {
+        let mut runtime = OpenCodeSessionRuntime::default();
+        set_item_text_delta_capability(&mut runtime, Some("itm_1"), Some("native_1"), false);
+        assert!(item_delta_is_non_text(
+            &runtime,
+            Some("itm_1"),
+            Some("native_1")
+        ));
+
+        set_item_text_delta_capability(&mut runtime, Some("itm_1"), Some("native_1"), true);
+        assert!(!item_delta_is_non_text(
+            &runtime,
+            Some("itm_1"),
+            Some("native_1")
+        ));
+    }
+}

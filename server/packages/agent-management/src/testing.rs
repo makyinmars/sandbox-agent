@@ -159,6 +159,7 @@ pub fn test_agents_from_env() -> Result<Vec<TestAgentConfig>, TestAgentConfigErr
                 }
                 credentials_with(anthropic_cred.clone(), openai_cred.clone())
             }
+            AgentId::Cursor => credentials_with(None, None),
             AgentId::Mock => credentials_with(None, None),
         };
         configs.push(TestAgentConfig { agent, credentials });
