@@ -9,6 +9,7 @@ const agentLabels: Record<string, string> = {
   codex: "Codex",
   opencode: "OpenCode",
   amp: "Amp",
+  pi: "Pi",
   mock: "Mock"
 };
 
