@@ -81,16 +81,16 @@ async function npmVersionExists(
 		return true;
 	} catch (error: any) {
 		if (error.stderr) {
-			if (
-				!error.stderr.includes(
-					`No match found for version ${version}`,
-				) &&
-				!error.stderr.includes(
-					`'${packageName}@${version}' is not in this registry.`,
-				)
-			) {
+			const stderr = error.stderr;
+			// Expected errors when version or package doesn't exist
+			const expected =
+				stderr.includes(`No match found for version ${version}`) ||
+				stderr.includes(`'${packageName}@${version}' is not in this registry.`) ||
+				stderr.includes("404 Not Found") ||
+				stderr.includes("is not in the npm registry");
+			if (!expected) {
 				throw new Error(
-					`unexpected npm view version output: ${error.stderr}`,
+					`unexpected npm view version output: ${stderr}`,
 				);
 			}
 		}
